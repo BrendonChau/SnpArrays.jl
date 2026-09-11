@@ -292,4 +292,11 @@ end
     expected = fill(Float32(16386), 2049)
     @test transpose(transpose_operator) * ones(Float32, 8193) == expected
     @test vec(adjoint(transpose_operator) * ones(Float32, 8193, 1)) == expected
+
+    rhs_fixture = filled_genotype_fixture(17, 9, 0x03)
+    rhs_operator = SnpLinAlg{Float32}(rhs_fixture)
+    @test rhs_operator * ones(Float32, 9, 257) ==
+          fill(Float32(18), 17, 257)
+    @test transpose(rhs_operator) * ones(Float32, 17, 2049) ==
+          fill(Float32(34), 9, 2049)
 end

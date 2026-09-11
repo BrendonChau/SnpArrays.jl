@@ -187,67 +187,21 @@ function mul!(
     return out
 end
 
-@inline function _wait_for_task(task::Union{Nothing, Task})
-    if !isnothing(task)
-        wait(task)
-    end
-    return nothing
-end
-
 function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
-    vertical_step = 1024
-    horizontal_step = 1024
-    vertical_iterations = (length(out) >> 2) >>> 10
-    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
-    horizontal_iterations = size(packed, 2) >>> 10
-    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
-    tasks = Vector{Union{Nothing, Task}}(undef, vertical_iterations + 1)
-    fill!(tasks, nothing)
+    row_step = 4096
+    column_step = 1024
     @sync begin
-        for horizontal in 0:(horizontal_iterations - 1)
-            column_first = horizontal_step * horizontal + 1
-            column_last = horizontal_step * (horizontal + 1)
-            for vertical in 0:(vertical_iterations - 1)
-                slot = vertical + 1
-                _wait_for_task(tasks[slot])
-                row_first = 4vertical_step * vertical + 1
-                row_last = 4vertical_step * (vertical + 1)
-                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
-                    out, packed, rhs, values, $row_first, $row_last,
-                    $column_first, $column_last,
-                )
-            end
-            if !iszero(vertical_remainder)
-                slot = vertical_iterations + 1
-                _wait_for_task(tasks[slot])
-                row_first = 4vertical_step * vertical_iterations + 1
-                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
-                    out, packed, rhs, values, $row_first, rows_filled,
-                    $column_first, $column_last,
-                )
-            end
-        end
-        if !iszero(horizontal_remainder)
-            column_first = horizontal_step * horizontal_iterations + 1
-            column_last = size(packed, 2)
-            for vertical in 0:(vertical_iterations - 1)
-                slot = vertical + 1
-                _wait_for_task(tasks[slot])
-                row_first = 4vertical_step * vertical + 1
-                row_last = 4vertical_step * (vertical + 1)
-                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
-                    out, packed, rhs, values, $row_first, $row_last,
-                    $column_first, $column_last,
-                )
-            end
-            if !iszero(vertical_remainder)
-                slot = vertical_iterations + 1
-                _wait_for_task(tasks[slot])
-                row_first = 4vertical_step * vertical_iterations + 1
-                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
-                    out, packed, rhs, values, $row_first, rows_filled,
-                    $column_first, $column_last,
-                )
+        for row_first in 1:row_step:rows_filled
+            row_last = min(row_first + row_step - 1, rows_filled)
+            Threads.@spawn begin
+                for column_first in 1:column_step:size(packed, 2)
+                    column_last = min(column_first + column_step - 1,
+                                      size(packed, 2))
+                    _snparray_ax_kernel!(
+                        out, packed, rhs, values, $row_first, $row_last,
+                        column_first, column_last,
+                    )
+                end
             end
         end
     end
@@ -255,46 +209,23 @@ function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
 end
 
 function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
-    vertical_step = 256
-    horizontal_step = 256
+    row_step = 1024
+    column_step = 256
     rhs_step = 256
-    vertical_iterations = (size(out, 1) >> 2) >>> 8
-    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
-    horizontal_iterations = size(packed, 2) >>> 8
-    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
-    rhs_iterations = size(out, 2) >>> 8
-    rhs_remainder = size(out, 2) & (rhs_step - 1)
-    tasks = Vector{Union{Nothing, Task}}(undef, vertical_iterations + 1)
-    fill!(tasks, nothing)
     @sync begin
-        for rhs_tile in 0:rhs_iterations
-            rhs_tile == rhs_iterations && iszero(rhs_remainder) && break
-            rhs_first = rhs_step * rhs_tile + 1
-            rhs_last = min(rhs_step * (rhs_tile + 1), size(out, 2))
-            for horizontal in 0:horizontal_iterations
-                horizontal == horizontal_iterations &&
-                    iszero(horizontal_remainder) && break
-                column_first = horizontal_step * horizontal + 1
-                column_last = min(horizontal_step * (horizontal + 1),
-                                  size(packed, 2))
-                for vertical in 0:(vertical_iterations - 1)
-                    slot = vertical + 1
-                    _wait_for_task(tasks[slot])
-                    row_first = 4vertical_step * vertical + 1
-                    row_last = 4vertical_step * (vertical + 1)
-                    tasks[slot] = Threads.@spawn _snparray_AX_kernel!(
-                        out, packed, rhs, values, $row_first, $row_last,
-                        $column_first, $column_last, $rhs_first, $rhs_last,
-                    )
-                end
-                if !iszero(vertical_remainder)
-                    slot = vertical_iterations + 1
-                    _wait_for_task(tasks[slot])
-                    row_first = 4vertical_step * vertical_iterations + 1
-                    tasks[slot] = Threads.@spawn _snparray_AX_kernel!(
-                        out, packed, rhs, values, $row_first, rows_filled,
-                        $column_first, $column_last, $rhs_first, $rhs_last,
-                    )
+        for rhs_first in 1:rhs_step:size(out, 2)
+            rhs_last = min(rhs_first + rhs_step - 1, size(out, 2))
+            for row_first in 1:row_step:rows_filled
+                row_last = min(row_first + row_step - 1, rows_filled)
+                Threads.@spawn begin
+                    for column_first in 1:column_step:size(packed, 2)
+                        column_last = min(column_first + column_step - 1,
+                                          size(packed, 2))
+                        _snparray_AX_kernel!(
+                            out, packed, rhs, values, $row_first, $row_last,
+                            column_first, column_last, $rhs_first, $rhs_last,
+                        )
+                    end
                 end
             end
         end
@@ -303,37 +234,20 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
 end
 
 function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
-    vertical_step = 2048
-    horizontal_step = 2048
-    vertical_iterations = (length(rhs) >> 2) >>> 11
-    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
-    horizontal_iterations = size(packed, 2) >>> 11
-    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
-    tasks = Vector{Union{Nothing, Task}}(undef, horizontal_iterations + 1)
-    fill!(tasks, nothing)
+    row_step = 8192
+    column_step = 2048
     @sync begin
-        for vertical in 0:vertical_iterations
-            vertical == vertical_iterations && iszero(vertical_remainder) && break
-            row_first = 4vertical_step * vertical + 1
-            row_last = min(4vertical_step * (vertical + 1), rows_filled)
-            for horizontal in 0:(horizontal_iterations - 1)
-                slot = horizontal + 1
-                _wait_for_task(tasks[slot])
-                column_first = horizontal_step * horizontal + 1
-                column_last = horizontal_step * (horizontal + 1)
-                tasks[slot] = Threads.@spawn _snparray_atx_kernel!(
-                    out, packed, rhs, values, $row_first, $row_last,
-                    $column_first, $column_last,
-                )
-            end
-            if !iszero(horizontal_remainder)
-                slot = horizontal_iterations + 1
-                _wait_for_task(tasks[slot])
-                column_first = horizontal_step * horizontal_iterations + 1
-                tasks[slot] = Threads.@spawn _snparray_atx_kernel!(
-                    out, packed, rhs, values, $row_first, $row_last,
-                    $column_first, size(packed, 2),
-                )
+        for column_first in 1:column_step:size(packed, 2)
+            column_last = min(column_first + column_step - 1,
+                              size(packed, 2))
+            Threads.@spawn begin
+                for row_first in 1:row_step:rows_filled
+                    row_last = min(row_first + row_step - 1, rows_filled)
+                    _snparray_atx_kernel!(
+                        out, packed, rhs, values, row_first, row_last,
+                        $column_first, $column_last,
+                    )
+                end
             end
         end
     end
@@ -341,45 +255,24 @@ function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
 end
 
 function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled)
-    vertical_step = 2048
-    horizontal_step = 2048
+    row_step = 8192
+    column_step = 2048
     rhs_step = 2048
-    vertical_iterations = (size(rhs, 1) >> 2) >>> 11
-    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
-    horizontal_iterations = size(packed, 2) >>> 11
-    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
-    rhs_iterations = size(out, 2) >>> 11
-    rhs_remainder = size(out, 2) & (rhs_step - 1)
-    tasks = Vector{Union{Nothing, Task}}(undef, horizontal_iterations + 1)
-    fill!(tasks, nothing)
     @sync begin
-        for rhs_tile in 0:rhs_iterations
-            rhs_tile == rhs_iterations && iszero(rhs_remainder) && break
-            rhs_first = rhs_step * rhs_tile + 1
-            rhs_last = min(rhs_step * (rhs_tile + 1), size(out, 2))
-            for vertical in 0:vertical_iterations
-                vertical == vertical_iterations &&
-                    iszero(vertical_remainder) && break
-                row_first = 4vertical_step * vertical + 1
-                row_last = min(4vertical_step * (vertical + 1), rows_filled)
-                for horizontal in 0:(horizontal_iterations - 1)
-                    slot = horizontal + 1
-                    _wait_for_task(tasks[slot])
-                    column_first = horizontal_step * horizontal + 1
-                    column_last = horizontal_step * (horizontal + 1)
-                    tasks[slot] = Threads.@spawn _snparray_AtX_kernel!(
-                        out, packed, rhs, values, $row_first, $row_last,
-                        $column_first, $column_last, $rhs_first, $rhs_last,
-                    )
-                end
-                if !iszero(horizontal_remainder)
-                    slot = horizontal_iterations + 1
-                    _wait_for_task(tasks[slot])
-                    column_first = horizontal_step * horizontal_iterations + 1
-                    tasks[slot] = Threads.@spawn _snparray_AtX_kernel!(
-                        out, packed, rhs, values, $row_first, $row_last,
-                        $column_first, size(packed, 2), $rhs_first, $rhs_last,
-                    )
+        for rhs_first in 1:rhs_step:size(out, 2)
+            rhs_last = min(rhs_first + rhs_step - 1, size(out, 2))
+            for column_first in 1:column_step:size(packed, 2)
+                column_last = min(column_first + column_step - 1,
+                                  size(packed, 2))
+                Threads.@spawn begin
+                    for row_first in 1:row_step:rows_filled
+                        row_last = min(row_first + row_step - 1, rows_filled)
+                        _snparray_AtX_kernel!(
+                            out, packed, rhs, values, row_first, row_last,
+                            $column_first, $column_last,
+                            $rhs_first, $rhs_last,
+                        )
+                    end
                 end
             end
         end
