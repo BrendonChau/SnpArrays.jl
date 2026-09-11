@@ -100,6 +100,174 @@ cc = counts(mouse, dims=1)
 @test sum(mp, dims = 2) == view(counts(mouse, dims=2), 2:2, :)'
 end
 
+@testset "packed reductions" begin
+function packed_fixture(rows::Integer, columns::Integer = 5)
+    s = SnpArray(undef, rows, columns)
+    dense = Matrix{UInt8}(undef, rows, columns)
+    for column in 1:columns, row in 1:rows
+        genotype = UInt8(mod(row + 2column, 4))
+        s[row, column] = genotype
+        dense[row, column] = genotype
+    end
+    trailing_genotypes = rem(rows, 4)
+    if !iszero(trailing_genotypes)
+        for column in 1:columns, offset in trailing_genotypes:3
+            shift = 2offset
+            mask = ~(0x03 << shift)
+            s.data[end, column] =
+                (s.data[end, column] & mask) | (0x01 << shift)
+        end
+    end
+    return s, dense
+end
+
+function dense_counts(dense::AbstractMatrix{UInt8}, dims::Integer)
+    groups = dims == 1 ? size(dense, 2) : size(dense, 1)
+    result = zeros(Int, 4, groups)
+    for column in axes(dense, 2), row in axes(dense, 1)
+        group = dims == 1 ? column : row
+        result[dense[row, column] + 1, group] += 1
+    end
+    return result
+end
+
+function dense_model(
+    dense::AbstractMatrix{UInt8},
+    ::Type{T},
+    model::Union{Val{1}, Val{2}, Val{3}},
+) where T <: AbstractFloat
+    result = Matrix{T}(undef, size(dense))
+    for index in eachindex(dense)
+        result[index] = SnpArrays.convert(T, dense[index], model)
+    end
+    return result
+end
+
+function transformed_dense(
+    dense::AbstractMatrix{UInt8},
+    ::Type{T},
+    model::Union{Val{1}, Val{2}, Val{3}},
+    center::Bool,
+    scale::Bool,
+    impute::Bool,
+) where T <: AbstractFloat
+    result = dense_model(dense, T, model)
+    for column in axes(result, 2)
+        observed = filter(!isnan, view(result, :, column))
+        column_mean = mean(observed)
+        column_std = model == ADDITIVE_MODEL ?
+                     sqrt(column_mean * (1 - column_mean / 2)) :
+                     sqrt(column_mean * (1 - column_mean))
+        for row in axes(result, 1)
+            impute && isnan(result[row, column]) &&
+                (result[row, column] = column_mean)
+            center && (result[row, column] -= column_mean)
+            scale && column_std > 0 &&
+                (result[row, column] /= column_std)
+        end
+    end
+    return result
+end
+
+for rows in 1:8
+    s, dense = packed_fixture(rows)
+    @test counts(s, dims=1) == dense_counts(dense, 1)
+    @test counts(s, dims=2) == dense_counts(dense, 2)
+    @test missingpos(s) == sparse(dense .== 0x01)
+end
+
+s, dense = packed_fixture(7)
+for model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL)
+    modeled = dense_model(dense, Float64, model)
+    expected_columns = [mean(filter(!isnan, view(modeled, :, column)))
+                        for column in axes(modeled, 2)]
+    expected_rows = [mean(filter(!isnan, view(modeled, row, :)))
+                     for row in axes(modeled, 1)]
+    @test vec(mean!(zeros(1, size(s, 2)), s; dims=1, model=model)) ≈
+          expected_columns
+    @test vec(mean!(zeros(size(s, 1), 1), s; dims=2, model=model)) ≈
+          expected_rows
+
+    for T in (Float32, Float64), center in (false, true),
+        scale in (false, true), impute in (false, true)
+        expected = transformed_dense(dense, T, model, center, scale, impute)
+        actual = Matrix{T}(undef, size(s))
+        copyto!(actual, s; model=model, center=center, scale=scale,
+                impute=impute)
+        @test all(isapprox.(actual, expected; nans=true,
+                           atol=2eps(T), rtol=2eps(T)))
+    end
+end
+
+additive = dense_model(dense, Float64, ADDITIVE_MODEL)
+expected_column_means = [mean(filter(!isnan, view(additive, :, column)))
+                         for column in axes(additive, 2)]
+expected_column_vars = [var(filter(!isnan, view(additive, :, column)))
+                        for column in axes(additive, 2)]
+expected_row_vars = [var(filter(!isnan, view(additive, row, :)); corrected=false)
+                     for row in axes(additive, 1)]
+@test vec(var!(zeros(1, size(s, 2)), s; dims=1)) ≈ expected_column_vars
+@test vec(var!(zeros(size(s, 1), 1), s; dims=2, corrected=false)) ≈
+      expected_row_vars
+@test vec(var!(zeros(1, size(s, 2)), s; dims=1,
+               mean=expected_column_means)) ≈ expected_column_vars
+@test missingrate!(zeros(size(s, 2)), s, 1) ==
+      vec(sum(dense .== 0x01, dims=1)) ./ size(s, 1)
+@test missingrate!(zeros(size(s, 1)), s, 2) ==
+      vec(sum(dense .== 0x01, dims=2)) ./ size(s, 2)
+
+@test_throws DimensionMismatch mean!(zeros(size(s, 2) - 1), s; dims=1)
+@test_throws DimensionMismatch var!(zeros(size(s, 1) - 1), s; dims=2)
+@test_throws DimensionMismatch var!(zeros(size(s, 2)), s; dims=1,
+                                    mean=zeros(size(s, 2) - 1))
+@test_throws DimensionMismatch missingrate!(zeros(size(s, 2) - 1), s, 1)
+@test_throws ArgumentError mean!(zeros(size(s, 2)), s; dims=3)
+@test_throws ArgumentError var!(zeros(size(s, 2)), s; dims=3)
+@test_throws ArgumentError missingrate!(zeros(size(s, 2)), s, 3)
+
+cached, cached_dense = packed_fixture(7)
+counts(cached, dims=1)
+counts(cached, dims=2)
+old_value = cached[1, 1]
+new_value = UInt8(mod(old_value + 1, 4))
+@test_logs (:warn, r"invalidated") cached[1, 1] = new_value
+cached_dense[1, 1] = new_value
+@test all(iszero, cached.columncounts)
+@test all(iszero, cached.rowcounts)
+@test counts(cached, dims=1) == dense_counts(cached_dense, 1)
+@test_logs cached[1, 1] = new_value
+
+allocation_s, _ = packed_fixture(7)
+column_output = zeros(1, size(allocation_s, 2))
+rate_output = zeros(size(allocation_s, 2))
+copy_output = zeros(size(allocation_s))
+mean!(column_output, allocation_s; dims=1)
+var!(column_output, allocation_s; dims=1)
+missingrate!(rate_output, allocation_s, 1)
+counts(allocation_s, dims=2)
+copyto!(copy_output, allocation_s)
+fill!(allocation_s.columncounts, 0)
+@test (@allocated counts(allocation_s, dims=1)) == 0
+fill!(allocation_s.rowcounts, 0)
+@test (@allocated counts(allocation_s, dims=2)) == 0
+fill!(allocation_s.columncounts, 0)
+@test (@allocated mean!(column_output, allocation_s; dims=1)) == 0
+fill!(allocation_s.columncounts, 0)
+@test (@allocated var!(column_output, allocation_s; dims=1)) == 0
+fill!(allocation_s.columncounts, 0)
+@test (@allocated missingrate!(rate_output, allocation_s, 1)) == 0
+@test (@allocated copyto!(copy_output, allocation_s)) == 0
+for model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL),
+    center in (false, true), scale in (false, true), impute in (false, true)
+    copyto!(copy_output, allocation_s; model=model, center=center,
+            scale=scale, impute=impute)
+    fill!(allocation_s.columncounts, 0)
+    @test (@allocated copyto!(copy_output, allocation_s; model=model,
+                              center=center, scale=scale,
+                              impute=impute)) == 0
+end
+end
+
 @testset "create bed" begin
 tmpbf = SnpArray("tmp.bed", 5, 3)
 @test isfile("tmp.bed")

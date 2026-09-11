@@ -10,7 +10,7 @@ import DataFrames: DataFrame, rename!, eachrow
 import DelimitedFiles: readdlm, writedlm
 import CSV # for CSV.read, to avoid clash with Base.read
 import LinearAlgebra: copytri!, mul!
-import Statistics: mean, std, var
+import Statistics: mean, mean!, std, var
 import StatsBase: counts
 import SpecialFunctions: gamma_inc
 import VectorizationBase: gesp
@@ -19,10 +19,9 @@ export AbstractSnpArray, AbstractSnpBitMatrix, AbstractSnpLinAlg
 export SnpArray, SnpBitMatrix, SnpLinAlg, SnpData, StackedSnpArray
 export simulate!
 export compress_plink, decompress_plink, split_plink, merge_plink, write_plink 
-export counts, grm, grm_admixture, maf, mean, minorallele, missingpos, missingrate
-export std, var, vcf2plink
-export counts, grm, maf, mean, minorallele, missingpos, missingrate, std, var
-export vcf2plink, kinship_pruning
+export counts, grm, grm_admixture, maf, mean, mean!, minorallele
+export missingpos, missingrate, missingrate!, std, var, var!, vcf2plink
+export kinship_pruning
 export ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL
 export CuSnpArray
 import VariantCallFormat: findgenokey, VCF, header
