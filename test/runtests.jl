@@ -473,7 +473,7 @@ for model in [ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL], t in [Float32, F
     # imputing missing data
     mousela = SnpLinAlg{t}(mouse, model=ADDITIVE_MODEL, center=true, scale=true, impute=true)
     v = copyto!(zeros(1), @view(mousela[702])) # missing entry
-    @test isapprox(v[1], 1.113003134727478, atol=1e-6)
+    @test iszero(v[1])
     # not imputing missing data
     mousela = SnpLinAlg{t}(mouse, model=ADDITIVE_MODEL, center=true, scale=true, impute=false)
     v = copyto!(zeros(1), @view(mousela[702])) # missing entry
@@ -682,6 +682,8 @@ end
         end
     end
 end
+
+include("linalg_simd.jl")
 
 @testset "subarrays" begin
 @test all(@view(EUR[1:2:10, 1:2:10]) .==

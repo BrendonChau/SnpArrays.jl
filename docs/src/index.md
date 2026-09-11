@@ -1971,13 +1971,13 @@ In some applications we want to perform linear algebra using SnpArray directly w
 2. Operations on transformed `BitMatrix`es: `SnpBitMatrix`
 3. Direct operations on a plink-formatted data on an Nvidia GPU: `CuSnpArray`.
 
-`SnpLinAlg` and `SnpBitMatrix` use Chris Elrod's [LoopVectorization.jl](https://github.com/chriselrod/LoopVectorization.jl) internally. It is much faster on machines with AVX support. `CuSnpArray` uses [CUDA.jl](https://juliagpu.gitlab.io/CUDA.jl/) internally.
+`SnpLinAlg` uses [SIMD.jl](https://github.com/eschnett/SIMD.jl) internally. `CuSnpArray` uses [CUDA.jl](https://juliagpu.gitlab.io/CUDA.jl/) internally.
 
 !!! warning "deprecated SnpBitMatrix"
     `SnpBitMatrix` is now deprecated in favor of `SnpLinAlg`. 
     `SnpBitMatrix` will be removed on next minor release.
     
-The implementation assumes that the matrix corresponding to SnpArray is the matrix of the A2 allele counts. `SnpLinAlg` and `CuSnpArray` impute any missing genotype with its column mean by default. They can also configured to impute missing genotypes with zero. `SnpBitMatrix` can only impute missing values with zero. 
+The implementation assumes that the matrix corresponding to SnpArray is the matrix of the A2 allele counts. `SnpLinAlg` and `CuSnpArray` impute any missing genotype with its column mean by default. With `SnpLinAlg(..., impute=false)`, missing genotypes remain `NaN` and propagate through products, including when multiplied by zero. `SnpBitMatrix` can only impute missing values with zero.
 
 ### Constructor
 

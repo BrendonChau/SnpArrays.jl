@@ -1,7 +1,8 @@
 """
     SnpLinAlg{T}
 
-Wraps a `SnpArray` with the parameters and scratch buffers for linear algebra.
+Wraps a `SnpArray` with the parameters and precomputed genotype values for
+linear algebra.
 
 # Fields
 - `s`: the underlying genotype array.
@@ -11,11 +12,9 @@ Wraps a `SnpArray` with the parameters and scratch buffers for linear algebra.
 - `impute`: whether to impute missing genotypes with the column mean.
 - `μ`: column means.
 - `σinv`: inverse column standard deviations.
-- `storagev1`: length `m`; allocated but never read.
-- `storagev2`: length `n`; holds the scaled `v` in vector `mul!`, or the
-  column mean (or 0) buffer in matrix `mul!`.
-- `storagev3`: length `n`; the inverse standard deviation (or 1) buffer,
-  used only in matrix `mul!`.
+- `values`: a `4 × n` lookup table where entry `(code + 1, j)` is genotype code
+  `code` in column `j` after model conversion, imputation, centering and
+  scaling.
 """
 struct SnpLinAlg{T} <: AbstractMatrix{T}
     s::SnpArray
@@ -25,9 +24,7 @@ struct SnpLinAlg{T} <: AbstractMatrix{T}
     impute::Bool
     μ::Vector{T}
     σinv::Vector{T}
-    storagev1::Vector{T}
-    storagev2::Vector{T}
-    storagev3::Vector{T}
+    values::Matrix{T}
 end
 
 """
@@ -40,856 +37,461 @@ AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
     SubArray{T, 2, SnpLinAlg{T}}} where T
 
 """
-    SnpLinAlg{T}(s; model=ADDITIVE_MODEL, center=false, scale=false, impute=true)
+    SnpLinAlg{T}(s; model=ADDITIVE_MODEL, center=false, scale=false,
+                 impute=true)
 
-Pad a `SnpArray` with some parameters for linear algebera operation.
+Wrap a `SnpArray` for direct linear algebra without materializing its genotypes.
+Missing genotypes use the column mean before centering and scaling when
+`impute=true`, and use `NaN` otherwise.
 
 # Arguments
-- s: a `SnpArray`.
-- model: one of `ADDITIVE_MODEL`(default), `DOMINANT_MODEL`, `RECESSIVE_MODEL`.
-- center: whether to center (default: false).
-- scale: whether to scale to standard deviation 1 (default: false).
-- impute: whether to impute missing value with column mean (default: true).
+- `s`: a `SnpArray`
+- `model`: `ADDITIVE_MODEL`, `DOMINANT_MODEL`, or `RECESSIVE_MODEL`
+- `center`: center each column when `true`
+- `scale`: scale each column to unit standard deviation when `true`
+- `impute`: replace missing genotypes with the column mean when `true`
 """
 function SnpLinAlg{T}(
     s::AbstractSnpArray;
     model = ADDITIVE_MODEL,
     center::Bool = false,
     scale::Bool = false,
-    impute::Bool = true) where T <: AbstractFloat
-    μ = dropdims(mean(s; dims=1, model=model), dims=1)
-    σinv = Vector{T}(undef, size(s, 2))
-    if model == ADDITIVE_MODEL
-        @inbounds @simd for j in 1:size(s, 2)
-            σinv[j] = sqrt(μ[j] * (1 - μ[j] / 2))
-            σinv[j] = σinv[j] > 0 ? inv(σinv[j]) : one(T)
-        end
-    elseif model == DOMINANT_MODEL || model == RECESSIVE_MODEL
-        @inbounds @simd for j in 1:size(s, 2)
-            σinv[j] = sqrt(μ[j] * (1 - μ[j]))
-            σinv[j] = σinv[j] > 0 ? inv(σinv[j]) : one(T)
-        end
-    else
+    impute::Bool = true,
+) where T <: AbstractFloat
+    model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL) ||
         throw(ArgumentError("unrecognized model $model"))
+    means = Vector{T}(dropdims(mean(s; dims=1, model=model); dims=1))
+    inverse_standard_deviations = Vector{T}(undef, size(s, 2))
+    @inbounds @simd for column in eachindex(means)
+        column_mean = means[column]
+        variance = model == ADDITIVE_MODEL ?
+                   column_mean * (one(T) - column_mean / T(2)) :
+                   column_mean * (one(T) - column_mean)
+        standard_deviation = sqrt(variance)
+        inverse_standard_deviations[column] =
+            standard_deviation > zero(T) ? inv(standard_deviation) : one(T)
     end
-    storagev1 = Vector{T}(undef, size(s, 1))
-    storagev2 = Vector{T}(undef, size(s, 2))
-    storagev3 = Vector{T}(undef, size(s, 2))
-    SnpLinAlg{T}(s, model, center, scale, impute, μ, σinv, storagev1, storagev2, storagev3)
+    values = Matrix{T}(undef, 4, size(s, 2))
+    _fill_genotype_values!(values, means, inverse_standard_deviations, model,
+                           center, scale, impute)
+    return SnpLinAlg{T}(s, model, center, scale, impute, means,
+                        inverse_standard_deviations, values)
+end
+
+function _fill_genotype_values!(
+    values::AbstractMatrix{T},
+    means::AbstractVector{T},
+    inverse_standard_deviations::AbstractVector{T},
+    model::Union{Val{1}, Val{2}, Val{3}},
+    center::Bool,
+    scale::Bool,
+    impute::Bool,
+) where T <: AbstractFloat
+    @inbounds for column in axes(values, 2)
+        transformed = _transformed_genotype_values(
+            T, means[column], inverse_standard_deviations[column], model,
+            center, scale, impute,
+        )
+        for code in 1:4
+            values[code, column] = transformed[code]
+        end
+    end
+    return values
 end
 
 Base.size(sla::SnpLinAlg) = size(sla.s)
-Base.size(sla::SnpLinAlg, k::Integer) = size(sla.s, k)
+Base.size(sla::SnpLinAlg, dimension::Integer) = size(sla.s, dimension)
+Base.eltype(::SnpLinAlg{T}) where T = T
 
-eltype(bm::SnpLinAlg) = eltype(bm.μ)
-
-function Base.getindex(s::SnpLinAlg{T}, i::Int, j::Int) where T
-    x = SnpArrays.convert(T, getindex(s.s, i, j), s.model)
-    s.impute && isnan(x) && return s.μ[j]
-    s.center && (x -= s.μ[j])
-    s.scale && (x *= s.σinv[j])
-    return x
+@inline function Base.getindex(sla::SnpLinAlg, row::Int, column::Int)
+    code = getindex(sla.s, row, column)
+    return @inbounds sla.values[Int(code) + 1, column]
 end
 
 """
-    LinearAlgebra.mul!(out, sla::SnpLinAlg, v)
+    LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs)
 
-In-place matrix-vector multiplication.
+Multiply `sla` by a vector or matrix and overwrite `out`.
 """
 function mul!(
-    out::AbstractVector{T}, 
-    sla::SnpLinAlg{T}, 
-    v::AbstractVector{T}) where T <: AbstractFloat
-    @assert length(out) == size(sla, 1) && length(v) == size(sla, 2)
-    if sla.scale
-        sla.storagev2 .= sla.σinv .* v
-        w = sla.storagev2
-    else
-        w = v
-    end
-    fill!(out, zero(eltype(out)))
-    s = sla.s
-
-    _snparray_ax_tile!(out, s.data, w, sla.model, sla.μ, sla.impute, s.m)
-
-    if sla.center
-        return out .-= dot(sla.μ, w)
-    else
-        return out
-    end
+    out::AbstractVector{T},
+    sla::SnpLinAlg{T},
+    rhs::AbstractVector{T},
+) where T <: AbstractFloat
+    length(out) == size(sla, 1) || throw(DimensionMismatch(
+        "output has length $(length(out)); expected $(size(sla, 1))",
+    ))
+    length(rhs) == size(sla, 2) || throw(DimensionMismatch(
+        "right-hand side has length $(length(rhs)); expected $(size(sla, 2))",
+    ))
+    fill!(out, zero(T))
+    _snparray_ax_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
+    return out
 end
 
-"""
-    LinearAlgebra.mul!(out, sla::SnpLinAlg, V)
-
-In-place matrix-matrix multiplication.
-"""
 function mul!(
-    out::AbstractMatrix{T}, 
-    sla::SnpLinAlg{T}, 
-    V::AbstractMatrix{T}) where T <: AbstractFloat
-    @assert size(out, 1) == size(sla, 1) && size(out, 2) == size(V, 2) && size(sla, 2) == size(V, 1)
-    sla.storagev2 .= sla.center ? sla.μ : zero(T) # for on-the-fly centering
-    sla.storagev3 .= sla.scale ? sla.σinv : one(T) # for on-the-fly scaling
-
-    fill!(out, zero(eltype(out)))
-    s = sla.s
-
-    _snparray_AX_tile!(out, s.data, V, sla.model, sla.storagev2, sla.μ, sla.impute, s.m, sla.storagev3)
-
+    out::AbstractMatrix{T},
+    sla::SnpLinAlg{T},
+    rhs::AbstractMatrix{T},
+) where T <: AbstractFloat
+    size(out) == (size(sla, 1), size(rhs, 2)) || throw(DimensionMismatch(
+        "output has size $(size(out)); expected $((size(sla, 1), size(rhs, 2)))",
+    ))
+    size(rhs, 1) == size(sla, 2) || throw(DimensionMismatch(
+        "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
+    ))
+    fill!(out, zero(T))
+    _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
     return out
 end
 
 """
-    LinearAlgebra.mul!(out, st::Union{Transpose{T, SnpLinAlg{T}}, Adjoint{T, SnpLinAlg{T}}}, v)
+    LinearAlgebra.mul!(out, adjoint_sla, rhs)
 
-In-place matrix-vector multiplication, with transposed `SnpLinAlg`.
+Multiply the transpose or adjoint of a `SnpLinAlg` by a vector or matrix and
+overwrite `out`.
 """
 function mul!(
-    out::AbstractVector{T}, 
-    st::Union{Transpose{T, SnpLinAlg{T}}, Adjoint{T, SnpLinAlg{T}}},
-    v::AbstractVector{T}) where T <: AbstractFloat
-    @assert length(out) == size(st, 1) && length(v) == size(st, 2)
-    sla = st.parent
-    s = sla.s
-    fill!(out, zero(eltype(out)))
-
-    _snparray_atx_tile!(out, s.data, v, sla.model, sla.μ, sla.impute, s.m)
-    if sla.center
-        out .-= sum(v) .* sla.μ
-    end
-    if sla.scale
-        return out .*= sla.σinv
-    else
-        return out
-    end
-end
-
-"""
-    LinearAlgebra.mul!(out, st::Union{Transpose{T, SnpLinAlg{T}}, Adjoint{T, SnpLinAlg{T}}}, V)
-
-In-place matrix-matrix multiplication, with transposed `SnpLinAlg`.
-"""
-function mul!(
-    out::AbstractMatrix{T}, 
-    st::Union{Transpose{T, SnpLinAlg{T}}, Adjoint{T, SnpLinAlg{T}}},
-    V::AbstractMatrix{T}) where T <: AbstractFloat
-    sla = st.parent
-    @assert size(out, 1) == size(sla, 2) && size(out, 2) == size(V, 2) && size(sla, 1) == size(V, 1)
-
-    sla.storagev2 .= sla.center ? sla.μ : zero(T) # for on-the-fly centering
-    sla.storagev3 .= sla.scale ? sla.σinv : one(T) # for on-the-fly scaling
-
-    s = sla.s
-    fill!(out, zero(eltype(out)))
-
-    _snparray_AtX_tile!(out, s.data, V, sla.model, sla.storagev2, sla.μ, sla.impute, s.m, sla.storagev3)
-
+    out::AbstractVector{T},
+    transposed::Union{Transpose{T, SnpLinAlg{T}},
+                      Adjoint{T, SnpLinAlg{T}}},
+    rhs::AbstractVector{T},
+) where T <: AbstractFloat
+    sla = transposed.parent
+    length(out) == size(sla, 2) || throw(DimensionMismatch(
+        "output has length $(length(out)); expected $(size(sla, 2))",
+    ))
+    length(rhs) == size(sla, 1) || throw(DimensionMismatch(
+        "right-hand side has length $(length(rhs)); expected $(size(sla, 1))",
+    ))
+    fill!(out, zero(T))
+    _snparray_atx_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
     return out
 end
 
-wait(::Nothing) = nothing
+function mul!(
+    out::AbstractMatrix{T},
+    transposed::Union{Transpose{T, SnpLinAlg{T}},
+                      Adjoint{T, SnpLinAlg{T}}},
+    rhs::AbstractMatrix{T},
+) where T <: AbstractFloat
+    sla = transposed.parent
+    size(out) == (size(sla, 2), size(rhs, 2)) || throw(DimensionMismatch(
+        "output has size $(size(out)); expected $((size(sla, 2), size(rhs, 2)))",
+    ))
+    size(rhs, 1) == size(sla, 1) || throw(DimensionMismatch(
+        "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
+    ))
+    fill!(out, zero(T))
+    _snparray_AtX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
+    return out
+end
 
-function _snparray_ax_tile!(c, A, b, model, μ, impute, rows_filled)
-    vstep = 1024
-    hstep = 1024
-    vstep_log2 = 10
-    hstep_log2 = 10
-
-    if !impute
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_ax_additive!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_ax_dominant!
-        else
-            _ftn! = _snparray_ax_recessive!
-        end
-    else
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_ax_additive_meanimpute!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_ax_dominant_meanimpute!
-        else
-            _ftn! = _snparray_ax_recessive_meanimpute!
-        end
+@inline function _wait_for_task(task::Union{Nothing, Task})
+    if !isnothing(task)
+        wait(task)
     end
+    return nothing
+end
 
-    M = length(c) >> 2
-    N = size(A, 2)
-    Miter = M >>> vstep_log2 # fast div(M, 1024)
-    Mrem = rows_filled & (vstep << 2 - 1) # fast rem(rows_filled, 4vstep)
-    Niter = N >>> hstep_log2
-    Nrem = N & (hstep - 1)
-    taskarray = Array{Any}(undef, Miter + 1)
-    fill!(taskarray, nothing)
+function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
+    vertical_step = 1024
+    horizontal_step = 1024
+    vertical_iterations = (length(out) >> 2) >>> 10
+    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
+    horizontal_iterations = size(packed, 2) >>> 10
+    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
+    tasks = Vector{Union{Nothing, Task}}(undef, vertical_iterations + 1)
+    fill!(tasks, nothing)
     @sync begin
-        GC.@preserve c A b for n in 0:Niter - 1
-            for m in 0:Miter - 1
-                wait(taskarray[m+1])
-                taskarray[m+1] = Threads.@spawn _ftn!(
-                    gesp(stridedpointer(c), (4 * vstep * m,)),
-                    gesp(stridedpointer(A), (vstep * m, hstep * n)),
-                    gesp(stridedpointer(b), (hstep * n,)),
-                    vstep << 2, hstep, @view(μ[hstep * n + 1:hstep * (n + 1)])
+        for horizontal in 0:(horizontal_iterations - 1)
+            column_first = horizontal_step * horizontal + 1
+            column_last = horizontal_step * (horizontal + 1)
+            for vertical in 0:(vertical_iterations - 1)
+                slot = vertical + 1
+                _wait_for_task(tasks[slot])
+                row_first = 4vertical_step * vertical + 1
+                row_last = 4vertical_step * (vertical + 1)
+                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
+                    out, packed, rhs, values, $row_first, $row_last,
+                    $column_first, $column_last,
                 )
             end
-            if Mrem != 0
-                wait(taskarray[Miter+1])
-                taskarray[Miter+1] = Threads.@spawn _ftn!(
-                    @view(c[4 * vstep * Miter + 1:end]), 
-                    @view(A[vstep * Miter + 1:end, hstep * n + 1:hstep * (n + 1)]),
-                    @view(b[hstep * n + 1:hstep * (n + 1)]),
-                    length(c) - 4 * vstep * Miter, hstep,
-                    @view(μ[hstep * n + 1:hstep * (n + 1)])
+            if !iszero(vertical_remainder)
+                slot = vertical_iterations + 1
+                _wait_for_task(tasks[slot])
+                row_first = 4vertical_step * vertical_iterations + 1
+                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
+                    out, packed, rhs, values, $row_first, rows_filled,
+                    $column_first, $column_last,
                 )
             end
         end
-        if Nrem != 0
-            for m in 0:Miter-1
-                wait(taskarray[m+1])
-                taskarray[m+1] = Threads.@spawn _ftn!(
-                    @view(c[4 * vstep * m + 1:4 * vstep * (m + 1)]),
-                    @view(A[vstep * m + 1:vstep * (m + 1), hstep * Niter + 1:end]),
-                    @view(b[hstep * Niter + 1:end]),
-                    vstep << 2, 
-                    Nrem, @view(μ[hstep * Niter + 1:end])
+        if !iszero(horizontal_remainder)
+            column_first = horizontal_step * horizontal_iterations + 1
+            column_last = size(packed, 2)
+            for vertical in 0:(vertical_iterations - 1)
+                slot = vertical + 1
+                _wait_for_task(tasks[slot])
+                row_first = 4vertical_step * vertical + 1
+                row_last = 4vertical_step * (vertical + 1)
+                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
+                    out, packed, rhs, values, $row_first, $row_last,
+                    $column_first, $column_last,
                 )
             end
-            if Mrem != 0
-                wait(taskarray[Miter + 1])
-                taskarray[Miter + 1] = Threads.@spawn _ftn!(
-                    @view(c[4 * vstep * Miter+1:end]),
-                    @view(A[vstep * Miter + 1:end, hstep * Niter + 1:end]),
-                    @view(b[hstep * Niter + 1:end]),
-                    length(c) - 4 * vstep * Miter,
-                    Nrem, @view(μ[hstep * Niter + 1:end])
+            if !iszero(vertical_remainder)
+                slot = vertical_iterations + 1
+                _wait_for_task(tasks[slot])
+                row_first = 4vertical_step * vertical_iterations + 1
+                tasks[slot] = Threads.@spawn _snparray_ax_kernel!(
+                    out, packed, rhs, values, $row_first, rows_filled,
+                    $column_first, $column_last,
                 )
             end
         end
     end
+    return out
 end
 
-# μ[i] is mean of SNP i, and μimpute[i] is used to impute missings for SNP i
-function _snparray_AX_tile!(C, A, B, model, μ, μimpute, impute, rows_filled, σinv)
-    vstep = 256
-    hstep = 256
-    pstep = 256
-    vstep_log2 = 8
-    hstep_log2 = 8
-    pstep_log2 = 8
-
-    if !impute
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_AX_additive!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_AX_dominant!
-        else
-            _ftn! = _snparray_AX_recessive!
-        end
-    else
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_AX_additive_meanimpute!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_AX_dominant_meanimpute!
-        else
-            _ftn! = _snparray_AX_recessive_meanimpute!
-        end
-    end
-
-    M = size(C, 1) >> 2
-    N = size(A, 2)
-    P = size(C, 2)
-    Miter = M >>> vstep_log2 # fast div(M, 1024)
-    Mrem = rows_filled & (vstep << 2 - 1) # fast rem(rows_filled, 4vstep)
-    Niter = N >>> hstep_log2
-    Nrem = N & (hstep - 1)
-    Piter = P >>> pstep_log2
-    Prem = P & (pstep - 1)
-    taskarray = Array{Any}(undef, Miter + 1)
-    fill!(taskarray, nothing)
+function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
+    vertical_step = 256
+    horizontal_step = 256
+    rhs_step = 256
+    vertical_iterations = (size(out, 1) >> 2) >>> 8
+    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
+    horizontal_iterations = size(packed, 2) >>> 8
+    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
+    rhs_iterations = size(out, 2) >>> 8
+    rhs_remainder = size(out, 2) & (rhs_step - 1)
+    tasks = Vector{Union{Nothing, Task}}(undef, vertical_iterations + 1)
+    fill!(tasks, nothing)
     @sync begin
-        GC.@preserve C A B for p in 0:Piter - 1
-            for n in 0:Niter - 1
-                for m in 0:Miter - 1
-                    wait(taskarray[m+1])
-                    taskarray[m+1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * p + 1:pstep * (p + 1)]), 
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[hstep * n + 1:hstep * (n + 1), pstep * p + 1:pstep * (p + 1)]),
-                        vstep << 2, hstep, pstep, 
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
+        for rhs_tile in 0:rhs_iterations
+            rhs_tile == rhs_iterations && iszero(rhs_remainder) && break
+            rhs_first = rhs_step * rhs_tile + 1
+            rhs_last = min(rhs_step * (rhs_tile + 1), size(out, 2))
+            for horizontal in 0:horizontal_iterations
+                horizontal == horizontal_iterations &&
+                    iszero(horizontal_remainder) && break
+                column_first = horizontal_step * horizontal + 1
+                column_last = min(horizontal_step * (horizontal + 1),
+                                  size(packed, 2))
+                for vertical in 0:(vertical_iterations - 1)
+                    slot = vertical + 1
+                    _wait_for_task(tasks[slot])
+                    row_first = 4vertical_step * vertical + 1
+                    row_last = 4vertical_step * (vertical + 1)
+                    tasks[slot] = Threads.@spawn _snparray_AX_kernel!(
+                        out, packed, rhs, values, $row_first, $row_last,
+                        $column_first, $column_last, $rhs_first, $rhs_last,
                     )
                 end
-                if Mrem != 0
-                    wait(taskarray[Miter+1])
-                    taskarray[Miter+1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * Miter + 1:end, pstep * p + 1:pstep * (p + 1)]), 
-                        @view(A[vstep * Miter + 1:end, hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[hstep * n + 1:hstep * (n + 1), pstep * p + 1:pstep * (p + 1)]),
-                        size(C, 1) - 4 * vstep * Miter, hstep, pstep,
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
-                    )
-                end
-            end
-            if Nrem != 0
-                for m in 0:Miter-1
-                    wait(taskarray[m+1])
-                    taskarray[m+1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * p + 1:pstep * (p + 1)]),
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * Niter + 1:end]),
-                        @view(B[hstep * Niter + 1:end, pstep * p + 1:pstep * (p + 1)]),
-                        vstep << 2, Nrem, pstep,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
-                    )
-                end
-                if Mrem != 0
-                    wait(taskarray[Miter + 1])
-                    taskarray[Miter + 1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * Miter+1:end, pstep * p + 1:pstep * (p + 1)]),
-                        @view(A[vstep * Miter + 1:end, hstep * Niter + 1:end]),
-                        @view(B[hstep * Niter + 1:end, pstep * p + 1:pstep * (p + 1)]),
-                        size(C, 1) - 4 * vstep * Miter, Nrem, pstep,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
-                    )
-                end
-            end
-        end
-        if Prem != 0
-            for n in 0:Niter - 1
-                for m in 0:Miter - 1
-                    wait(taskarray[m+1])
-                    taskarray[m+1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * Piter + 1:end]), 
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[hstep * n + 1:hstep * (n + 1), pstep * Piter + 1:end]),
-                        vstep << 2, hstep, Prem,
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
-                    )
-                end
-                if Mrem != 0
-                    wait(taskarray[Miter+1])
-                    taskarray[Miter+1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * Miter + 1:end, pstep * Piter + 1:end]), 
-                        @view(A[vstep * Miter + 1:end, hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[hstep * n + 1:hstep * (n + 1), pstep * Piter + 1:end]),
-                        size(C, 1) - 4 * vstep * Miter, hstep, Prem,
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
-                    )
-                end
-            end
-            if Nrem != 0
-                for m in 0:Miter-1
-                    wait(taskarray[m+1])
-                    taskarray[m+1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * Piter + 1:end]),
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * Niter + 1:end]),
-                        @view(B[hstep * Niter + 1:end, pstep * Piter + 1:end]),
-                        vstep << 2, Nrem, Prem,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
-                    )
-                end
-                if Mrem != 0
-                    wait(taskarray[Miter + 1])
-                    taskarray[Miter + 1] = Threads.@spawn _ftn!(
-                        @view(C[4 * vstep * Miter+1:end, pstep * Piter + 1:end]),
-                        @view(A[vstep * Miter + 1:end, hstep * Niter + 1:end]),
-                        @view(B[hstep * Niter + 1:end, pstep * Piter + 1:end]),
-                        size(C, 1) - 4 * vstep * Miter, Nrem, Prem,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
+                if !iszero(vertical_remainder)
+                    slot = vertical_iterations + 1
+                    _wait_for_task(tasks[slot])
+                    row_first = 4vertical_step * vertical_iterations + 1
+                    tasks[slot] = Threads.@spawn _snparray_AX_kernel!(
+                        out, packed, rhs, values, $row_first, rows_filled,
+                        $column_first, $column_last, $rhs_first, $rhs_last,
                     )
                 end
             end
         end
     end
+    return out
 end
 
-function _snparray_atx_tile!(c, A, b, model, μ, impute, rows_filled)
-    vstep = 2048
-    hstep = 2048
-    vstep_log2 = 11
-    hstep_log2 = 11
-
-    if !impute
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_atx_additive!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_atx_dominant!
-        else
-            _ftn! = _snparray_atx_recessive!
-        end
-    else
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_atx_additive_meanimpute!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_atx_dominant_meanimpute!
-        else
-            _ftn! = _snparray_atx_recessive_meanimpute!
-        end
-    end
-
-    M = length(b) >> 2
-    N = size(A, 2)
-    Miter = M >>> vstep_log2 # fast div(M, 1024)
-    Mrem = rows_filled & (vstep << 2 - 1) # fast rem(rows_filled, 4vstep)
-    Niter = N >>> hstep_log2
-    Nrem = N & (hstep - 1)
-    taskarray = Array{Any}(undef, Niter+1)
-    fill!(taskarray, nothing)
+function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
+    vertical_step = 2048
+    horizontal_step = 2048
+    vertical_iterations = (length(rhs) >> 2) >>> 11
+    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
+    horizontal_iterations = size(packed, 2) >>> 11
+    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
+    tasks = Vector{Union{Nothing, Task}}(undef, horizontal_iterations + 1)
+    fill!(tasks, nothing)
     @sync begin
-        GC.@preserve c A b for m in 0:Miter - 1
-            for n in 0:Niter - 1
-                wait(taskarray[n + 1])
-                taskarray[n + 1] = Threads.@spawn _ftn!(
-                    gesp(stridedpointer(c), (hstep * n,)),
-                    gesp(stridedpointer(A), (vstep * m, hstep * n)),
-                    gesp(stridedpointer(b), (4 * vstep * m,)),
-                    vstep << 2, hstep, @view(μ[hstep * n + 1:hstep * (n + 1)])
+        for vertical in 0:vertical_iterations
+            vertical == vertical_iterations && iszero(vertical_remainder) && break
+            row_first = 4vertical_step * vertical + 1
+            row_last = min(4vertical_step * (vertical + 1), rows_filled)
+            for horizontal in 0:(horizontal_iterations - 1)
+                slot = horizontal + 1
+                _wait_for_task(tasks[slot])
+                column_first = horizontal_step * horizontal + 1
+                column_last = horizontal_step * (horizontal + 1)
+                tasks[slot] = Threads.@spawn _snparray_atx_kernel!(
+                    out, packed, rhs, values, $row_first, $row_last,
+                    $column_first, $column_last,
                 )
             end
-            if Nrem != 0
-                wait(taskarray[Niter + 1])
-                taskarray[Niter + 1] = Threads.@spawn _ftn!(
-                    @view(c[hstep * Niter + 1:end]),
-                    @view(A[vstep * m + 1:vstep * (m + 1), hstep * Niter + 1:end]),
-                    @view(b[4 * vstep * m + 1:4 * vstep * (m + 1)]),
-                    vstep << 2, Nrem, @view(μ[hstep * Niter + 1:end])
-                )
-            end
-
-        end
-        if Mrem != 0
-            for n in 0:Niter - 1
-                wait(taskarray[n + 1])
-                taskarray[n + 1] = Threads.@spawn _ftn!(
-                    @view(c[hstep * n + 1:hstep * (n + 1)]),
-                    @view(A[vstep * Miter + 1:end, hstep * n + 1:hstep * (n + 1)]),
-                    @view(b[4 * vstep * Miter + 1:end]),
-                    length(b) - 4 * vstep * Miter,
-                    hstep, @view(μ[hstep * n + 1:hstep * (n + 1)])
-                )
-            end
-            if Nrem != 0
-                wait(taskarray[Niter + 1])
-                taskarray[Niter + 1] = Threads.@spawn _ftn!(
-                    @view(c[hstep * Niter + 1:end]),
-                    @view(A[vstep * Miter + 1:end, hstep * Niter + 1:end]),
-                    @view(b[4 * vstep * Miter + 1:end]),
-                    length(b) - 4 * vstep * Miter,
-                    Nrem, @view(μ[hstep * Niter + 1:end])
+            if !iszero(horizontal_remainder)
+                slot = horizontal_iterations + 1
+                _wait_for_task(tasks[slot])
+                column_first = horizontal_step * horizontal_iterations + 1
+                tasks[slot] = Threads.@spawn _snparray_atx_kernel!(
+                    out, packed, rhs, values, $row_first, $row_last,
+                    $column_first, size(packed, 2),
                 )
             end
         end
     end
+    return out
 end
 
-# μ[i] is mean of SNP i, and μimpute[i] is used to impute missings for SNP i
-function _snparray_AtX_tile!(C, A, B, model, μ, μimpute, impute, rows_filled, σinv)
-    vstep = 2048
-    hstep = 2048
-    pstep = 2048
-    vstep_log2 = 11
-    hstep_log2 = 11
-    pstep_log2 = 11
-
-    if !impute
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_AtX_additive!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_AtX_dominant!
-        else
-            _ftn! = _snparray_AtX_recessive!
-        end
-    else
-        if model == ADDITIVE_MODEL
-            _ftn! = _snparray_AtX_additive_meanimpute!
-        elseif model == DOMINANT_MODEL
-            _ftn! = _snparray_AtX_dominant_meanimpute!
-        else
-            _ftn! = _snparray_AtX_recessive_meanimpute!
-        end
-    end
-
-    M = size(B, 1) >> 2
-    N = size(A, 2)
-    P = size(C, 2)
-    Miter = M >>> vstep_log2 # fast div(M, 1024)
-    Mrem = rows_filled & (vstep << 2 - 1) # fast rem(rows_filled, 4vstep)
-    Niter = N >>> hstep_log2
-    Nrem = N & (hstep - 1)
-    Piter = P >>> pstep_log2
-    Prem = P & (pstep - 1)
-    taskarray = Array{Any}(undef, Niter + 1)
-    fill!(taskarray, nothing)
+function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled)
+    vertical_step = 2048
+    horizontal_step = 2048
+    rhs_step = 2048
+    vertical_iterations = (size(rhs, 1) >> 2) >>> 11
+    vertical_remainder = rows_filled & ((vertical_step << 2) - 1)
+    horizontal_iterations = size(packed, 2) >>> 11
+    horizontal_remainder = size(packed, 2) & (horizontal_step - 1)
+    rhs_iterations = size(out, 2) >>> 11
+    rhs_remainder = size(out, 2) & (rhs_step - 1)
+    tasks = Vector{Union{Nothing, Task}}(undef, horizontal_iterations + 1)
+    fill!(tasks, nothing)
     @sync begin
-        GC.@preserve C A B for p in 0:Piter - 1
-            for m in 0:Miter - 1
-                for n in 0:Niter - 1
-                    wait(taskarray[n + 1])
-                    taskarray[n + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * n + 1:hstep * (n + 1), pstep * p + 1:pstep * (p + 1)]), 
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * p + 1:pstep * (p + 1)]),
-                        vstep << 2, hstep, pstep, 
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
+        for rhs_tile in 0:rhs_iterations
+            rhs_tile == rhs_iterations && iszero(rhs_remainder) && break
+            rhs_first = rhs_step * rhs_tile + 1
+            rhs_last = min(rhs_step * (rhs_tile + 1), size(out, 2))
+            for vertical in 0:vertical_iterations
+                vertical == vertical_iterations &&
+                    iszero(vertical_remainder) && break
+                row_first = 4vertical_step * vertical + 1
+                row_last = min(4vertical_step * (vertical + 1), rows_filled)
+                for horizontal in 0:(horizontal_iterations - 1)
+                    slot = horizontal + 1
+                    _wait_for_task(tasks[slot])
+                    column_first = horizontal_step * horizontal + 1
+                    column_last = horizontal_step * (horizontal + 1)
+                    tasks[slot] = Threads.@spawn _snparray_AtX_kernel!(
+                        out, packed, rhs, values, $row_first, $row_last,
+                        $column_first, $column_last, $rhs_first, $rhs_last,
                     )
                 end
-                if Nrem != 0
-                    wait(taskarray[Niter + 1])
-                    taskarray[Niter + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * Niter + 1:end, pstep * p + 1:pstep * (p + 1)]), 
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * Niter + 1:end]),
-                        @view(B[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * p + 1:pstep * (p + 1)]),
-                        vstep << 2, Nrem, pstep,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
-                    )
-                end
-            end
-            if Mrem != 0
-                for n in 0:Niter - 1
-                    wait(taskarray[n + 1])
-                    taskarray[n + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * n + 1:hstep * (n + 1), pstep * p + 1:pstep * (p + 1)]),
-                        @view(A[vstep * Miter + 1:end, hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[4 * vstep * Miter + 1:end, pstep * p + 1:pstep * (p + 1)]),
-                        size(B, 1) - 4 * vstep * Miter, hstep, pstep,
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
-                    )
-                end
-                if Nrem != 0
-                    wait(taskarray[Niter + 1])
-                    taskarray[Niter + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * Niter + 1:end, pstep * p + 1:pstep * (p + 1)]),
-                        @view(A[vstep * Miter + 1:end, hstep * Niter + 1:end]),
-                        @view(B[4 * vstep * Miter + 1:end, pstep * p + 1:pstep * (p + 1)]),
-                        size(B, 1) - 4 * vstep * Miter, Nrem, pstep,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
-                    )
-                end
-            end
-        end
-        if Prem != 0
-            for m in 0:Miter - 1
-                for n in 0:Niter - 1
-                    wait(taskarray[n + 1])
-                    taskarray[n + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * n + 1:hstep * (n + 1), pstep * Piter + 1:end]), 
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * Piter + 1:end]),
-                        vstep << 2, hstep, Prem,
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
-                    )
-                end
-                if Nrem != 0
-                    wait(taskarray[Niter + 1])
-                    taskarray[Niter + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * Niter + 1:end, pstep * Piter + 1:end]), 
-                        @view(A[vstep * m + 1:vstep * (m + 1), hstep * Niter + 1:end]),
-                        @view(B[4 * vstep * m + 1:4 * vstep * (m + 1), pstep * Piter + 1:end]),
-                        vstep << 2, Nrem, Prem,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
-                    )
-                end
-            end
-            if Mrem != 0
-                for n in 0:Niter - 1
-                    wait(taskarray[n + 1])
-                    taskarray[n + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * n + 1:hstep * (n + 1), pstep * Piter + 1:end]),
-                        @view(A[vstep * Miter + 1:end, hstep * n + 1:hstep * (n + 1)]),
-                        @view(B[4 * vstep * Miter + 1:end, pstep * Piter + 1:end]),
-                        size(B, 1) - 4 * vstep * Miter, hstep, Prem,
-                        @view(μ[hstep * n + 1:hstep * (n + 1)]),
-                        @view(μimpute[hstep * n + 1:hstep * (n + 1)]),
-                        @view(σinv[hstep * n + 1:hstep * (n + 1)])
-                    )
-                end
-                if Nrem != 0
-                    wait(taskarray[Niter + 1])
-                    taskarray[Niter + 1] = Threads.@spawn _ftn!(
-                        @view(C[hstep * Niter + 1:end, pstep * Piter + 1:end]),
-                        @view(A[vstep * Miter + 1:end, hstep * Niter + 1:end]),
-                        @view(B[4 * vstep * Miter + 1:end, pstep * Piter + 1:end]),
-                        size(B, 1) - 4 * vstep * Miter, Nrem, Prem,
-                        @view(μ[hstep * Niter + 1:end]),
-                        @view(μimpute[hstep * Niter + 1:end]),
-                        @view(σinv[hstep * Niter + 1:end])
+                if !iszero(horizontal_remainder)
+                    slot = horizontal_iterations + 1
+                    _wait_for_task(tasks[slot])
+                    column_first = horizontal_step * horizontal_iterations + 1
+                    tasks[slot] = Threads.@spawn _snparray_AtX_kernel!(
+                        out, packed, rhs, values, $row_first, $row_last,
+                        $column_first, size(packed, 2), $rhs_first, $rhs_last,
                     )
                 end
             end
         end
     end
+    return out
 end
 
-for (_ftn!, _ftn_rem!, expr) in [
-        (:_snparray_ax_additive!, :_snparray_ax_additive_rem!, 
-            :(((Aij >= 2) + (Aij == 3)) * v[j])),
-        (:_snparray_ax_dominant!, :_snparray_ax_dominant_rem!, 
-            :((Aij >= 2)  * v[j])),
-        (:_snparray_ax_recessive!, :_snparray_ax_recessive_rem!, 
-            :((Aij == 3) * v[j])),
-        (:_snparray_ax_additive_meanimpute!, :_snparray_ax_additive_meanimpute_rem!, 
-            :(((Aij >= 2) * 1.0 + (Aij == 3) * 1.0 + (Aij == 1) * μ[j]) * v[j])),
-        (:_snparray_ax_dominant_meanimpute!, :_snparray_ax_dominant_meanimpute_rem!, 
-            :((Aij >= 2) * v[j] + (Aij == 1) * μ[j] * v[j])),
-        (:_snparray_ax_recessive_meanimpute!, :_snparray_ax_recessive_meanimpute_rem!, 
-            :((Aij == 3) * v[j] + (Aij == 1) * μ[j] * v[j]))
-    ]
-    @eval begin
-        function ($_ftn_rem!)(out, s, v, μ)
-            maxp = length(out)
-            @avx for j in eachindex(v)
-                block = s[1, j]
-                for p in 1:maxp
-                    Aij = (block >> (2 * (p - 1))) & 3
-                    out[p] += $expr
-                end
-            end
-        end
-
-        function ($_ftn!)(out, s, v, rows, cols, μ)
-            k = rows >> 2
-            rem = rows & 3
-
-            if k ≥ 1 # avoid avxing over empty collection
-                @avx for j ∈ 1:cols
-                    for l in 1:k
-                        block = s[l, j]
-
-                        for p in 1:4
-                            Aij = (block >> (2 * (p - 1))) & 3
-                            out[4 * (l - 1) + p] += $expr
-                        end
-
-                    end
-                end
-            end
-            if rem != 0
-                ($_ftn_rem!)(@view(out[4k + 1:end]), @view(s[k + 1:k + 1, :]), v, μ)
-            end
-            nothing
-        end
-    end
+@inline function _packed_code(packed, row::Int, column::Int)
+    byte = @inbounds packed[((row - 1) >>> 2) + 1, column]
+    return Int((byte >> (2((row - 1) & 3))) & 0x03) + 1
 end
 
-for (_ftn!, _ftn_rem!, expr) in [
-        (:_snparray_atx_additive!, :_snparray_atx_additive_rem!, 
-            :(((Aij >= 2) + (Aij == 3)) * v[4 * (l - 1) + p])),
-        (:_snparray_atx_dominant!, :_snparray_atx_dominant_rem!, 
-            :((Aij >= 2)  * v[4 * (l - 1) + p])),
-        (:_snparray_atx_recessive!, :_snparray_atx_recessive_rem!, 
-            :((Aij == 3) * v[4 * (l - 1) + p])),
-        (:_snparray_atx_additive_meanimpute!, :_snparray_atx_additive_meanimpute_rem!, 
-            :(((Aij >= 2) * 1.0 + (Aij == 3) * 1.0 + (Aij == 1) * μ[i]) *  v[4 * (l - 1) + p])),
-        (:_snparray_atx_dominant_meanimpute!, :_snparray_atx_dominant_meanimpute_rem!, 
-            :((Aij >= 2) * v[4 * (l - 1) + p] + (Aij == 1) * μ[i] * v[4 * (l - 1) + p])),
-        (:_snparray_atx_recessive_meanimpute!, :_snparray_atx_recessive_meanimpute_rem!, 
-            :((Aij == 3) * v[4 * (l - 1) + p] + (Aij == 1) * μ[i] * v[4 * (l - 1) + p]))
-    ]
-    @eval begin
-        function $(_ftn_rem!)(out, s, v, μ)
-            maxp = length(v)
-            l = 1
-            @avx for i in eachindex(out)
-                block = s[1, i]
-                for p in 1:maxp
-                    Aij = (block >> (2 * (p - 1))) & 3
-                    out[i] += $expr
-                end
-            end
-        end
-
-        function $(_ftn!)(out, s, v, rows, cols, μ)
-            k = rows >> 2
-            rem = rows & 3
-
-            if k ≥ 1 # avoid avxing over empty collection
-                @avx for i ∈ 1:cols
-                    for l in 1:k
-                        block = s[l, i]
-                        
-                        for p in 1:4
-                            Aij = (block >> (2 * (p - 1))) & 3
-                            out[i] += $expr
-                        end
-                    end
-                end
-            end
-            if rem != 0
-                $(_ftn_rem!)(out, @view(s[k + 1:k + 1, :]), @view(v[4k + 1:end]), μ)
-            end
-            nothing
-        end
-    end
+function _snparray_ax_kernel!(out, packed, rhs, values, row_first, row_last,
+                              column_first, column_last)
+    return _snparray_ax_scalar!(out, packed, rhs, values, row_first, row_last,
+                                column_first, column_last)
 end
 
-for (_ftn!, _ftn_rem!, expr) in [
-        (:_snparray_AX_additive!, :_snparray_AX_additive_rem!, 
-            :(((Aij >= 2) + (Aij == 3) - μ[j]) * σinv[j] * V[j, c])),
-        (:_snparray_AX_dominant!, :_snparray_AX_dominant_rem!, 
-            :(((Aij >= 2) - μ[j]) * σinv[j] * V[j, c])),
-        (:_snparray_AX_recessive!, :_snparray_AX_recessive_rem!, 
-            :(((Aij == 3) - μ[j]) * σinv[j] * V[j, c])),
-        (:_snparray_AX_additive_meanimpute!, :_snparray_AX_additive_meanimpute_rem!, 
-            :(((((Aij >= 2) + (Aij == 3) - μ[j]) + (Aij == 1) * μimpute[j]) * σinv[j] * V[j, c]))),
-        (:_snparray_AX_dominant_meanimpute!, :_snparray_AX_dominant_meanimpute_rem!, 
-            :(((Aij >= 2) - μ[j]) * σinv[j] * V[j, c] + (Aij == 1) * μimpute[j] * σinv[j] * V[j, c])),
-            (:_snparray_AX_recessive_meanimpute!, :_snparray_AX_recessive_meanimpute_rem!, 
-            :(((Aij == 3) - μ[j]) * V[j, c] * σinv[j] + (Aij == 1) * μimpute[j] * σinv[j] * V[j, c]))
-    ]
-    @eval begin
-        function ($_ftn_rem!)(out, s, V, μ, μimpute, σinv, c)
-            maxp = size(out, 1)
-            @avx for j in 1:size(V, 1)
-                block = s[1, j]
-                for p in 1:maxp
-                    Aij = (block >> (2 * (p - 1))) & 3
-                    out[p, c] += $expr
-                end
-            end
-        end
-
-        function ($_ftn!)(out, s, V, srows, scols, Vcols, μ, μimpute, σinv)
-            k = srows >> 2 # fast div(srows, 4)
-            rem = srows & 3 # fast rem(srows, 4)
-
-            # compute out[i, c] = s[i, j] * V[j, c] for j in 1:n
-            if k ≥ 1 # avoid avxing over empty collection
-                @avx for c in 1:Vcols
-                    for j in 1:scols
-                        for l in 1:k
-                            block = s[l, j]
-                            for p in 1:4
-                                Aij = (block >> (2 * (p - 1))) & 3
-                                out[4*(l - 1) + p, c] += $expr
-                            end
-                        end
-                    end
-                end
-            end
-            if rem != 0
-                for c in 1:Vcols
-                    ($_ftn_rem!)(@view(out[4k + 1:end, :]), @view(s[k + 1:k + 1, :]),
-                        V, μ, μimpute, σinv, c)
-                end
-            end
-            nothing
+function _snparray_ax_scalar!(out, packed, rhs, values, row_first, row_last,
+                              column_first, column_last)
+    @inbounds for column in column_first:column_last
+        rhs_value = rhs[column]
+        for row in row_first:row_last
+            out[row] += values[_packed_code(packed, row, column), column] *
+                        rhs_value
         end
     end
+    return out
 end
 
-for (_ftn!, _ftn_rem!, expr) in [
-    (:_snparray_AtX_additive!, :_snparray_AtX_additive_rem!, 
-        :(((Aij >= 2) + (Aij == 3) - μ[i]) * σinv[i] * V[4 * (l - 1) + p, c])),
-    (:_snparray_AtX_dominant!, :_snparray_AtX_dominant_rem!, 
-        :(((Aij >= 2) - μ[i]) * σinv[i] * V[4 * (l - 1) + p, c])),
-    (:_snparray_AtX_recessive!, :_snparray_AtX_recessive_rem!, 
-        :(((Aij == 3) - μ[i]) * σinv[i] * V[4 * (l - 1) + p, c])),
-    (:_snparray_AtX_additive_meanimpute!, :_snparray_AtX_additive_meanimpute_rem!, 
-        :(((((Aij >= 2) + (Aij == 3) - μ[i]) + (Aij == 1) * μimpute[i]) * σinv[i] * V[4 * (l - 1) + p, c]))),
-    (:_snparray_AtX_dominant_meanimpute!, :_snparray_AtX_dominant_meanimpute_rem!, 
-        :(((Aij >= 2) - μ[i]) * σinv[i] * V[4 * (l - 1) + p, c] + (Aij == 1) * μimpute[i] * σinv[i] * V[4 * (l - 1) + p, c])),
-    (:_snparray_AtX_recessive_meanimpute!, :_snparray_AtX_recessive_meanimpute_rem!, 
-        :(((Aij == 3) - μ[i]) * σinv[i] * V[4 * (l - 1) + p, c] + (Aij == 1) * μimpute[i] * σinv[i] * V[4 * (l - 1) + p, c]))
-]
-    @eval begin
-        function ($_ftn_rem!)(out, s, V, μ, μimpute, σinv, c)
-            maxp = size(V, 1)
-            l = 1
-            @avx for i in 1:size(out, 1)
-                block = s[1, i]
-                for p in 1:maxp
-                    Aij = (block >> (2 * (p - 1))) & 3
-                    out[i, c] += $expr
-                end
-            end
-        end
+function _snparray_AX_kernel!(out, packed, rhs, values, row_first, row_last,
+                              column_first, column_last, rhs_first, rhs_last)
+    return _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
+                                column_first, column_last, rhs_first, rhs_last)
+end
 
-        function ($_ftn!)(out, s, V, srows, scols, Vcols, μ, μimpute, σinv)
-            k = srows >> 2 # fast div(srows, 4)
-            rem = srows & 3 # fast rem(srows, 4)
-
-            if k ≥ 1 # avoid avxing over empty collection
-                @avx for c in 1:Vcols
-                    for i in 1:scols
-                        for l in 1:k
-                            block = s[l, i]
-                            for p in 1:4
-                                Aij = (block >> (2 * (p - 1))) & 3
-                                out[i, c] += $expr
-                            end
-                        end
-                    end
-                end
+function _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
+                              column_first, column_last, rhs_first, rhs_last)
+    @inbounds for rhs_column in rhs_first:rhs_last
+        for column in column_first:column_last
+            rhs_value = rhs[column, rhs_column]
+            for row in row_first:row_last
+                out[row, rhs_column] +=
+                    values[_packed_code(packed, row, column), column] * rhs_value
             end
-            if rem != 0
-                for c in 1:Vcols
-                    ($_ftn_rem!)(out, @view(s[k + 1:k + 1, :]),
-                        @view(V[4k + 1:end, :]), μ, μimpute, σinv, c)
-                end
-            end
-            nothing
         end
     end
+    return out
+end
+
+function _snparray_atx_kernel!(out, packed, rhs, values, row_first, row_last,
+                               column_first, column_last)
+    return _snparray_atx_scalar!(out, packed, rhs, values, row_first, row_last,
+                                 column_first, column_last)
+end
+
+function _snparray_atx_scalar!(out, packed, rhs, values, row_first, row_last,
+                               column_first, column_last)
+    @inbounds for column in column_first:column_last
+        total = out[column]
+        for row in row_first:row_last
+            total += values[_packed_code(packed, row, column), column] * rhs[row]
+        end
+        out[column] = total
+    end
+    return out
+end
+
+function _snparray_AtX_kernel!(out, packed, rhs, values, row_first, row_last,
+                               column_first, column_last, rhs_first, rhs_last)
+    return _snparray_AtX_scalar!(out, packed, rhs, values, row_first, row_last,
+                                 column_first, column_last, rhs_first, rhs_last)
+end
+
+function _snparray_AtX_scalar!(out, packed, rhs, values, row_first, row_last,
+                               column_first, column_last, rhs_first, rhs_last)
+    @inbounds for rhs_column in rhs_first:rhs_last
+        for column in column_first:column_last
+            total = out[column, rhs_column]
+            for row in row_first:row_last
+                total += values[_packed_code(packed, row, column), column] *
+                         rhs[row, rhs_column]
+            end
+            out[column, rhs_column] = total
+        end
+    end
+    return out
 end
 
 """
-    Base.copyto!(v, s)
+    Base.copyto!(destination, source)
 
-Copy SnpLinAlg `s` to numeric vector or matrix `v`. If `s` is centered/scaled,
-`v` will be centered/scaled using precomputed column mean `s.μ` and inverse std 
-`s.σinv`.
+Copy a `SnpLinAlg` or one of its views to a floating-point vector or matrix.
 """
 function Base.copyto!(
-    v::AbstractVecOrMat{T}, 
-    s::AbstractSnpLinAlg
-    ) where T <: AbstractFloat
-    m, n = size(s, 1), size(s, 2)
-    @inbounds for j in 1:n
-        @simd for i in 1:m
-            v[i, j] = s[i, j]
-        end
+    destination::AbstractVecOrMat{T},
+    source::AbstractSnpLinAlg,
+) where T <: AbstractFloat
+    size(destination) == size(source) || throw(DimensionMismatch(
+        "destination has size $(size(destination)); expected $(size(source))",
+    ))
+    for index in eachindex(destination, source)
+        @inbounds destination[index] = source[index]
     end
-    return v
+    return destination
 end
 
 """
-    Base.convert(t, s)
+    Base.convert(T, source)
 
-Convert a AbstractSnpLinAlg `s` to a numeric vector or matrix of same shape as `s`.
-If `s` is centered/scaled, `v` will be centered/scaled using precomputed column
-mean `s.μ` and inverse std `s.σinv`.
-
-# Arguments
-- `t::Type{AbstractVecOrMat{T}}`: Vector or matrix type.
+Convert a `SnpLinAlg` or one of its views to an array with the same shape.
 """
-Base.convert(::Type{T}, s::AbstractSnpLinAlg) where T <: Array = T(s)
-Array{T,N}(s::AbstractSnpLinAlg) where {T,N} = 
-    copyto!(Array{T,N}(undef, size(s)), s)
+Base.convert(::Type{T}, source::AbstractSnpLinAlg) where T <: Array = T(source)
+Array{T, N}(source::AbstractSnpLinAlg) where {T, N} =
+    copyto!(Array{T, N}(undef, size(source)), source)
