@@ -25,9 +25,11 @@ end
         code2 = Vec{N, T}(values[3, column])
         code3 = Vec{N, T}(values[4, column])
     end
-    return vifelse(codes == UInt8(0), code0,
-                   vifelse(codes == UInt8(1), code1,
-                            vifelse(codes == UInt8(2), code2, code3)))
+    low_bit_is_zero = (codes & UInt8(1)) == UInt8(0)
+    high_bit_is_zero = (codes & UInt8(2)) == UInt8(0)
+    lower_values = vifelse(low_bit_is_zero, code0, code1)
+    upper_values = vifelse(low_bit_is_zero, code2, code3)
+    return vifelse(high_bit_is_zero, lower_values, upper_values)
 end
 
 @inline function _decode_genotypes(
