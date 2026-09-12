@@ -188,15 +188,17 @@ function mul!(
 end
 
 function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
-    row_step = 4096
-    column_step = 1024
+    n = size(packed, 2)
+    row_step, column_step, _ =
+        _tile_sizes(eltype(out), rows_filled, n, 1, :forward; vector=true)
+    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
     @sync begin
         for row_first in 1:row_step:rows_filled
             row_last = min(row_first + row_step - 1, rows_filled)
+            @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
             Threads.@spawn begin
-                for column_first in 1:column_step:size(packed, 2)
-                    column_last = min(column_first + column_step - 1,
-                                      size(packed, 2))
+                for column_first in 1:column_step:n
+                    column_last = min(column_first + column_step - 1, n)
                     _snparray_ax_kernel!(
                         out, packed, rhs, values, $row_first, $row_last,
                         column_first, column_last,
@@ -209,24 +211,23 @@ function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
 end
 
 function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
-    row_step = 1024
-    column_step = 256
-    rhs_step = 256
+    n = size(packed, 2)
+    k = size(out, 2)
+    T = eltype(out)
+    row_step, column_step, rhs_step =
+        _tile_sizes(T, rows_filled, n, k, :forward; vector=false)
+    width = Val(_vector_width(T))
+    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
     @sync begin
-        for rhs_first in 1:rhs_step:size(out, 2)
-            rhs_last = min(rhs_first + rhs_step - 1, size(out, 2))
+        for rhs_first in 1:rhs_step:k
+            rhs_last = min(rhs_first + rhs_step - 1, k)
             for row_first in 1:row_step:rows_filled
                 row_last = min(row_first + row_step - 1, rows_filled)
-                Threads.@spawn begin
-                    for column_first in 1:column_step:size(packed, 2)
-                        column_last = min(column_first + column_step - 1,
-                                          size(packed, 2))
-                        _snparray_AX_kernel!(
-                            out, packed, rhs, values, $row_first, $row_last,
-                            column_first, column_last, $rhs_first, $rhs_last,
-                        )
-                    end
-                end
+                @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
+                Threads.@spawn _snparray_AX_kernel!(
+                    out, packed, rhs, values, $row_first, $row_last,
+                    $column_step, $rhs_first, $rhs_last, $width,
+                )
             end
         end
     end
@@ -234,15 +235,17 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
 end
 
 function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
-    row_step = 8192
-    column_step = 2048
+    n = size(packed, 2)
+    row_step, column_step, _ =
+        _tile_sizes(eltype(out), rows_filled, n, 1, :transpose; vector=true)
+    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
     @sync begin
-        for column_first in 1:column_step:size(packed, 2)
-            column_last = min(column_first + column_step - 1,
-                              size(packed, 2))
+        for column_first in 1:column_step:n
+            column_last = min(column_first + column_step - 1, n)
             Threads.@spawn begin
                 for row_first in 1:row_step:rows_filled
                     row_last = min(row_first + row_step - 1, rows_filled)
+                    @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
                     _snparray_atx_kernel!(
                         out, packed, rhs, values, row_first, row_last,
                         $column_first, $column_last,
@@ -255,25 +258,23 @@ function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
 end
 
 function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled)
-    row_step = 8192
-    column_step = 2048
-    rhs_step = 2048
+    n = size(packed, 2)
+    k = size(out, 2)
+    T = eltype(out)
+    row_step, column_step, rhs_step =
+        _tile_sizes(T, rows_filled, n, k, :transpose; vector=false)
+    width = Val(_vector_width(T))
+    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
     @sync begin
-        for rhs_first in 1:rhs_step:size(out, 2)
-            rhs_last = min(rhs_first + rhs_step - 1, size(out, 2))
-            for column_first in 1:column_step:size(packed, 2)
-                column_last = min(column_first + column_step - 1,
-                                  size(packed, 2))
-                Threads.@spawn begin
-                    for row_first in 1:row_step:rows_filled
-                        row_last = min(row_first + row_step - 1, rows_filled)
-                        _snparray_AtX_kernel!(
-                            out, packed, rhs, values, row_first, row_last,
-                            $column_first, $column_last,
-                            $rhs_first, $rhs_last,
-                        )
-                    end
-                end
+        for rhs_first in 1:rhs_step:k
+            rhs_last = min(rhs_first + rhs_step - 1, k)
+            for column_first in 1:column_step:n
+                column_last = min(column_first + column_step - 1, n)
+                Threads.@spawn _snparray_AtX_kernel!(
+                    out, packed, rhs, values, $row_step, rows_filled,
+                    $column_first, $column_last, $rhs_first, $rhs_last,
+                    $width,
+                )
             end
         end
     end
@@ -304,9 +305,9 @@ function _snparray_ax_scalar!(out, packed, rhs, values, row_first, row_last,
 end
 
 function _snparray_AX_kernel!(out, packed, rhs, values, row_first, row_last,
-                              column_first, column_last, rhs_first, rhs_last)
+                              column_step, rhs_first, rhs_last, ::Val)
     return _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
-                                column_first, column_last, rhs_first, rhs_last)
+                                1, size(packed, 2), rhs_first, rhs_last)
 end
 
 function _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
@@ -341,9 +342,10 @@ function _snparray_atx_scalar!(out, packed, rhs, values, row_first, row_last,
     return out
 end
 
-function _snparray_AtX_kernel!(out, packed, rhs, values, row_first, row_last,
-                               column_first, column_last, rhs_first, rhs_last)
-    return _snparray_AtX_scalar!(out, packed, rhs, values, row_first, row_last,
+function _snparray_AtX_kernel!(out, packed, rhs, values, row_step,
+                               rows_filled, column_first, column_last,
+                               rhs_first, rhs_last, ::Val)
+    return _snparray_AtX_scalar!(out, packed, rhs, values, 1, rows_filled,
                                  column_first, column_last, rhs_first, rhs_last)
 end
 

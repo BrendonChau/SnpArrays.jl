@@ -1,0 +1,168 @@
+## before (commit 2c5b1ce, unmodified kernels)
+### -t auto, R=20
+Threads.nthreads() = 8
+Sys.CPU_NAME = apple-m1
+Sys.ARCH = aarch64
+VERSION = 1.12.7
+R = 20
+samples (m) = 379
+SNPs (n) = 54051
+VECTOR_BYTES = n/a
+_micro_tile(Float32) = n/a
+_micro_tile(Float64) = n/a
+_tile_sizes(Float32, k=1) = n/a
+_tile_sizes(Float32, k=8) = n/a
+_tile_sizes(Float32, k=32) = n/a
+_tile_sizes(Float32, k=128) = n/a
+_tile_sizes(Float64, k=1) = n/a
+_tile_sizes(Float64, k=8) = n/a
+_tile_sizes(Float64, k=32) = n/a
+_tile_sizes(Float64, k=128) = n/a
+stacking genotypes (R=20)...
+stacking took 1.91 s
+Float32  A*x    k=1         46.901 ms       8.74 GFMA/s
+Float32  Aᵀ*y   k=1         11.645 ms      35.18 GFMA/s
+Float32  A*X    k=8          32.196 ms     101.80 GFMA/s
+Float32  A*X    k=32        120.031 ms     109.23 GFMA/s
+Float32  A*X    k=128       484.602 ms     108.22 GFMA/s
+Float32  Aᵀ*Y   k=8          33.054 ms      99.16 GFMA/s
+Float32  Aᵀ*Y   k=32        132.129 ms      99.23 GFMA/s
+Float32  Aᵀ*Y   k=128       531.970 ms      98.58 GFMA/s
+Float64  A*x    k=1         88.635 ms       4.62 GFMA/s
+Float64  Aᵀ*y   k=1         23.193 ms      17.67 GFMA/s
+Float64  A*X    k=8          76.716 ms      42.72 GFMA/s
+Float64  A*X    k=32        299.749 ms      43.74 GFMA/s
+Float64  A*X    k=128      1162.212 ms      45.12 GFMA/s
+Float64  Aᵀ*Y   k=8          80.139 ms      40.90 GFMA/s
+Float64  Aᵀ*Y   k=32        335.464 ms      39.08 GFMA/s
+Float64  Aᵀ*Y   k=128      1420.134 ms      36.93 GFMA/s
+
+### -t 1, R=4
+Threads.nthreads() = 1
+Sys.CPU_NAME = apple-m1
+Sys.ARCH = aarch64
+VERSION = 1.12.7
+R = 4
+samples (m) = 379
+SNPs (n) = 54051
+VECTOR_BYTES = n/a
+_micro_tile(Float32) = n/a
+_micro_tile(Float64) = n/a
+_tile_sizes(Float32, k=1) = n/a
+_tile_sizes(Float32, k=8) = n/a
+_tile_sizes(Float32, k=32) = n/a
+_tile_sizes(Float32, k=128) = n/a
+_tile_sizes(Float64, k=1) = n/a
+_tile_sizes(Float64, k=8) = n/a
+_tile_sizes(Float64, k=32) = n/a
+_tile_sizes(Float64, k=128) = n/a
+stacking genotypes (R=4)...
+stacking took 0.36 s
+Float32  A*x    k=1         17.693 ms       4.63 GFMA/s
+Float32  Aᵀ*y   k=1         15.673 ms       5.23 GFMA/s
+Float32  A*X    k=8          42.979 ms      15.25 GFMA/s
+Float32  A*X    k=32        164.032 ms      15.99 GFMA/s
+Float32  A*X    k=128       645.418 ms      16.25 GFMA/s
+Float32  Aᵀ*Y   k=8          44.192 ms      14.83 GFMA/s
+Float32  Aᵀ*Y   k=32        177.970 ms      14.73 GFMA/s
+Float32  Aᵀ*Y   k=128       712.888 ms      14.71 GFMA/s
+Float64  A*x    k=1         32.267 ms       2.54 GFMA/s
+Float64  Aᵀ*y   k=1         29.834 ms       2.75 GFMA/s
+Float64  A*X    k=8         101.270 ms       6.47 GFMA/s
+Float64  A*X    k=32        394.082 ms       6.65 GFMA/s
+Float64  A*X    k=128      1570.648 ms       6.68 GFMA/s
+Float64  Aᵀ*Y   k=8          97.654 ms       6.71 GFMA/s
+Float64  Aᵀ*Y   k=32        392.276 ms       6.68 GFMA/s
+Float64  Aᵀ*Y   k=128      1573.967 ms       6.66 GFMA/s
+
+## after (micro-kernels, heuristic tiles; working tree on top of 2c5b1ce)
+### -t auto, R=20
+stacking genotypes (R=20)...
+stacking took 1.92 s
+Threads.nthreads() = 8
+Sys.CPU_NAME = apple-m1
+Sys.ARCH = aarch64
+VERSION = 1.12.7
+R = 20
+samples (m) = 379
+SNPs (n) = 54051
+VECTOR_BYTES = 32
+_micro_tile(Float32) = (6, 16)
+_micro_tile(Float64) = (6, 8)
+_tile_sizes(Float32, k=1, :forward) = (256, 54051, 1)
+_tile_sizes(Float32, k=1, :transpose) = (4096, 1696, 1)
+_tile_sizes(Float32, k=8, :forward) = (256, 512, 8)
+_tile_sizes(Float32, k=8, :transpose) = (4096, 1696, 8)
+_tile_sizes(Float32, k=32, :forward) = (256, 512, 32)
+_tile_sizes(Float32, k=32, :transpose) = (2048, 1696, 32)
+_tile_sizes(Float32, k=128, :forward) = (256, 512, 128)
+_tile_sizes(Float32, k=128, :transpose) = (512, 1696, 128)
+_tile_sizes(Float64, k=1, :forward) = (256, 54051, 1)
+_tile_sizes(Float64, k=1, :transpose) = (2048, 1696, 1)
+_tile_sizes(Float64, k=8, :forward) = (256, 512, 8)
+_tile_sizes(Float64, k=8, :transpose) = (4096, 1696, 8)
+_tile_sizes(Float64, k=32, :forward) = (256, 512, 32)
+_tile_sizes(Float64, k=32, :transpose) = (1024, 1696, 32)
+_tile_sizes(Float64, k=128, :forward) = (256, 256, 128)
+_tile_sizes(Float64, k=128, :transpose) = (256, 1696, 128)
+Float32  A*x    k=1         39.306 ms      10.42 GFMA/s
+Float32  Aᵀ*y   k=1         10.733 ms      38.17 GFMA/s
+Float32  A*X    k=8          29.290 ms     111.90 GFMA/s
+Float32  A*X    k=32         69.398 ms     188.92 GFMA/s
+Float32  A*X    k=128       261.506 ms     200.54 GFMA/s
+Float32  Aᵀ*Y   k=8          22.219 ms     147.52 GFMA/s
+Float32  Aᵀ*Y   k=32         54.598 ms     240.13 GFMA/s
+Float32  Aᵀ*Y   k=128       229.710 ms     228.30 GFMA/s
+Float64  A*x    k=1         50.221 ms       8.16 GFMA/s
+Float64  Aᵀ*y   k=1         21.235 ms      19.29 GFMA/s
+Float64  A*X    k=8          36.636 ms      89.47 GFMA/s
+Float64  A*X    k=32        126.068 ms     104.00 GFMA/s
+Float64  A*X    k=128       488.716 ms     107.31 GFMA/s
+Float64  Aᵀ*Y   k=8          26.112 ms     125.52 GFMA/s
+Float64  Aᵀ*Y   k=32        115.727 ms     113.29 GFMA/s
+Float64  Aᵀ*Y   k=128       455.829 ms     115.05 GFMA/s
+### -t 1, R=4
+stacking genotypes (R=4)...
+stacking took 0.35 s
+Threads.nthreads() = 1
+Sys.CPU_NAME = apple-m1
+Sys.ARCH = aarch64
+VERSION = 1.12.7
+R = 4
+samples (m) = 379
+SNPs (n) = 54051
+VECTOR_BYTES = 32
+_micro_tile(Float32) = (6, 16)
+_micro_tile(Float64) = (6, 8)
+_tile_sizes(Float32, k=1, :forward) = (384, 54051, 1)
+_tile_sizes(Float32, k=1, :transpose) = (4096, 2048, 1)
+_tile_sizes(Float32, k=8, :forward) = (384, 512, 8)
+_tile_sizes(Float32, k=8, :transpose) = (4096, 2048, 8)
+_tile_sizes(Float32, k=32, :forward) = (384, 512, 32)
+_tile_sizes(Float32, k=32, :transpose) = (2048, 2048, 32)
+_tile_sizes(Float32, k=128, :forward) = (384, 512, 128)
+_tile_sizes(Float32, k=128, :transpose) = (512, 2048, 128)
+_tile_sizes(Float64, k=1, :forward) = (384, 54051, 1)
+_tile_sizes(Float64, k=1, :transpose) = (2048, 2048, 1)
+_tile_sizes(Float64, k=8, :forward) = (384, 512, 8)
+_tile_sizes(Float64, k=8, :transpose) = (4096, 2048, 8)
+_tile_sizes(Float64, k=32, :forward) = (384, 512, 32)
+_tile_sizes(Float64, k=32, :transpose) = (1024, 2048, 32)
+_tile_sizes(Float64, k=128, :forward) = (384, 256, 128)
+_tile_sizes(Float64, k=128, :transpose) = (256, 2048, 128)
+Float32  A*x    k=1         16.636 ms       4.93 GFMA/s
+Float32  Aᵀ*y   k=1         15.111 ms       5.42 GFMA/s
+Float32  A*X    k=8          34.316 ms      19.10 GFMA/s
+Float32  A*X    k=32         85.468 ms      30.68 GFMA/s
+Float32  A*X    k=128       330.647 ms      31.72 GFMA/s
+Float32  Aᵀ*Y   k=8          31.617 ms      20.73 GFMA/s
+Float32  Aᵀ*Y   k=32         78.254 ms      33.51 GFMA/s
+Float32  Aᵀ*Y   k=128       324.001 ms      32.37 GFMA/s
+Float64  A*x    k=1         32.485 ms       2.52 GFMA/s
+Float64  Aᵀ*y   k=1         29.621 ms       2.77 GFMA/s
+Float64  A*X    k=8          43.125 ms      15.20 GFMA/s
+Float64  A*X    k=32        161.812 ms      16.20 GFMA/s
+Float64  A*X    k=128       646.642 ms      16.22 GFMA/s
+Float64  Aᵀ*Y   k=8          38.678 ms      16.95 GFMA/s
+Float64  Aᵀ*Y   k=32        155.879 ms      16.82 GFMA/s
+Float64  Aᵀ*Y   k=128       641.947 ms      16.34 GFMA/s

@@ -1,10 +1,14 @@
-function simd_test_fixture(rows::Int, columns::Int)
+function simd_test_fixture(
+    rows::Int,
+    columns::Int;
+    allow_missing::Bool = true,
+)
     dense = Matrix{UInt8}(undef, rows, columns)
     packed = SnpArray(undef, rows, columns)
     fill!(packed.data, 0x55)
     for column in 1:columns, row in 1:rows
         code = UInt8(mod(row + 2column, 4))
-        if rows == 1 && code == 0x01
+        if (rows == 1 || !allow_missing) && code == 0x01
             code = 0x03
         end
         dense[row, column] = code
@@ -264,39 +268,228 @@ end
                    transpose(finite_reference) * backward; nans=true)
 end
 
-function filled_genotype_fixture(rows::Int, columns::Int, code::UInt8)
-    fixture = SnpArray(undef, rows, columns)
-    fill!(fixture.data, 0x55)
-    for column in 1:columns, row in 1:rows
-        byte_index = ((row - 1) >>> 2) + 1
-        shift = 2((row - 1) & 3)
-        fixture.data[byte_index, column] &= ~(UInt8(3) << shift)
-        fixture.data[byte_index, column] |= code << shift
+@testset "SnpLinAlg scheduler tile boundaries" begin
+    probe_m, probe_n = 4097, 2049
+
+    for T in (Float32, Float64)
+        # A*x / A*X: samples axis (row_step), small SNP count.
+        for k in (1, 8)
+            step = SnpArrays._tile_sizes(T, probe_m, 37, k, :forward)[1]
+            for m in (step - 1, step + 1, 2step + 1)
+                packed, dense = simd_test_fixture(m, 37; allow_missing=false)
+                reference = simd_test_reference(
+                    dense, T, ADDITIVE_MODEL, false, false, true,
+                )
+                operator = SnpLinAlg{T}(packed)
+                rhs = simd_test_rhs(T, 37, k)
+                expected = reference * rhs
+                actual = SnpArrays._tile_sizes(T, m, 37, k, :forward)[1]
+                @test actual <= step
+                m > step && @test m > actual
+                result = k == 1 ? operator * vec(rhs) : operator * rhs
+                @test isapprox(result, k == 1 ? vec(expected) : expected;
+                               atol=64eps(T), rtol=64eps(T), nans=true)
+            end
+        end
+
+        # A*X inner column axis (column_step), samples = 257.
+        let column_step =
+                SnpArrays._tile_sizes(T, 257, probe_n, 8, :forward)[2]
+            n = column_step + 1
+            actual = SnpArrays._tile_sizes(T, 257, n, 8, :forward)[2]
+            @test actual <= column_step
+            @test n > actual
+            packed, dense = simd_test_fixture(257, n; allow_missing=false)
+            reference = simd_test_reference(
+                dense, T, ADDITIVE_MODEL, false, false, true,
+            )
+            operator = SnpLinAlg{T}(packed)
+            rhs = simd_test_rhs(T, n, 8)
+            @test isapprox(operator * rhs, reference * rhs;
+                           atol=64eps(T), rtol=64eps(T), nans=true)
+        end
+
+        # transpose(A)*x / transpose(A)*X: SNP axis (column_step), m = 37.
+        for k in (1, 8)
+            step = SnpArrays._tile_sizes(T, 37, probe_n, k, :transpose)[2]
+            for n in (step - 1, step + 1, 2step + 1)
+                packed, dense = simd_test_fixture(37, n; allow_missing=false)
+                reference = simd_test_reference(
+                    dense, T, ADDITIVE_MODEL, false, false, true,
+                )
+                operator = SnpLinAlg{T}(packed)
+                rhs = simd_test_rhs(T, 37, k)
+                expected = transpose(reference) * rhs
+                actual = SnpArrays._tile_sizes(T, 37, n, k, :transpose)[2]
+                @test actual <= step
+                n > step && @test n > actual
+                result = k == 1 ?
+                    transpose(operator) * vec(rhs) : transpose(operator) * rhs
+                @test isapprox(result, k == 1 ? vec(expected) : expected;
+                               atol=64eps(T), rtol=64eps(T), nans=true)
+            end
+        end
+
+        # transpose(A)*x / transpose(A)*X: sample-block axis (row_step),
+        # SNPs = 37.
+        for k in (1, 8)
+            step = SnpArrays._tile_sizes(T, probe_m, 37, k, :transpose)[1]
+            for m in (step - 1, step + 1, 2step + 1)
+                packed, dense = simd_test_fixture(m, 37; allow_missing=false)
+                reference = simd_test_reference(
+                    dense, T, ADDITIVE_MODEL, false, false, true,
+                )
+                operator = SnpLinAlg{T}(packed)
+                rhs = simd_test_rhs(T, m, k)
+                expected = transpose(reference) * rhs
+                actual = SnpArrays._tile_sizes(T, m, 37, k, :transpose)[1]
+                @test actual <= step
+                m > step && @test m > actual
+                result = k == 1 ?
+                    transpose(operator) * vec(rhs) : transpose(operator) * rhs
+                @test isapprox(result, k == 1 ? vec(expected) : expected;
+                               atol=64eps(T), rtol=64eps(T), nans=true)
+            end
+        end
+
+        # rhs axis: k = 257 exercises the outer rhs_step = 256 loop.
+        packed, dense = simd_test_fixture(17, 9; allow_missing=false)
+        reference = simd_test_reference(
+            dense, T, ADDITIVE_MODEL, false, false, true,
+        )
+        operator = SnpLinAlg{T}(packed)
+        forward_rhs = simd_test_rhs(T, 9, 257)
+        @test isapprox(operator * forward_rhs, reference * forward_rhs;
+                       atol=64eps(T), rtol=64eps(T), nans=true)
+        transpose_rhs = simd_test_rhs(T, 17, 257)
+        @test isapprox(transpose(operator) * transpose_rhs,
+                       transpose(reference) * transpose_rhs;
+                       atol=64eps(T), rtol=64eps(T), nans=true)
+
+        # A one-column matrix rhs keeps the k > 1 (matrix) rules, since it
+        # still runs the register-tiled kernel rather than the vector one.
+        @test SnpArrays._tile_sizes(T, 4097, 54051, 1, :forward;
+                                     vector=false)[2] ==
+              SnpArrays._tile_sizes(T, 4097, 54051, 2, :forward)[2]
+        @test SnpArrays._tile_sizes(T, 4097, 54051, 1, :transpose;
+                                     vector=false)[1] ==
+              SnpArrays._tile_sizes(T, 4097, 54051, 2, :transpose)[1]
+
+        let step = SnpArrays._tile_sizes(T, 4097, 37, 1, :forward;
+                                          vector=false)[1]
+            packed, dense = simd_test_fixture(step + 1, 37;
+                                               allow_missing=false)
+            reference = simd_test_reference(
+                dense, T, ADDITIVE_MODEL, false, false, true,
+            )
+            operator = SnpLinAlg{T}(packed)
+            rhs = simd_test_rhs(T, 37, 1)
+            @test isapprox(operator * rhs, reference * rhs;
+                           atol=64eps(T), rtol=64eps(T), nans=true)
+        end
+
+        let step = SnpArrays._tile_sizes(T, 4097, 37, 1, :transpose;
+                                          vector=false)[1]
+            packed, dense = simd_test_fixture(step + 1, 37;
+                                               allow_missing=false)
+            reference = simd_test_reference(
+                dense, T, ADDITIVE_MODEL, false, false, true,
+            )
+            operator = SnpLinAlg{T}(packed)
+            rhs = simd_test_rhs(T, step + 1, 1)
+            @test isapprox(transpose(operator) * rhs,
+                           transpose(reference) * rhs;
+                           atol=64eps(T), rtol=64eps(T), nans=true)
+        end
+
+        # every _tile_sizes result satisfies the basic invariants
+        for direction in (:forward, :transpose),
+            k in (1, 8, 128, 257),
+            m in (0, 1, 17, 4097),
+            n in (0, 1, 9, 2049)
+
+            row_step, column_step, rhs_step =
+                SnpArrays._tile_sizes(T, m, n, k, direction)
+            @test row_step % 16 == 0
+            @test column_step >= 1
+            @test rhs_step >= 1
+        end
     end
-    return fixture
 end
 
-@testset "SnpLinAlg scheduler tile boundaries" begin
-    forward_vector_fixture = filled_genotype_fixture(4097, 1025, 0x03)
-    forward_vector_operator = SnpLinAlg{Float32}(forward_vector_fixture)
-    @test forward_vector_operator * ones(Float32, 1025) ==
-          fill(Float32(2050), 4097)
+@testset "SnpLinAlg micro-kernel edge cases" begin
+    for T in (Float32, Float64)
+        mr, nr = SnpArrays._micro_tile(T)
+        w = SnpArrays._vector_width(T)
+        tolerance = T(64) * eps(T)
 
-    forward_matrix_fixture = filled_genotype_fixture(1025, 257, 0x03)
-    forward_matrix_operator = SnpLinAlg{Float32}(forward_matrix_fixture)
-    @test forward_matrix_operator * ones(Float32, 257, 256) ==
-          fill(Float32(514), 1025, 256)
+        # 1. sample-count remainders against MR, 16, and 16q + r.
+        column_count = 2mr + 3
+        sample_counts = sort(unique(vcat(
+            collect(1:(mr - 1)), mr, collect((mr + 1):15), 16,
+            [16q + r for q in (1, 3) for r in 1:15],
+        )))
+        for m in sample_counts
+            packed, dense = simd_test_fixture(m, column_count;
+                                              allow_missing=false)
+            reference = simd_test_reference(dense, T, ADDITIVE_MODEL, false,
+                                            false, true)
+            operator = SnpLinAlg{T}(packed)
 
-    transpose_fixture = filled_genotype_fixture(8193, 2049, 0x03)
-    transpose_operator = SnpLinAlg{Float32}(transpose_fixture)
-    expected = fill(Float32(16386), 2049)
-    @test transpose(transpose_operator) * ones(Float32, 8193) == expected
-    @test vec(adjoint(transpose_operator) * ones(Float32, 8193, 1)) == expected
+            k = nr + 3
+            forward_rhs = simd_test_rhs(T, column_count, k)
+            @test isapprox(operator * forward_rhs, reference * forward_rhs;
+                           atol=tolerance, rtol=tolerance, nans=true)
+            transpose_rhs = simd_test_rhs(T, m, k)
+            @test isapprox(transpose(operator) * transpose_rhs,
+                           transpose(reference) * transpose_rhs;
+                           atol=tolerance, rtol=tolerance, nans=true)
 
-    rhs_fixture = filled_genotype_fixture(17, 9, 0x03)
-    rhs_operator = SnpLinAlg{Float32}(rhs_fixture)
-    @test rhs_operator * ones(Float32, 9, 257) ==
-          fill(Float32(18), 17, 257)
-    @test transpose(rhs_operator) * ones(Float32, 17, 2049) ==
-          fill(Float32(34), 9, 2049)
+            forward_vector = vec(simd_test_rhs(T, column_count, 1))
+            @test isapprox(operator * forward_vector,
+                           vec(reference * forward_vector);
+                           atol=tolerance, rtol=tolerance, nans=true)
+        end
+
+        # 2. rhs-width remainders for a fixed, tile-remainder-bearing shape.
+        m = 16 * 3 + 5
+        n = 2mr + 3
+        packed, dense = simd_test_fixture(m, n; allow_missing=false)
+        reference = simd_test_reference(dense, T, ADDITIVE_MODEL, false,
+                                        false, true)
+        operator = SnpLinAlg{T}(packed)
+        widths = sort(unique(vcat(
+            [1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 128, 130],
+            [w - 1, w, w + 1, nr - 1, nr, nr + 1],
+        )))
+        for k in widths
+            forward_rhs = simd_test_rhs(T, n, k)
+            @test isapprox(operator * forward_rhs, reference * forward_rhs;
+                           atol=tolerance, rtol=tolerance, nans=true)
+            transpose_rhs = simd_test_rhs(T, m, k)
+            @test isapprox(transpose(operator) * transpose_rhs,
+                           transpose(reference) * transpose_rhs;
+                           atol=tolerance, rtol=tolerance, nans=true)
+        end
+
+        # 3. SNP-count remainders.
+        m3 = 37
+        k3 = nr + 1
+        for n3 in (1, mr - 1, mr, mr + 1, 2mr + 1, 16, 17)
+            packed3, dense3 = simd_test_fixture(m3, n3; allow_missing=false)
+            reference3 = simd_test_reference(dense3, T, ADDITIVE_MODEL,
+                                             false, false, true)
+            operator3 = SnpLinAlg{T}(packed3)
+            forward_rhs = simd_test_rhs(T, n3, k3)
+            @test isapprox(operator3 * forward_rhs, reference3 * forward_rhs;
+                           atol=tolerance, rtol=tolerance, nans=true)
+            transpose_rhs = simd_test_rhs(T, m3, k3)
+            @test isapprox(transpose(operator3) * transpose_rhs,
+                           transpose(reference3) * transpose_rhs;
+                           atol=tolerance, rtol=tolerance, nans=true)
+        end
+
+        # 4. mul! with prefilled destination and adjoint.
+        test_simd_products(operator, reference, nr + 1; tolerance=tolerance)
+    end
 end
