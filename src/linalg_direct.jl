@@ -7,6 +7,11 @@ struct SnpLinAlg{T} <: AbstractMatrix{T}
     μ::Vector{T}
     σinv::Vector{T}
     values::Matrix{T}
+    # Packing workspace for the register-tiled matrix products, one slice
+    # per spawned task. Resized on the first product of a given shape and
+    # reused after, so a repeated product allocates nothing here. Not
+    # reentrant: concurrent `mul!` calls on one `SnpLinAlg` would share it.
+    panel::Vector{T}
 end
 
 AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
@@ -51,7 +56,7 @@ function SnpLinAlg{T}(
     _fill_genotype_values!(values, means, inverse_standard_deviations, model,
                            center, scale, impute)
     return SnpLinAlg{T}(s, model, center, scale, impute, means,
-                        inverse_standard_deviations, values)
+                        inverse_standard_deviations, values, T[])
 end
 
 function _fill_genotype_values!(
@@ -117,7 +122,7 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
     fill!(out, zero(T))
-    _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
+    _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, sla.panel)
     return out
 end
 
@@ -159,9 +164,10 @@ function mul!(
         "right-hand side has length $(length(rhs)); expected $(size(sla, 1))",
     ))
     fill!(out, zero(T))
-    packed = view(sla.s.data, :, cols)
-    values = view(sla.values, :, cols)
-    _snparray_atx_tile!(out, packed, rhs, values, sla.s.m)
+    # The dense genotype arrays with `cols` as an index offset, never a
+    # view: indexing a `SubArray` per element costs about 2x in the
+    # register-tiled kernel.
+    _snparray_atx_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, cols)
     return out
 end
 
@@ -193,9 +199,11 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
     fill!(out, zero(T))
-    packed = view(sla.s.data, :, cols)
-    values = view(sla.values, :, cols)
-    _snparray_AtX_tile!(out, packed, rhs, values, sla.s.m)
+    # The dense genotype arrays with `cols` as an index offset, never a
+    # view: indexing a `SubArray` per element costs about 2x in the
+    # register-tiled kernel.
+    _snparray_AtX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, cols,
+                        sla.panel)
     return out
 end
 
@@ -222,23 +230,43 @@ function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
     return out
 end
 
-function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
+"""
+    _resize_workspace!(workspace, count) -> workspace
+
+Resize the shared panel workspace to exactly `count` elements. Repeated
+products at one shape reuse the buffer; a change of shape reallocates.
+"""
+function _resize_workspace!(workspace::Vector, count::Int)
+    length(workspace) == count || resize!(workspace, count)
+    return workspace
+end
+
+function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace)
     n = size(packed, 2)
     k = size(out, 2)
     T = eltype(out)
     row_step, column_step, rhs_step =
         _tile_sizes(T, rows_filled, n, k, :forward; vector=false)
-    width = Val(_vector_width(T))
+    lanes = _rhs_width(T, k)
+    width = Val(lanes)
     @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
+    # One panel slice per spawned task, so concurrent tasks never overlap.
+    panel_length = 2lanes * column_step
+    tasks = cld(rows_filled, row_step) * cld(k, rhs_step)
+    _resize_workspace!(workspace, tasks * panel_length)
+    task_index = 0
     @sync begin
         for rhs_first in 1:rhs_step:k
             rhs_last = min(rhs_first + rhs_step - 1, k)
             for row_first in 1:row_step:rows_filled
                 row_last = min(row_first + row_step - 1, rows_filled)
                 @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
+                panel_offset = task_index * panel_length
+                task_index += 1
                 Threads.@spawn _snparray_AX_kernel!(
-                    out, packed, rhs, values, $row_first, $row_last,
-                    $column_step, $rhs_first, $rhs_last, $width,
+                    out, packed, rhs, values, workspace, $panel_offset,
+                    $row_first, $row_last, $column_step, $rhs_first,
+                    $rhs_last, $width,
                 )
             end
         end
@@ -246,21 +274,22 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled)
     return out
 end
 
-function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
-    n = size(packed, 2)
+function _snparray_atx_tile!(out, packed, rhs, values, rows_filled, cols)
+    n = length(cols)
+    out_offset = first(cols) - 1
     row_step, column_step, _ =
         _tile_sizes(eltype(out), rows_filled, n, 1, :transpose; vector=true)
     @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
     @sync begin
-        for column_first in 1:column_step:n
-            column_last = min(column_first + column_step - 1, n)
+        for column_first in first(cols):column_step:last(cols)
+            column_last = min(column_first + column_step - 1, last(cols))
             Threads.@spawn begin
                 for row_first in 1:row_step:rows_filled
                     row_last = min(row_first + row_step - 1, rows_filled)
                     @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
                     _snparray_atx_kernel!(
                         out, packed, rhs, values, row_first, row_last,
-                        $column_first, $column_last,
+                        $column_first, $column_last, $out_offset,
                     )
                 end
             end
@@ -269,23 +298,32 @@ function _snparray_atx_tile!(out, packed, rhs, values, rows_filled)
     return out
 end
 
-function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled)
-    n = size(packed, 2)
+function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled, cols,
+                             workspace)
+    n = length(cols)
     k = size(out, 2)
     T = eltype(out)
+    out_offset = first(cols) - 1
     row_step, column_step, rhs_step =
         _tile_sizes(T, rows_filled, n, k, :transpose; vector=false)
-    width = Val(_vector_width(T))
+    lanes = _rhs_width(T, k)
+    width = Val(lanes)
     @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
+    panel_length = 2lanes * row_step
+    tasks = cld(n, column_step) * cld(k, rhs_step)
+    _resize_workspace!(workspace, tasks * panel_length)
+    task_index = 0
     @sync begin
         for rhs_first in 1:rhs_step:k
             rhs_last = min(rhs_first + rhs_step - 1, k)
-            for column_first in 1:column_step:n
-                column_last = min(column_first + column_step - 1, n)
+            for column_first in first(cols):column_step:last(cols)
+                column_last = min(column_first + column_step - 1, last(cols))
+                panel_offset = task_index * panel_length
+                task_index += 1
                 Threads.@spawn _snparray_AtX_kernel!(
-                    out, packed, rhs, values, $row_step, rows_filled,
-                    $column_first, $column_last, $rhs_first, $rhs_last,
-                    $width,
+                    out, packed, rhs, values, workspace, $panel_offset,
+                    $row_step, rows_filled, $column_first, $column_last,
+                    $rhs_first, $rhs_last, $out_offset, $width,
                 )
             end
         end
@@ -316,8 +354,9 @@ function _snparray_ax_scalar!(out, packed, rhs, values, row_first, row_last,
     return out
 end
 
-function _snparray_AX_kernel!(out, packed, rhs, values, row_first, row_last,
-                              column_step, rhs_first, rhs_last, ::Val)
+function _snparray_AX_kernel!(out, packed, rhs, values, panel, panel_offset,
+                              row_first, row_last, column_step, rhs_first,
+                              rhs_last, ::Val)
     return _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
                                 1, size(packed, 2), rhs_first, rhs_last)
 end
@@ -337,40 +376,43 @@ function _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
 end
 
 function _snparray_atx_kernel!(out, packed, rhs, values, row_first, row_last,
-                               column_first, column_last)
+                               column_first, column_last, out_offset)
     return _snparray_atx_scalar!(out, packed, rhs, values, row_first, row_last,
-                                 column_first, column_last)
+                                 column_first, column_last, out_offset)
 end
 
 function _snparray_atx_scalar!(out, packed, rhs, values, row_first, row_last,
-                               column_first, column_last)
+                               column_first, column_last, out_offset)
     @inbounds for column in column_first:column_last
-        total = out[column]
+        total = out[column - out_offset]
         for row in row_first:row_last
             total += values[_packed_code(packed, row, column), column] * rhs[row]
         end
-        out[column] = total
+        out[column - out_offset] = total
     end
     return out
 end
 
-function _snparray_AtX_kernel!(out, packed, rhs, values, row_step,
-                               rows_filled, column_first, column_last,
-                               rhs_first, rhs_last, ::Val)
+function _snparray_AtX_kernel!(out, packed, rhs, values, panel, panel_offset,
+                               row_step, rows_filled, column_first,
+                               column_last, rhs_first, rhs_last, out_offset,
+                               ::Val)
     return _snparray_AtX_scalar!(out, packed, rhs, values, 1, rows_filled,
-                                 column_first, column_last, rhs_first, rhs_last)
+                                 column_first, column_last, rhs_first,
+                                 rhs_last, out_offset)
 end
 
 function _snparray_AtX_scalar!(out, packed, rhs, values, row_first, row_last,
-                               column_first, column_last, rhs_first, rhs_last)
+                               column_first, column_last, rhs_first, rhs_last,
+                               out_offset)
     @inbounds for rhs_column in rhs_first:rhs_last
         for column in column_first:column_last
-            total = out[column, rhs_column]
+            total = out[column - out_offset, rhs_column]
             for row in row_first:row_last
                 total += values[_packed_code(packed, row, column), column] *
                          rhs[row, rhs_column]
             end
-            out[column, rhs_column] = total
+            out[column - out_offset, rhs_column] = total
         end
     end
     return out

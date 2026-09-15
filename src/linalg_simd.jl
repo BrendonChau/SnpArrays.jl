@@ -5,12 +5,10 @@ SIMD register width in bytes used by the register-tiled kernels: 64 on
 x86_64 hosts whose ISA includes the AVX-512 tier, 32 otherwise (AVX2, or
 NEON packed as two 128-bit registers). Set in `__init__` from
 `_detect_vector_bytes()`; the first use of each `(T, W)` pair compiles
-in-process (no precompile workload). On AVX-512 hosts, verify with
-`@code_native` that LLVM emits zmm registers for the micro-kernel (LLVM's
-prefer-vector-width default may split 512-bit vectors), and if it does
-not, set `VECTOR_BYTES[] = 32`. This is a heuristic default awaiting one
-benchmark run on an AVX2/AVX-512 x86 machine; no x86 machine was available
-during development (an Apple M1 was used instead).
+in-process (no precompile workload). On a Xeon 6736P, 64 measured 1.27x to
+1.92x faster than 32 for every `k` at or above 8, and LLVM emitted zmm
+registers rather than splitting the 512-bit vectors; see
+`benchmark/results/x86_avx512_n1183.md`.
 """
 const VECTOR_BYTES = Ref{Int}(32)
 
@@ -50,8 +48,8 @@ const DECODE_WIDTH = 16
 Byte budget, per task, for the `A*x` output block (read-modified-written
 once per SNP column) and the `transpose(A)*x` rhs block (re-read once per
 column), so it stays resident in a 32-48 KB-class L1 data cache with room
-left for the packed genotype bytes. Heuristic default awaiting one
-benchmark run on an AVX2/AVX-512 x86 machine.
+left for the packed genotype bytes. The best swept alternative on a Xeon
+6736P was 1.13x faster in one of four cells and no better in the rest.
 """
 const L1_OUT_BUDGET = 16_384
 
@@ -60,8 +58,8 @@ const L1_OUT_BUDGET = 16_384
 
 Byte budget, per task, for the transposed rhs slab (`k_padded x
 column_step * sizeof(T)`) of one inner block, so it fits a 256 KB-class
-private L2 slice. Heuristic default awaiting one benchmark run on an
-AVX2/AVX-512 x86 machine.
+private L2 slice. Enlarging it to match the 2 MB private L2 of a Xeon
+6736P measured neutral for `A*X` and worse for `transpose(A)*X`.
 """
 const L2_PANEL_BUDGET = 262_144
 
@@ -70,8 +68,8 @@ const L2_PANEL_BUDGET = 262_144
 
 Byte budget for the packed cache lines touched by one `A*X` row tile, one
 64-byte line per SNP column of the block, re-touched by every following
-row tile, so they stay L1-resident. Heuristic default awaiting one
-benchmark run on an AVX2/AVX-512 x86 machine.
+row tile, so they stay L1-resident. The `column_step` it caps sits on a
+flat part of the measured response curve on a Xeon 6736P.
 """
 const PACKED_LINES_BUDGET = 32_768
 
@@ -79,8 +77,8 @@ const PACKED_LINES_BUDGET = 32_768
     TASKS_PER_THREAD
 
 Target task count is `TASKS_PER_THREAD * Threads.nthreads()`, so uneven
-per-task progress balances across threads. Heuristic default awaiting one
-benchmark run on an AVX2/AVX-512 x86 machine.
+per-task progress balances across threads. Measured at 91% scaling
+efficiency for `transpose(A)*X` on 12 cores of a Xeon 6736P.
 """
 const TASKS_PER_THREAD = 4
 
@@ -88,8 +86,8 @@ const TASKS_PER_THREAD = 4
     TASK_AXIS_FLOOR
 
 Minimum block size along a task-partitioned axis; below it, per-task
-overhead and the output-tile read-modify-write dominate. Heuristic
-default awaiting one benchmark run on an AVX2/AVX-512 x86 machine.
+overhead and the output-tile read-modify-write dominate. The `A*x` and
+`A*X` row-step optima on a Xeon 6736P both land on this floor.
 """
 const TASK_AXIS_FLOOR = 256
 
@@ -100,6 +98,22 @@ Return the number of `T` lanes in a `Vec{W,T}` register of width
 `VECTOR_BYTES[]`.
 """
 _vector_width(::Type{T}) where T = VECTOR_BYTES[] ÷ sizeof(T)
+
+"""
+    _rhs_width(::Type{T}, k::Int) -> Int
+
+Return the `Vec` lane count for the rhs tile: the largest power of two that
+is at most `_vector_width(T)` and does not exceed `k`, floored at 4. A `k`
+narrower than the register width would otherwise leave lanes idle in every
+tile.
+"""
+function _rhs_width(::Type{T}, k::Int) where T
+    width = _vector_width(T)
+    while width > 4 && k < width
+        width >>= 1
+    end
+    return width
+end
 
 """
     _micro_tile(::Type{T}) -> (MR, NR)
@@ -168,9 +182,9 @@ For `:transpose, !vector` (`transpose(A)*X`), `rhs_step` is `k` capped at
 256; `row_step` sizes the transposed rhs slab over samples to
 `L2_PANEL_BUDGET`; `column_step` is task-partitioned over SNPs.
 
-These values are heuristic defaults awaiting one benchmark run on an
-AVX2/AVX-512 x86 machine; no x86 machine was available during
-development.
+Across 106 swept configurations on a Xeon 6736P these values were within
+1.15x of the best in every operation and element type; see
+`benchmark/results/x86_avx512_n1183.md`.
 """
 function _tile_sizes(
     ::Type{T},
@@ -341,15 +355,18 @@ the scalar `left` to every one of the `U` blocks.
 end
 
 """
-    _pack_rhs_panel!(panel, rhs, column_first, column_last, rhs_column,
-        valid, unroll, width)
+    _pack_rhs_panel!(panel, panel_offset, rhs, column_first, column_last,
+        rhs_column, valid, unroll, width)
 
 Copy the `valid` rhs columns starting at `rhs_column` of SNP rows
-`column_first:column_last` into `panel` so that the `U * W` lanes of one
-SNP row are contiguous, zero-filling the lanes beyond `valid`.
+`column_first:column_last` into `panel` at `panel_offset` so that the
+`U * W` lanes of one SNP row are contiguous, zero-filling the lanes beyond
+`valid`. `panel` is shared between concurrent tasks, each writing the slice
+that starts at its own `panel_offset`.
 """
 @inline function _pack_rhs_panel!(
     panel::Vector{T},
+    panel_offset::Int,
     rhs::Matrix{T},
     column_first::Int,
     column_last::Int,
@@ -360,7 +377,7 @@ SNP row are contiguous, zero-filling the lanes beyond `valid`.
 ) where {T <: SIMD_FLOAT, U, W}
     lanes = U * W
     @inbounds for j in 1:(column_last - column_first + 1)
-        base = (j - 1) * lanes
+        base = panel_offset + (j - 1) * lanes
         for t in 1:valid
             panel[base + t] = rhs[column_first + j - 1, rhs_column + t - 1]
         end
@@ -412,7 +429,7 @@ Fuse the genotypes of samples `row:row + MR - 1` at SNP `column` into the
 end
 
 """
-    _snparray_AX_micro_tile!(out, packed, values, panel, row,
+    _snparray_AX_micro_tile!(out, packed, values, panel, panel_offset, row,
         column_first, column_last, rhs_column, valid, rows, unroll, width)
 
 Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
@@ -424,6 +441,7 @@ Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
     packed::Matrix{UInt8},
     values::Matrix{T},
     panel::Vector{T},
+    panel_offset::Int,
     row::Int,
     column_first::Int,
     column_last::Int,
@@ -434,7 +452,7 @@ Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
     ::Val{W},
 ) where {T <: SIMD_FLOAT, MR, U, W}
     accumulators = ntuple(_ -> _fill_blocks(zero(Vec{W, T}), unroll), Val(MR))
-    offset = 0
+    offset = panel_offset
     for column in column_first:column_last
         rhs_vectors = _load_panel_vectors(panel, offset, unroll, Val(W))
         accumulators = _multiply_add_rows(
@@ -457,8 +475,9 @@ Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
 end
 
 """
-    _snparray_AX_row_tiles!(out, packed, values, panel, row_first, row_last,
-        column_first, column_last, rhs_column, valid, rows, unroll, width)
+    _snparray_AX_row_tiles!(out, packed, values, panel, panel_offset,
+        row_first, row_last, column_first, column_last, rhs_column, valid,
+        rows, unroll, width)
 
 Sweep samples `row_first:row_last` with `MR`-row register tiles, finishing
 the tail one sample at a time.
@@ -468,6 +487,7 @@ the tail one sample at a time.
     packed::Matrix{UInt8},
     values::Matrix{T},
     panel::Vector{T},
+    panel_offset::Int,
     row_first::Int,
     row_last::Int,
     column_first::Int,
@@ -481,15 +501,15 @@ the tail one sample at a time.
     row = row_first
     while row + MR - 1 <= row_last
         _snparray_AX_micro_tile!(
-            out, packed, values, panel, row, column_first, column_last,
-            rhs_column, valid, rows, unroll, width,
+            out, packed, values, panel, panel_offset, row, column_first,
+            column_last, rhs_column, valid, rows, unroll, width,
         )
         row += MR
     end
     while row <= row_last
         _snparray_AX_micro_tile!(
-            out, packed, values, panel, row, column_first, column_last,
-            rhs_column, valid, Val(1), unroll, width,
+            out, packed, values, panel, panel_offset, row, column_first,
+            column_last, rhs_column, valid, Val(1), unroll, width,
         )
         row += 1
     end
@@ -497,8 +517,8 @@ the tail one sample at a time.
 end
 
 """
-    _snparray_AX_task!(out, packed, rhs, values, panel, row_first, row_last,
-        column_step, rhs_first, rhs_last, rows, width)
+    _snparray_AX_task!(out, packed, rhs, values, panel, panel_offset,
+        row_first, row_last, column_step, rhs_first, rhs_last, rows, width)
 
 Run one `A*X` task with a compile-time tile height `MR`, looping over SNP
 column blocks of width `column_step` and rhs tiles of width `2W`.
@@ -509,6 +529,7 @@ function _snparray_AX_task!(
     rhs::Matrix{T},
     values::Matrix{T},
     panel::Vector{T},
+    panel_offset::Int,
     row_first::Int,
     row_last::Int,
     column_step::Int,
@@ -525,23 +546,23 @@ function _snparray_AX_task!(
             valid = min(2W, rhs_last - rhs_column + 1)
             if valid <= W
                 _pack_rhs_panel!(
-                    panel, rhs, column_first, column_last, rhs_column, valid,
-                    Val(1), width,
+                    panel, panel_offset, rhs, column_first, column_last,
+                    rhs_column, valid, Val(1), width,
                 )
                 _snparray_AX_row_tiles!(
-                    out, packed, values, panel, row_first, row_last,
-                    column_first, column_last, rhs_column, valid, rows,
-                    Val(1), width,
+                    out, packed, values, panel, panel_offset, row_first,
+                    row_last, column_first, column_last, rhs_column, valid,
+                    rows, Val(1), width,
                 )
             else
                 _pack_rhs_panel!(
-                    panel, rhs, column_first, column_last, rhs_column, valid,
-                    Val(2), width,
+                    panel, panel_offset, rhs, column_first, column_last,
+                    rhs_column, valid, Val(2), width,
                 )
                 _snparray_AX_row_tiles!(
-                    out, packed, values, panel, row_first, row_last,
-                    column_first, column_last, rhs_column, valid, rows,
-                    Val(2), width,
+                    out, packed, values, panel, panel_offset, row_first,
+                    row_last, column_first, column_last, rhs_column, valid,
+                    rows, Val(2), width,
                 )
             end
             rhs_column += 2W
@@ -551,8 +572,8 @@ function _snparray_AX_task!(
 end
 
 """
-    _snparray_AX_kernel!(out, packed, rhs, values, row_first, row_last,
-        column_step, rhs_first, rhs_last, width)
+    _snparray_AX_kernel!(out, packed, rhs, values, panel, panel_offset,
+        row_first, row_last, column_step, rhs_first, rhs_last, width)
 
 Run one `A*X` task over samples `row_first:row_last` and rhs columns
 `rhs_first:rhs_last`, blocking the SNP columns into `column_step`-wide
@@ -561,17 +582,19 @@ inner tiles and accumulating each `MR x 2W` register tile in registers.
 The tile shape is `(MR, NR) = _micro_tile(T)`: AVX2 `Float32` gives
 `MR = 6`, `NR = 16`, i.e. 12 accumulators + 2 rhs vectors + 1 broadcast
 genotype = 15 of 16 ymm registers. The rhs values of one SNP column are
-packed contiguously into a per-task panel buffer of `NR * column_step`
-elements, zero-padded past the last rhs column of a partial tile, so each
-column contributes `U` full vector loads. x86 performance is unverified
-(development machine is an Apple M1); an x86 run should check
-`@code_native` for accumulator spills.
+packed contiguously into the `2W * column_step` elements of `panel` that
+start at `panel_offset`, zero-padded past the last rhs column of a partial
+tile, so each column contributes `U` full vector loads. On a Xeon 6736P the
+hot loop compiles to 16 FMAs on zmm accumulators with no spills, 19 of 32
+registers live.
 """
 function _snparray_AX_kernel!(
     out::Matrix{T},
     packed::Matrix{UInt8},
     rhs::Matrix{T},
     values::Matrix{T},
+    panel::Vector{T},
+    panel_offset::Int,
     row_first::Int,
     row_last::Int,
     column_step::Int,
@@ -580,23 +603,26 @@ function _snparray_AX_kernel!(
     width::Val{W},
 ) where {T <: SIMD_FLOAT, W}
     size(packed, 2) == 0 && return out
-    tile_rows, tile_lanes = _micro_tile(T)
-    panel = zeros(T, tile_lanes * column_step)
+    tile_rows, _ = _micro_tile(T)
     return _snparray_AX_task!(
-        out, packed, rhs, values, panel, row_first, row_last, column_step,
-        rhs_first, rhs_last, Val(tile_rows), width,
+        out, packed, rhs, values, panel, panel_offset, row_first, row_last,
+        column_step, rhs_first, rhs_last, Val(tile_rows), width,
     )
 end
 
 """
     _snparray_atx_kernel!(out, packed, rhs, values, row_first, row_last,
-        column_first, column_last)
+        column_first, column_last, out_offset)
 
-Accumulate `out[column_first:column_last] +=
+Accumulate `out[column_first - out_offset:column_last - out_offset] +=
 transpose(A[row_first:row_last, column_first:column_last]) *
 rhs[row_first:row_last]` for a `SnpLinAlg` matrix `A`, decoding genotypes
 with the 16-lane vector decode and reducing each column's partial vector
 with a SIMD tree reduction. Requires `row_first ≡ 1 (mod 4)`.
+
+`column_first` and `column_last` index `packed` and `values`, which are the
+full genotype arrays; `out_offset` shifts them onto `out`, so a restricted
+column range needs no view of the genotypes.
 """
 function _snparray_atx_kernel!(
     out::Vector{T},
@@ -607,10 +633,11 @@ function _snparray_atx_kernel!(
     row_last::Int,
     column_first::Int,
     column_last::Int,
+    out_offset::Int,
 ) where T <: SIMD_FLOAT
     vectorized_row_last = row_last - 15
     @inbounds for column in column_first:column_last
-        total = out[column]
+        total = out[column - out_offset]
         vector_total = zero(Vec{16, T})
         lookup = _broadcast_lookup(values, column, Val(16))
         row = row_first
@@ -627,7 +654,7 @@ function _snparray_atx_kernel!(
                 values[_packed_code(packed, row, column), column] * rhs[row]
             row += 1
         end
-        out[column] = total
+        out[column - out_offset] = total
     end
     return out
 end
@@ -695,23 +722,27 @@ Fuse the genotypes of sample `row` at the `MR` SNP columns starting at
 end
 
 """
-    _snparray_AtX_micro_tile!(out, packed, values, panel, row_first,
-        row_last, column, rhs_column, valid, rows, unroll, width)
+    _snparray_AtX_micro_tile!(out, packed, values, panel, panel_offset,
+        row_first, row_last, column, rhs_column, valid, out_offset, rows,
+        unroll, width)
 
 Accumulate the `MR x (U * W)` register tile of `transpose(A)*X` rooted at
 SNP `column` and rhs column `rhs_column` over the samples
-`row_first:row_last`, then add the `valid` leading lanes into `out`.
+`row_first:row_last`, then add the `valid` leading lanes into `out` at row
+`column - out_offset`.
 """
 @inline function _snparray_AtX_micro_tile!(
     out::Matrix{T},
     packed::StridedMatrix{UInt8},
     values::StridedMatrix{T},
     panel::Vector{T},
+    panel_offset::Int,
     row_first::Int,
     row_last::Int,
     column::Int,
     rhs_column::Int,
     valid::Int,
+    out_offset::Int,
     rows::Val{MR},
     unroll::Val{U},
     width::Val{W},
@@ -720,7 +751,7 @@ SNP `column` and rhs column `rhs_column` over the samples
     lanes = U * W
     byte_index = ((row_first - 1) >>> 2) + 1
     row = row_first
-    offset = 0
+    offset = panel_offset
     # `row_first ≡ 1 (mod 4)`, so one byte per column covers four samples.
     while row + 3 <= row_last
         bytes = _load_packed_bytes(packed, byte_index, column, rows)
@@ -751,7 +782,8 @@ SNP `column` and rhs column `rhs_column` over the samples
             for lane in 1:W
                 position = (block - 1) * W + lane
                 position <= valid || break
-                out[column + c - 1, rhs_column + position - 1] += vector[lane]
+                out[column - out_offset + c - 1, rhs_column + position - 1] +=
+                    vector[lane]
             end
         end
     end
@@ -759,9 +791,9 @@ SNP `column` and rhs column `rhs_column` over the samples
 end
 
 """
-    _snparray_AtX_column_tiles!(out, packed, values, panel, row_first,
-        row_last, column_first, column_last, rhs_column, valid, rows,
-        unroll, width)
+    _snparray_AtX_column_tiles!(out, packed, values, panel, panel_offset,
+        row_first, row_last, column_first, column_last, rhs_column, valid,
+        out_offset, rows, unroll, width)
 
 Sweep SNP columns `column_first:column_last` with `MR`-column register
 tiles, finishing the tail one column at a time.
@@ -771,12 +803,14 @@ tiles, finishing the tail one column at a time.
     packed::StridedMatrix{UInt8},
     values::StridedMatrix{T},
     panel::Vector{T},
+    panel_offset::Int,
     row_first::Int,
     row_last::Int,
     column_first::Int,
     column_last::Int,
     rhs_column::Int,
     valid::Int,
+    out_offset::Int,
     rows::Val{MR},
     unroll::Val{U},
     width::Val{W},
@@ -784,15 +818,15 @@ tiles, finishing the tail one column at a time.
     column = column_first
     while column + MR - 1 <= column_last
         _snparray_AtX_micro_tile!(
-            out, packed, values, panel, row_first, row_last, column,
-            rhs_column, valid, rows, unroll, width,
+            out, packed, values, panel, panel_offset, row_first, row_last,
+            column, rhs_column, valid, out_offset, rows, unroll, width,
         )
         column += MR
     end
     while column <= column_last
         _snparray_AtX_micro_tile!(
-            out, packed, values, panel, row_first, row_last, column,
-            rhs_column, valid, Val(1), unroll, width,
+            out, packed, values, panel, panel_offset, row_first, row_last,
+            column, rhs_column, valid, out_offset, Val(1), unroll, width,
         )
         column += 1
     end
@@ -800,9 +834,9 @@ tiles, finishing the tail one column at a time.
 end
 
 """
-    _snparray_AtX_task!(out, packed, rhs, values, panel, row_step,
-        rows_filled, column_first, column_last, rhs_first, rhs_last, rows,
-        width)
+    _snparray_AtX_task!(out, packed, rhs, values, panel, panel_offset,
+        row_step, rows_filled, column_first, column_last, rhs_first,
+        rhs_last, out_offset, rows, width)
 
 Run one `transpose(A)*X` task with a compile-time tile width `MR`, looping
 over sample blocks of `row_step` samples and rhs tiles of width `2W`.
@@ -813,12 +847,14 @@ function _snparray_AtX_task!(
     rhs::Matrix{T},
     values::StridedMatrix{T},
     panel::Vector{T},
+    panel_offset::Int,
     row_step::Int,
     rows_filled::Int,
     column_first::Int,
     column_last::Int,
     rhs_first::Int,
     rhs_last::Int,
+    out_offset::Int,
     rows::Val{MR},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, W}
@@ -829,23 +865,23 @@ function _snparray_AtX_task!(
             valid = min(2W, rhs_last - rhs_column + 1)
             if valid <= W
                 _pack_rhs_panel!(
-                    panel, rhs, row_first, row_last, rhs_column, valid,
-                    Val(1), width,
+                    panel, panel_offset, rhs, row_first, row_last,
+                    rhs_column, valid, Val(1), width,
                 )
                 _snparray_AtX_column_tiles!(
-                    out, packed, values, panel, row_first, row_last,
-                    column_first, column_last, rhs_column, valid, rows,
-                    Val(1), width,
+                    out, packed, values, panel, panel_offset, row_first,
+                    row_last, column_first, column_last, rhs_column, valid,
+                    out_offset, rows, Val(1), width,
                 )
             else
                 _pack_rhs_panel!(
-                    panel, rhs, row_first, row_last, rhs_column, valid,
-                    Val(2), width,
+                    panel, panel_offset, rhs, row_first, row_last,
+                    rhs_column, valid, Val(2), width,
                 )
                 _snparray_AtX_column_tiles!(
-                    out, packed, values, panel, row_first, row_last,
-                    column_first, column_last, rhs_column, valid, rows,
-                    Val(2), width,
+                    out, packed, values, panel, panel_offset, row_first,
+                    row_last, column_first, column_last, rhs_column, valid,
+                    out_offset, rows, Val(2), width,
                 )
             end
             rhs_column += 2W
@@ -855,42 +891,47 @@ function _snparray_AtX_task!(
 end
 
 """
-    _snparray_AtX_kernel!(out, packed, rhs, values, row_step, rows_filled,
-        column_first, column_last, rhs_first, rhs_last, width)
+    _snparray_AtX_kernel!(out, packed, rhs, values, panel, panel_offset,
+        row_step, rows_filled, column_first, column_last, rhs_first,
+        rhs_last, out_offset, width)
 
 Run one `transpose(A)*X` task over SNP columns `column_first:column_last`
 and rhs columns `rhs_first:rhs_last`, blocking the samples into
 `row_step`-wide inner blocks and accumulating each `MR x 2W` register tile
-in registers over a whole sample block.
+in registers over a whole sample block. `column_first` and `column_last`
+index the full genotype arrays; `out_offset` shifts them onto `out`.
 
 The tile shape is `(MR, NR) = _micro_tile(T)`: AVX2 `Float32` gives
 `MR = 6`, `NR = 16`, i.e. 12 accumulators + 2 rhs vectors + 1 broadcast
 genotype = 15 of 16 ymm registers. The rhs values of one sample are packed
-contiguously into a per-task panel buffer of `NR * row_step` elements,
-zero-padded past the last rhs column of a partial tile, so each sample
-contributes `U` full vector loads. The reduction reads one packed byte per
-SNP column per four samples and shifts out the four codes. x86 performance
-is unverified (development machine is an Apple M1); an x86 run should check
-`@code_native` for accumulator spills.
+contiguously into the `2W * row_step` elements of `panel` that start at
+`panel_offset`, zero-padded past the last rhs column of a partial tile, so
+each sample contributes `U` full vector loads. The reduction reads one
+packed byte per SNP column per four samples and shifts out the four codes.
+On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with
+no spills.
 """
 function _snparray_AtX_kernel!(
     out::Matrix{T},
     packed::StridedMatrix{UInt8},
     rhs::Matrix{T},
     values::StridedMatrix{T},
+    panel::Vector{T},
+    panel_offset::Int,
     row_step::Int,
     rows_filled::Int,
     column_first::Int,
     column_last::Int,
     rhs_first::Int,
     rhs_last::Int,
+    out_offset::Int,
     width::Val{W},
 ) where {T <: SIMD_FLOAT, W}
     rows_filled == 0 && return out
-    tile_columns, tile_lanes = _micro_tile(T)
-    panel = zeros(T, tile_lanes * row_step)
+    tile_columns, _ = _micro_tile(T)
     return _snparray_AtX_task!(
-        out, packed, rhs, values, panel, row_step, rows_filled, column_first,
-        column_last, rhs_first, rhs_last, Val(tile_columns), width,
+        out, packed, rhs, values, panel, panel_offset, row_step, rows_filled,
+        column_first, column_last, rhs_first, rhs_last, out_offset,
+        Val(tile_columns), width,
     )
 end

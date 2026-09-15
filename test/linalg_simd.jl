@@ -417,6 +417,85 @@ end
     end
 end
 
+@testset "SnpLinAlg transpose over a column range" begin
+    rows, columns = 53, 97
+    packed, dense = simd_test_fixture(rows, columns)
+    ranges = (1:columns, 1:1, columns:columns, 2:2, 5:17, 9:21, 33:96,
+              1:13, columns - 12:columns, 40:47, 40:48, 40:49)
+
+    for T in (Float32, Float64, Float16)
+        operator = SnpLinAlg{T}(packed; model=ADDITIVE_MODEL, impute=true,
+                                center=true, scale=true)
+        reference = simd_test_reference(dense, T, ADDITIVE_MODEL, true, true,
+                                        true)
+        tolerance = T == Float16 ? 128eps(Float16) : T(64) * eps(T)
+        for cols in ranges, transposed in (transpose(operator),
+                                           adjoint(operator))
+            restricted = transpose(view(reference, :, cols))
+
+            vector_rhs = vec(simd_test_rhs(T, rows, 1))
+            expected = restricted * vector_rhs
+            destination = fill(T(19), length(cols))
+            @test mul!(destination, transposed, vector_rhs, cols) ===
+                  destination
+            @test isapprox(destination, expected; nans=true, atol=tolerance,
+                           rtol=tolerance)
+
+            for width in (1, 8, 33)
+                matrix_rhs = simd_test_rhs(T, rows, width)
+                expected_matrix = restricted * matrix_rhs
+                matrix_destination = fill(T(19), length(cols), width)
+                @test mul!(matrix_destination, transposed, matrix_rhs,
+                           cols) === matrix_destination
+                @test isapprox(matrix_destination, expected_matrix;
+                               nans=true, atol=tolerance, rtol=tolerance)
+            end
+        end
+    end
+
+    # A restricted range must agree with the full product over that range.
+    operator = SnpLinAlg{Float64}(packed; impute=true, center=true,
+                                  scale=true)
+    matrix_rhs = simd_test_rhs(Float64, rows, 8)
+    full = mul!(Matrix{Float64}(undef, columns, 8), transpose(operator),
+                matrix_rhs)
+    for cols in ranges
+        block = mul!(Matrix{Float64}(undef, length(cols), 8),
+                     transpose(operator), matrix_rhs, cols)
+        @test block ≈ view(full, cols, :)
+    end
+
+    @test_throws ArgumentError mul!(zeros(Float64, 3), transpose(operator),
+                                    zeros(Float64, rows), 0:2)
+    @test_throws ArgumentError mul!(zeros(Float64, 3), transpose(operator),
+                                    zeros(Float64, rows),
+                                    (columns - 1):(columns + 1))
+    @test_throws DimensionMismatch mul!(zeros(Float64, 4),
+                                        transpose(operator),
+                                        zeros(Float64, rows), 1:3)
+    @test_throws DimensionMismatch mul!(zeros(Float64, 3, 8),
+                                        transpose(operator),
+                                        zeros(Float64, rows + 1, 8), 1:3)
+end
+
+@testset "SnpLinAlg rhs width selection" begin
+    for T in (Float32, Float64)
+        full = SnpArrays._vector_width(T)
+        previous = 0
+        for k in 1:(4full + 3)
+            width = SnpArrays._rhs_width(T, k)
+            @test ispow2(width)
+            @test 4 <= width <= full
+            @test width <= max(k, 4)
+            @test width >= previous
+            previous = width
+        end
+        # A rhs at least as wide as the register uses the full register.
+        @test SnpArrays._rhs_width(T, full) == full
+        @test SnpArrays._rhs_width(T, 4full) == full
+    end
+end
+
 @testset "SnpLinAlg micro-kernel edge cases" begin
     for T in (Float32, Float64)
         mr, nr = SnpArrays._micro_tile(T)
