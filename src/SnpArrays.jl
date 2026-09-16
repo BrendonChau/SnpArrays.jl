@@ -26,8 +26,28 @@ export ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL
 export CuSnpArray
 import VariantCallFormat: findgenokey, VCF, header
 
+"""
+    ADDITIVE_MODEL
+
+Value for the `model` keyword selecting additive genotype coding:
+A1A1 as 0, A1A2 as 1, A2A2 as 2.
+"""
 const ADDITIVE_MODEL = Val(1)
+
+"""
+    DOMINANT_MODEL
+
+Value for the `model` keyword selecting dominant genotype coding:
+A1A1 as 0, A1A2 as 1, A2A2 as 1.
+"""
 const DOMINANT_MODEL = Val(2)
+
+"""
+    RECESSIVE_MODEL
+
+Value for the `model` keyword selecting recessive genotype coding:
+A1A1 as 0, A1A2 as 0, A2A2 as 1.
+"""
 const RECESSIVE_MODEL = Val(3)
 
 include("codec.jl")

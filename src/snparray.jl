@@ -6,6 +6,14 @@
 
 Raw .bed file as a shared, memory-mapped Matrix{UInt8}.  The number of rows, `m`
 is stored separately because it is not uniquely determined by the size of the `data` field.
+
+# Fields
+- `data`: packed two-bit genotypes, four per byte, `(m+3)>>2` rows.
+- `columncounts`: 4 × n matrix of genotype code counts (0 through 3), one
+  column per SNP; computed lazily and reset to zero on write.
+- `rowcounts`: 4 × m matrix of genotype code counts (0 through 3), one
+  column per individual; computed lazily and reset to zero on write.
+- `m`: number of rows (individuals).
 """
 struct SnpArray <: AbstractMatrix{UInt8}
     data::Matrix{UInt8}
@@ -18,16 +26,31 @@ end
     StackedSnpArray(s::Vector{SnpArray})
 
 Stacked SnpArray for unified indexing
+
+# Fields
+- `arrays`: the arrays, concatenated column-wise; all must share row count
+  `m`.
+- `m`: row count, shared by every array in `arrays`.
+- `n`: total number of columns across `arrays`.
+- `ns`: number of columns contributed by each array in `arrays`.
+- `offsets`: zero-based starting column of each array in `arrays`; the
+  trailing entry equals `n`.
 """
 struct StackedSnpArray <: AbstractMatrix{UInt8} # details in stackedsnparray.jl
     arrays::Vector{SnpArray}
     m::Int
     n::Int
     ns::Vector{Int}
-    offsets::Vector{Int} # 0-based
+    offsets::Vector{Int}
 end
 
-const AbstractSnpArray = Union{SnpArray, SubArray{UInt8, 1, SnpArray}, SubArray{UInt8, 2, SnpArray}, 
+"""
+    AbstractSnpArray
+
+Union of `SnpArray` or `StackedSnpArray` with their 1-D and 2-D `SubArray`
+views, so that methods dispatch identically on an array or a view of it.
+"""
+const AbstractSnpArray = Union{SnpArray, SubArray{UInt8, 1, SnpArray}, SubArray{UInt8, 2, SnpArray},
     StackedSnpArray, SubArray{UInt8, 1, StackedSnpArray}, SubArray{UInt8, 2, StackedSnpArray}}
 
 function SnpArray(bednm::AbstractString, m::Integer, args...; kwargs...)

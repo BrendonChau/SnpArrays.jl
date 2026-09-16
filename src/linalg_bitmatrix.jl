@@ -1,3 +1,23 @@
+"""
+    SnpBitMatrix{T}
+
+Bit-plane representation of an `m` by `n` `SnpArray` for linear algebra.
+
+# Fields
+- `B1`: plane for at least one A2 copy; exactly two copies under the
+  recessive model.
+- `B2`: plane for two A2 copies (additive model only); `falses(0, 0)`
+  otherwise.
+- `model`: `ADDITIVE_MODEL`, `DOMINANT_MODEL`, or `RECESSIVE_MODEL`.
+- `center`: whether column means are subtracted during `mul!`.
+- `scale`: whether columns are rescaled to unit variance during `mul!`.
+- `μ`: column means, length `n`; empty unless `center` or `scale` is set.
+- `σinv`: inverse column standard deviations, length `n`; empty unless
+  `scale` is set.
+- `storagev1`: `mul!` scratch buffer, length `m`; holds the `B2 * w` term.
+- `storagev2`: `mul!` scratch buffer, length `n`; holds scaled `v` or
+  `B2ᵀ * v`.
+"""
 struct SnpBitMatrix{T} <: AbstractMatrix{T}
     B1::BitMatrix
     B2::BitMatrix
@@ -10,6 +30,12 @@ struct SnpBitMatrix{T} <: AbstractMatrix{T}
     storagev2::Vector{T}
 end
 
+"""
+    AbstractSnpBitMatrix
+
+Union of `SnpBitMatrix{T}` with its 1-D and 2-D `SubArray` views, so that
+methods dispatch identically on a `SnpBitMatrix` or a view of it.
+"""
 AbstractSnpBitMatrix = Union{SnpBitMatrix, SubArray{T, 1, SnpBitMatrix{T}},
     SubArray{T, 2, SnpBitMatrix{T}}} where T
 

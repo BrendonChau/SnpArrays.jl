@@ -1,3 +1,22 @@
+"""
+    SnpLinAlg{T}
+
+Wraps a `SnpArray` with the parameters and scratch buffers for linear algebra.
+
+# Fields
+- `s`: the underlying genotype array.
+- `model`: genetic model used to convert genotypes to numbers.
+- `center`: whether to center columns.
+- `scale`: whether to scale columns to standard deviation 1.
+- `impute`: whether to impute missing genotypes with the column mean.
+- `μ`: column means.
+- `σinv`: inverse column standard deviations.
+- `storagev1`: length `m`; allocated but never read.
+- `storagev2`: length `n`; holds the scaled `v` in vector `mul!`, or the
+  column mean (or 0) buffer in matrix `mul!`.
+- `storagev3`: length `n`; the inverse standard deviation (or 1) buffer,
+  used only in matrix `mul!`.
+"""
 struct SnpLinAlg{T} <: AbstractMatrix{T}
     s::SnpArray
     model::Union{Val{1}, Val{2}, Val{3}}
@@ -6,12 +25,18 @@ struct SnpLinAlg{T} <: AbstractMatrix{T}
     impute::Bool
     μ::Vector{T}
     σinv::Vector{T}
-    storagev1::Vector{T} # size(s, 1)
-    storagev2::Vector{T} # size(s, 2)
-    storagev3::Vector{T} # size(s, 2)
+    storagev1::Vector{T}
+    storagev2::Vector{T}
+    storagev3::Vector{T}
 end
 
-AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}}, 
+"""
+    AbstractSnpLinAlg
+
+Union of `SnpLinAlg{T}` with its 1-D and 2-D `SubArray` views, so that
+methods dispatch identically on a `SnpLinAlg` or a view of it.
+"""
+AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
     SubArray{T, 2, SnpLinAlg{T}}} where T
 
 """

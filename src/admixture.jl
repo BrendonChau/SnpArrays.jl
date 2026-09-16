@@ -70,6 +70,21 @@ end
 Array{T,N}(s::AbstractSnpArray, P::AbstractMatrix, Q::AbstractMatrix; kwargs...) where {T,N} = 
 copyto!(Array{T,N}(undef, size(s)), s, P, Q; kwargs...)
 
+"""
+    grm_admixture(s, P, Q, ::Type{T} = Float64)
+
+Compute the ADMIXTURE-corrected genomic relationship matrix from a SnpArray
+`s`, returning an `m × m` `Matrix{T}`. Does not mutate `s`, `P`, or `Q`.
+Missing genotypes are imputed on the fly by the admixture-implied frequency
+`Σ_k Q[k,i] * P[k,j]`, then centered and scaled.
+
+# Arguments
+- `s`: `m × n` `AbstractSnpArray` (`m` individuals, `n` SNPs).
+- `P`: `K × n` matrix of A2 allele frequencies per ancestral population
+  (`K` populations).
+- `Q`: `K × m` matrix of per-individual ancestry fractions.
+- `T::Type{T}=Float64`: Float type for the result; default is `Float64`.
+"""
 function grm_admixture(
     s::AbstractSnpArray,
     P::AbstractMatrix,
