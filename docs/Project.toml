@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+SnpArrays = "4e780e97-f5bf-4111-9dc4-b70aaf691b06"
+
+[compat]
+Documenter = "1"

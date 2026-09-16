@@ -1,21 +1,18 @@
 using Documenter, SnpArrays
 
 makedocs(
-    format = Documenter.HTML(),
+    format = Documenter.HTML(canonical = "https://OpenMendel.github.io/SnpArrays.jl/stable"),
     sitename = "SnpArrays.jl",
     authors = "Hua Zhou",
-    clean = true,
-    debug = true,
+    checkdocs = :exports,
+    warnonly = [:missing_docs, :cross_references],
     pages = [
         "SnpArrays.jl Tutorial" => "index.md",
-        "Linear Algebra Benchmarks" => "linalg.md"
+        "Linear Algebra Benchmarks" => "linalg.md",
+        "API Reference" => "api.md"
     ]
 )
 
 deploydocs(
-    repo   = "github.com/OpenMendel/SnpArrays.jl.git",
-    target = "build",
-    deps   = nothing,
-    make   = nothing
+    repo = "github.com/OpenMendel/SnpArrays.jl.git"
 )
-
