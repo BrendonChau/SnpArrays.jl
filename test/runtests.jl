@@ -211,6 +211,12 @@ expected_row_vars = [var(filter(!isnan, view(additive, row, :)); corrected=false
       expected_row_vars
 @test vec(var!(zeros(1, size(s, 2)), s; dims=1,
                mean=expected_column_means)) ≈ expected_column_vars
+expected_total_var = var(filter(!isnan, vec(additive)))
+@test var(s) ≈ expected_total_var
+@test var(s; corrected=false) ≈
+      var(filter(!isnan, vec(additive)); corrected=false)
+@test var(s; mean=[mean(s)]) ≈ expected_total_var
+@test std(s) ≈ sqrt(expected_total_var)
 @test missingrate!(zeros(size(s, 2)), s, 1) ==
       vec(sum(dense .== 0x01, dims=1)) ./ size(s, 1)
 @test missingrate!(zeros(size(s, 1)), s, 2) ==
@@ -222,6 +228,8 @@ expected_row_vars = [var(filter(!isnan, view(additive, row, :)); corrected=false
                                     mean=zeros(size(s, 2) - 1))
 @test_throws DimensionMismatch missingrate!(zeros(size(s, 2) - 1), s, 1)
 @test_throws ArgumentError mean!(zeros(size(s, 2)), s; dims=3)
+@test_throws DimensionMismatch var(s; mean=zeros(2))
+@test_throws ArgumentError var(s; dims=3)
 @test_throws ArgumentError var!(zeros(size(s, 2)), s; dims=3)
 @test_throws ArgumentError missingrate!(zeros(size(s, 2)), s, 3)
 
