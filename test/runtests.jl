@@ -575,12 +575,14 @@ end
 end
 
 @testset "SnpLinAlg-vector multiplication (Miter > 0)" begin
-    EUR11 = [EUR;EUR;EUR;EUR;EUR;EUR;EUR;EUR;EUR;EUR;EUR]
+    EUR11 = vcat(EUR, EUR, EUR, EUR, EUR, EUR, EUR, EUR, EUR, EUR, EUR;
+                 des="tmp.miter")
     EUR11la = SnpLinAlg{Float64}(EUR11, model=ADDITIVE_MODEL, impute=true, center=true, scale=true)
     v = rand(size(EUR11la, 2))
     vtest = EUR11la * v
     vtrue = convert(Matrix{Float64}, EUR11, model=ADDITIVE_MODEL, impute=true, center=true, scale=true) * v
     @test norm(vtest - vtrue) < 5e-4
+    Sys.iswindows() || rm("tmp.miter.bed", force=true)
 end
 
 if get(ENV,"JULIA_SNPARRAYS_TEST_CUDA","") == "true"
