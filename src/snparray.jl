@@ -396,6 +396,34 @@ function _var(
     return var!(result, s; dims=dims, corrected=corrected, mean=mean)
 end
 
+function _var(
+    s::AbstractSnpArray,
+    corrected::Bool,
+    mean::Union{Nothing, AbstractArray},
+    ::Colon,
+)
+    counts = _counts(s, 1)
+    count0 = count2 = count3 = 0
+    @inbounds for column in axes(counts, 2)
+        count0 += counts[1, column]
+        count2 += counts[3, column]
+        count3 += counts[4, column]
+    end
+    nonmissing = count0 + count2 + count3
+    if mean === nothing
+        overall_mean = (count2 + 2count3) / nonmissing
+    else
+        length(mean) == 1 || throw(DimensionMismatch(
+            "mean has length $(length(mean)); expected 1 when dims = :",
+        ))
+        overall_mean = first(mean)
+    end
+    numerator = abs2(overall_mean) * count0 +
+                abs2(1 - overall_mean) * count2 +
+                abs2(2 - overall_mean) * count3
+    return numerator / (nonmissing - Int(corrected))
+end
+
 """
     maf!(out, s)
 
