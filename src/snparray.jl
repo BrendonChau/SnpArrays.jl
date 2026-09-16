@@ -89,6 +89,14 @@ function SnpArray(file::AbstractString, m::Integer, n::Integer)
     SnpArray(file, m, "r+")
 end
 
+"""
+    counts(s; dims = :)
+
+Count genotype codes of `s` along `dims`, returning a 4-row matrix whose rows
+give the counts of codes `0`, `1` (missing), `2`, and `3` respectively.
+`dims = 1` gives one output column per SNP, `dims = 2` one per individual, and
+`dims = :` a single column totalling the whole array.
+"""
 StatsBase.counts(s::AbstractSnpArray; dims=:) = _counts(s, dims)
 
 @inline function _packed_counts(byte::UInt8)
@@ -247,6 +255,15 @@ Base.eltype(s::SnpArray) = UInt8
 
 Base.length(s::SnpArray) = s.m * size(s.data, 2)
 
+"""
+    mean(s; dims = :, model = ADDITIVE_MODEL)
+
+Compute means of `s` along `dims`, ignoring missing genotypes. Returns a
+scalar when `dims = :` and an array otherwise.
+
+# Throws
+- `ArgumentError`: `dims` is not `:`, `1`, or `2`
+"""
 Statistics.mean(
     s::AbstractSnpArray;
     dims::Union{Colon, Integer} = :,
@@ -327,6 +344,16 @@ k == 1 ? s.m : k == 2 ? size(s.data, 2) : k > 2 ? 1 : error("Dimension k out of 
 
 # TODO: need to implement `var` for different SNP models
 
+"""
+    var(s; dims, corrected = true, mean = nothing)
+
+Compute additive-model variances of `s` along `dims`, ignoring missing
+genotypes.
+
+# Throws
+- `DimensionMismatch`: a supplied `mean` has the wrong length
+- `ArgumentError`: `dims` is not `1` or `2`
+"""
 Statistics.var(
     s::AbstractSnpArray;
     corrected::Bool = true,
@@ -409,10 +436,15 @@ function maf!(out::AbstractVector{T}, s::AbstractSnpArray) where T <: AbstractFl
     end
     out
 end
+"""
+    maf(s)
+
+Calculate minor allele frequencies of SnpArray `s`.
+"""
 maf(s::AbstractSnpArray) = maf!(Vector{Float64}(undef, size(s, 2)), s)
 
 """
-    minorallele(out, s)
+    minorallele!(out, s)
 
 Populate `out` with minor allele indicators. `out[j] == true` means A2 is the minor 
 allele of `j`th column; `out[j] == false` means A1 is the minor allele.
@@ -776,6 +808,14 @@ function missingrate!(
     return out
 end
 
+"""
+    missingrate(s, dims)
+
+Calculate missing-genotype rates of `s` along `dims`.
+
+# Throws
+- `ArgumentError`: `dims` is not `1` or `2`
+"""
 function missingrate(s::AbstractSnpArray, dims::Integer)
     if isone(dims)
         return missingrate!(Vector{Float64}(undef, size(s, 2)), s, 1)
