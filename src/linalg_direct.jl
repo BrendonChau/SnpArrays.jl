@@ -12,6 +12,9 @@ struct SnpLinAlg{T} <: AbstractMatrix{T}
     # reused after, so a repeated product allocates nothing here. Not
     # reentrant: concurrent `mul!` calls on one `SnpLinAlg` would share it.
     panel::Vector{T}
+    # Transposed genotype codes (one byte per sample and 4-SNP block) for
+    # the lookup-table `A*X` kernel; same lifetime and caveat as `panel`.
+    blk::Vector{UInt8}
 end
 
 AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
@@ -56,7 +59,7 @@ function SnpLinAlg{T}(
     _fill_genotype_values!(values, means, inverse_standard_deviations, model,
                            center, scale, impute)
     return SnpLinAlg{T}(s, model, center, scale, impute, means,
-                        inverse_standard_deviations, values, T[])
+                        inverse_standard_deviations, values, T[], UInt8[])
 end
 
 function _fill_genotype_values!(
@@ -92,7 +95,10 @@ end
 """
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs)
 
-Multiply `sla` by a vector or matrix and overwrite `out`.
+Multiply `sla` by a vector or matrix and overwrite `out`. A matrix `rhs`
+with at least `LOOKUP_MIN_RHS` columns on at least `LOOKUP_MIN_ROWS`
+samples uses the lookup-table kernel (`_snparray_AX_lookup_tile!`); other
+shapes use the register-tiled kernel.
 """
 function mul!(
     out::AbstractVector{T},
@@ -122,7 +128,8 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
     fill!(out, zero(T))
-    _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, sla.panel)
+    _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, sla.panel,
+                       sla.blk)
     return out
 end
 
@@ -241,10 +248,16 @@ function _resize_workspace!(workspace::Vector, count::Int)
     return workspace
 end
 
-function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace)
+function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace,
+                            blk)
     n = size(packed, 2)
     k = size(out, 2)
     T = eltype(out)
+    if _uses_lookup_kernel(rows_filled, k) && T <: SIMD_FLOAT &&
+       out isa Matrix{T} && rhs isa Matrix{T} && packed isa Matrix{UInt8}
+        return _snparray_AX_lookup_tile!(out, packed, rhs, values,
+                                         rows_filled, workspace, blk)
+    end
     row_step, column_step, rhs_step =
         _tile_sizes(T, rows_filled, n, k, :forward; vector=false)
     lanes = _rhs_width(T, k)
@@ -267,6 +280,72 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace)
                     out, packed, rhs, values, workspace, $panel_offset,
                     $row_first, $row_last, $column_step, $rhs_first,
                     $rhs_last, $width,
+                )
+            end
+        end
+    end
+    return out
+end
+
+"""
+    _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
+        workspace, blk)
+
+Accumulate `out += A * rhs` with the lookup-table kernel: per chunk of
+`LOOKUP_CHUNK_SNPS` SNPs, build the 256-row tables of every 4-SNP block
+for all rhs columns (tasks over blocks), then gather them per sample
+(tasks over sample blocks). `workspace` holds the tables, one rhs staging
+slice per build task, and one output tile per gather task; `blk` holds the
+transposed codes of one chunk.
+"""
+function _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
+                                   workspace, blk)
+    n = size(packed, 2)
+    k = size(out, 2)
+    T = eltype(out)
+    lanes = _vector_width(T)
+    width = Val(lanes)
+    k_padded = cld(k, 2lanes) * 2lanes
+    nblk_max = min(LOOKUP_CHUNK_SNPS ÷ 4, cld(n, 4))
+    row_span = 4 * cld(rows_filled, 4)
+    tables_len = nblk_max * 256 * k_padded
+    stage_len = 4k_padded
+    tile_len = LOOKUP_ROW_TILE * 2lanes
+    row_step = _task_axis_step(rows_filled, rows_filled)
+    row_tasks = cld(rows_filled, row_step)
+    block_step = max(1, cld(nblk_max, TASKS_PER_THREAD * Threads.nthreads()))
+    block_tasks = cld(nblk_max, block_step)
+    stage_base = tables_len
+    tile_base = stage_base + block_tasks * stage_len
+    _resize_workspace!(workspace, tile_base + row_tasks * tile_len)
+    _resize_workspace!(blk, nblk_max * row_span)
+    group = clamp(LOOKUP_GROUP_BUDGET ÷ (256 * 2lanes * sizeof(T)), 1,
+                  nblk_max)
+    @assert row_step % 4 == 0 "row_step must be a multiple of 4"
+    for column_first in 1:LOOKUP_CHUNK_SNPS:n
+        nblk = cld(min(LOOKUP_CHUNK_SNPS, n - column_first + 1), 4)
+        @sync begin
+            task_index = 0
+            for block_first in 1:block_step:nblk
+                block_last = min(block_first + block_step - 1, nblk)
+                stage_offset = stage_base + task_index * stage_len
+                task_index += 1
+                Threads.@spawn _lookup_build_tables!(
+                    workspace, workspace, $stage_offset, n, rhs, values,
+                    $column_first, $block_first, $block_last, k_padded, width,
+                )
+            end
+        end
+        @sync begin
+            task_index = 0
+            for row_first in 1:row_step:rows_filled
+                row_last = min(row_first + row_step - 1, rows_filled)
+                tile_offset = tile_base + task_index * tile_len
+                task_index += 1
+                Threads.@spawn _snparray_AX_lookup_task!(
+                    out, packed, workspace, workspace, $tile_offset, blk,
+                    row_span, $row_first, $row_last, $column_first, $nblk,
+                    k_padded, group, width,
                 )
             end
         end

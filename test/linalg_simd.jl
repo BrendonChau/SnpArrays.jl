@@ -572,3 +572,83 @@ end
         test_simd_products(operator, reference, nr + 1; tolerance=tolerance)
     end
 end
+
+@testset "SnpLinAlg lookup-table A*X" begin
+    min_rows = SnpArrays.LOOKUP_MIN_ROWS
+    min_rhs = SnpArrays.LOOKUP_MIN_RHS
+    tile = SnpArrays.LOOKUP_ROW_TILE
+    chunk = SnpArrays.LOOKUP_CHUNK_SNPS
+
+    @test SnpArrays._uses_lookup_kernel(min_rows, min_rhs)
+    @test !SnpArrays._uses_lookup_kernel(min_rows - 1, min_rhs)
+    @test !SnpArrays._uses_lookup_kernel(min_rows, min_rhs - 1)
+
+    # 1. 4x4 two-bit transpose: sample s of x = r0 | r1<<8 | r2<<16 | r3<<24
+    #    gets code (r_l >> 2s) & 3 in bits 2l:2l+1.
+    for x in (0x00000000, 0xffffffff, 0x1b6ce4b1, 0x93c0a55f), s in 0:3
+        expected = UInt8(0)
+        for l in 0:3
+            byte = (x >>> (8l)) & 0xff
+            expected |= UInt8((byte >>> (2s)) & 3) << (2l)
+        end
+        @test SnpArrays._lookup_gather4(x, s) == expected
+    end
+
+    for T in (Float32, Float64)
+        nr = 2 * SnpArrays._vector_width(T)
+        tolerance = T(64) * eps(T)
+
+        # 2. Sample, SNP, and rhs remainders against the tile, chunk, byte,
+        #    4-SNP block, and rhs sub-block boundaries.
+        for m in (min_rows, min_rows + 1, 2tile + 3),
+            n in (3, 4, 5, chunk - 1, chunk + 2),
+            k in (min_rhs, nr - 1, nr, nr + 1, 2nr + 3)
+            packed, dense = simd_test_fixture(m, n)
+            reference = simd_test_reference(dense, T, ADDITIVE_MODEL, true,
+                                            true, true)
+            operator = SnpLinAlg{T}(packed; center=true, scale=true)
+            rhs = simd_test_rhs(T, n, k)
+            @test isapprox(operator * rhs, reference * rhs; atol=tolerance,
+                           rtol=tolerance, nans=true)
+        end
+
+        # 3. Every model and transformation at one lookup-path shape.
+        packed, dense = simd_test_fixture(min_rows + 5, 9)
+        for model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL),
+            impute in (false, true), center in (false, true),
+            scale in (false, true)
+            operator = SnpLinAlg{T}(packed; model=model, impute=impute,
+                                    center=center, scale=scale)
+            reference = simd_test_reference(dense, T, model, center, scale,
+                                            impute)
+            rhs = simd_test_rhs(T, 9, nr + 1)
+            @test isapprox(operator * rhs, reference * rhs; atol=tolerance,
+                           rtol=tolerance, nans=true)
+        end
+
+        # 4. mul! overwrites a prefilled destination and, after a warm-up,
+        #    a repeated product reuses the workspaces.
+        operator = SnpLinAlg{T}(packed; center=true, scale=true)
+        reference = simd_test_reference(dense, T, ADDITIVE_MODEL, true, true,
+                                        true)
+        rhs = simd_test_rhs(T, 9, nr + 1)
+        destination = fill(T(19), min_rows + 5, nr + 1)
+        @test mul!(destination, operator, rhs) === destination
+        @test isapprox(destination, reference * rhs; atol=tolerance,
+                       rtol=tolerance, nans=true)
+        panel_length = length(operator.panel)
+        blk_length = length(operator.blk)
+        mul!(destination, operator, rhs)
+        @test length(operator.panel) == panel_length
+        @test length(operator.blk) == blk_length
+    end
+
+    # 5. A missing genotype with impute=false yields NaN in its row only.
+    packed = SnpArray(undef, min_rows, 5)
+    fill!(packed.data, 0x00)
+    packed.data[1, 2] = 0x04
+    operator = SnpLinAlg{Float64}(packed; impute=false)
+    product = operator * ones(5, min_rhs)
+    @test all(isnan, product[2, :])
+    @test all(iszero, product[[1; 3:min_rows], :])
+end
