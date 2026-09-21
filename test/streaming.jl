@@ -185,6 +185,45 @@ end
                     V, stream, Q; scale = Vector{T}(undef, n + 1))
             end
         end
+
+        stream32 = SnpLinAlgStream{Float32}(path; m = M, width = 4096,
+                                            center = true, scale = true,
+                                            impute = true)
+        sla64 = SnpLinAlg{Float64}(stacked; center = true, scale = true,
+                                   impute = true)
+        tolerance32 = 32 * sqrt(Float32(max(M, n))) * eps(Float32)
+        for k in (1, 4, 32)
+            Q = randn(Xoshiro(k), Float64, M, k)
+            V = Matrix{Float64}(undef, M, k)
+            U = Matrix{Float64}(undef, n, k)
+            @test streamed_grm_mul!(V, stream32, Q; U = U) === V
+            Uref = transpose(sla64) * Q
+            Vref = (sla64 * Uref) ./ n
+            @test isapprox(norm(U - Uref) / norm(Uref), 0.0;
+                          atol = tolerance32, rtol = tolerance32)
+            @test isapprox(norm(V - Vref) / norm(Vref), 0.0;
+                          atol = tolerance32, rtol = tolerance32)
+
+            scale_vec = rand(Xoshiro(5), Float64, n)
+            V2 = Matrix{Float64}(undef, M, k)
+            streamed_grm_mul!(V2, stream32, Q; scale = scale_vec, U = U)
+            Vref2 = sla64 * (Uref .* scale_vec)
+            @test isapprox(norm(V2 - Vref2) / norm(Vref2), 0.0;
+                          atol = tolerance32, rtol = tolerance32)
+
+            @test_throws DimensionMismatch streamed_grm_mul!(
+                Matrix{Float64}(undef, M + 1, k), stream32, Q)
+            @test_throws DimensionMismatch streamed_grm_mul!(
+                V, stream32, Q; U = Matrix{Float64}(undef, n + 1, k))
+
+            # The mixed path differs from the uniform Float32 path only in
+            # accumulation precision; both should agree to the Float32
+            # tolerance.
+            Vuniform = Matrix{Float32}(undef, M, k)
+            streamed_grm_mul!(Vuniform, stream32, Float32.(Q))
+            @test isapprox(norm(Vuniform - V) / norm(V), 0.0;
+                          atol = tolerance32, rtol = tolerance32)
+        end
     end
 end
 

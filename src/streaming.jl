@@ -311,23 +311,21 @@ Base.iterate(stream::SnpLinAlgStream, state::SnpLinAlgStreamState) =
     _deliver!(stream, state)
 
 """
-    streamed_grm_mul!(V, stream, Q; scale=inv(size(stream, 2)), U=nothing)
+    _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
 
-Accumulate `V = Σ_c A_c diag(s_c) transpose(A_c) Q` over the chunks `A_c`
-of `stream`, where `s_c` is `scale` restricted to chunk `c`'s columns
-(`scale` may be a scalar or a length-`size(stream, 2)` vector). When `U` is
-an `AbstractMatrix`, also write the unscaled `transpose(A) * Q` into it.
-Matrix `Q` and `V` only; reshape a vector right-hand side yourself.
+Throw a `DimensionMismatch` naming the offending argument unless `V` is
+`m × k`, `Q` has `m` rows, `U` (when given) is `n × k`, and a vector
+`scale` has length `n`.
 """
-function streamed_grm_mul!(
-    V::AbstractMatrix{T},
-    stream::SnpLinAlgStream{T},
-    Q::AbstractMatrix{T};
-    scale::Union{Number, AbstractVector{T}} = inv(size(stream, 2)),
-    U::Union{Nothing, AbstractMatrix{T}} = nothing,
-) where T <: AbstractFloat
-    m, n = size(stream)
-    k = size(Q, 2)
+function _check_streamed_grm_dims(
+    V::AbstractMatrix,
+    Q::AbstractMatrix,
+    U::Union{Nothing, AbstractMatrix},
+    scale::Union{Number, AbstractVector},
+    m::Int,
+    n::Int,
+    k::Int,
+)
     size(V) == (m, k) || throw(DimensionMismatch(
         "V has size $(size(V)); expected $((m, k))",
     ))
@@ -342,18 +340,94 @@ function streamed_grm_mul!(
             "U has size $(size(U)); expected $((n, k))",
         ))
     end
-    fill!(V, zero(T))
-    buffers = Dict{Int, Matrix{T}}()
+    return nothing
+end
+
+"""
+    _streamed_grm_mul!(V, stream, Q_kernel, scale_kernel, U, V_scratch)
+
+Run the per-chunk products of `streamed_grm_mul!` in `Q_kernel`'s element
+type, accumulating into `V` directly when `V_scratch === nothing` (the
+uniform-precision path) or through `V_scratch` otherwise (the mixed
+Float32/Float64 path); `V` is assumed already zeroed.
+"""
+function _streamed_grm_mul!(
+    V::AbstractMatrix{TV},
+    stream::SnpLinAlgStream{TS},
+    Q_kernel::AbstractMatrix{TS},
+    scale_kernel::Union{Number, AbstractVector{TS}},
+    U::Union{Nothing, AbstractMatrix{TV}},
+    V_scratch::Union{Nothing, Matrix{TS}},
+) where {TV <: AbstractFloat, TS <: AbstractFloat}
+    k = size(Q_kernel, 2)
+    buffers = Dict{Int, Matrix{TS}}()
     for (cols, chunk) in stream
         width = length(cols)
         chunk_output = get!(buffers, width) do
-            Matrix{T}(undef, width, k)
+            Matrix{TS}(undef, width, k)
         end
-        mul!(chunk_output, transpose(chunk), Q)
+        mul!(chunk_output, transpose(chunk), Q_kernel)
         U !== nothing && copyto!(view(U, cols, :), chunk_output)
-        chunk_scale = scale isa AbstractVector ? view(scale, cols) : scale
+        chunk_scale = scale_kernel isa AbstractVector ?
+            view(scale_kernel, cols) : scale_kernel
         chunk_output .*= chunk_scale
-        mul!(V, chunk, chunk_output, 1, 1)
+        if V_scratch === nothing
+            mul!(V, chunk, chunk_output, 1, 1)
+        else
+            mul!(V_scratch, chunk, chunk_output)
+            V .+= V_scratch
+        end
     end
+    return V
+end
+
+"""
+    streamed_grm_mul!(V, stream, Q; scale=inv(size(stream, 2)), U=nothing)
+    streamed_grm_mul!(V::AbstractMatrix{Float64},
+                      stream::SnpLinAlgStream{Float32},
+                      Q::AbstractMatrix{Float64};
+                      scale=inv(size(stream, 2)), U=nothing)
+
+Accumulate `V = Σ_c A_c diag(s_c) transpose(A_c) Q` over the chunks `A_c`
+of `stream`, where `s_c` is `scale` restricted to chunk `c`'s columns
+(`scale` may be a scalar or a length-`size(stream, 2)` vector). When `U` is
+an `AbstractMatrix`, also write the unscaled `transpose(A) * Q` into it.
+Matrix `Q` and `V` only; reshape a vector right-hand side yourself. With a
+`Float32` stream and `Float64` `V`, `Q` (and `U`), each chunk's product
+runs in single precision and is accumulated into `V` (and `U`) in double
+precision, so the rounding error is bounded by the chunk width rather than
+by `n`; with matching element types everything runs in that one type.
+"""
+function streamed_grm_mul!(
+    V::AbstractMatrix{T},
+    stream::SnpLinAlgStream{T},
+    Q::AbstractMatrix{T};
+    scale::Union{Number, AbstractVector{T}} = inv(size(stream, 2)),
+    U::Union{Nothing, AbstractMatrix{T}} = nothing,
+) where T <: AbstractFloat
+    m, n = size(stream)
+    k = size(Q, 2)
+    _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
+    fill!(V, zero(T))
+    _streamed_grm_mul!(V, stream, Q, scale, U, nothing)
+    return V
+end
+
+function streamed_grm_mul!(
+    V::AbstractMatrix{Float64},
+    stream::SnpLinAlgStream{Float32},
+    Q::AbstractMatrix{Float64};
+    scale::Union{Number, AbstractVector{<:Real}} = inv(size(stream, 2)),
+    U::Union{Nothing, AbstractMatrix{Float64}} = nothing,
+)
+    m, n = size(stream)
+    k = size(Q, 2)
+    _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
+    fill!(V, zero(Float64))
+    Q32 = Matrix{Float32}(Q)
+    scale32 = scale isa AbstractVector ? Vector{Float32}(scale) :
+              Float32(scale)
+    V_scratch = Matrix{Float32}(undef, m, k)
+    _streamed_grm_mul!(V, stream, Q32, scale32, U, V_scratch)
     return V
 end

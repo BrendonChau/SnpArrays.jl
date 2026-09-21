@@ -86,9 +86,9 @@ end
 
 function run_benchmarks(stacked::SnpArray, path::AbstractString, m::Int, n::Int)
     println()
-    @printf("%-8s %4s | %10s %10s %10s | %10s %10s\n",
+    @printf("%-8s %4s | %10s %10s %10s | %10s %10s %10s\n",
             "T", "k", "mem AᵀQ", "mem A*U", "mem total", "stream(pf)",
-            "stream(no pf)")
+            "stream(no pf)", "stream(mixed)")
     for T in (Float32, Float64)
         sla = SnpLinAlg{T}(stacked; center=true, scale=true, impute=true)
         for k in (8, 64)
@@ -120,8 +120,26 @@ function run_benchmarks(stacked::SnpArray, path::AbstractString, m::Int, n::Int)
             t_stream_noprefetch = min_elapsed(streamed_grm_mul!, V3,
                                               stream_noprefetch, Q)
 
-            @printf("%-8s %4d | %10.3f %10.3f %10.3f | %10.3f %10.3f\n",
-                    T, k, t_atq, t_au, t_total, t_stream, t_stream_noprefetch)
+            mixed_str = lpad("-", 10)
+            if T == Float32
+                Q64 = Matrix{Float64}(Q)
+                V64 = Matrix{Float64}(undef, m, k)
+                t_mixed = min_elapsed(streamed_grm_mul!, V64, stream, Q64)
+                err_mixed = norm(V64 - Matrix{Float64}(V) ./ n) /
+                            norm(Matrix{Float64}(V) ./ n)
+                tol32 = 32 * sqrt(Float32(max(m, n))) * eps(Float32)
+                println("correctness check T=", T, " k=", k,
+                        " (mixed): rel err = ", err_mixed, " (tol = ", tol32,
+                        ")")
+                err_mixed < tol32 || error("streamed_grm_mul! mixed-" *
+                                           "precision correctness check " *
+                                           "failed: rel err $err_mixed >= " *
+                                           "tol $tol32 for k=$k")
+                mixed_str = @sprintf("%10.3f", t_mixed)
+            end
+            @printf("%-8s %4d | %10.3f %10.3f %10.3f | %10.3f %10.3f %s\n",
+                    T, k, t_atq, t_au, t_total, t_stream,
+                    t_stream_noprefetch, mixed_str)
         end
     end
 end

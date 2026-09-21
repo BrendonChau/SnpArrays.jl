@@ -45,6 +45,21 @@ the sweep is bound by that task rather than by the products.
 
 All runs used 16 threads.
 
+## Mixed precision, seconds (Float32 stream, Float64 `V`, `Q`), after
+
+`streamed_grm_mul!` with a `SnpLinAlgStream{Float32}` and `Float64` `V`
+and `Q` runs each chunk's products in Float32 and adds the chunk result
+into `V` in Float64, as `kq_pass.c` does. All columns are from one further
+run on the shared node, so they differ slightly from the tables above.
+
+| k | in-memory Float32 total | streaming Float32 | streaming mixed | streaming Float64 |
+| --- | --- | --- | --- | --- |
+| 8 | 0.136 | 0.205 | 0.217 | 0.209 |
+| 64 | 0.298 | 0.499 | 0.548 | 0.821 |
+
+Relative difference of the mixed result from the in-memory Float32
+reference: 1.4e-7 at both `k`, against the Float32 tolerance of 8.9e-4.
+
 ## Per-chunk stages, one 38279 x 4096 chunk (37 MiB), milliseconds
 
 | Stage | before | after |
