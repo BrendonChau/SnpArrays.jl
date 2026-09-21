@@ -100,17 +100,43 @@ StatsBase.counts(s::AbstractSnpArray; dims=:) = _counts(s, dims)
     return 4 - count1 - count2 - count3, count1, count2, count3
 end
 
+# mask selecting the low bit of each 2-bit genotype code within a 64-bit word
+const _WORD_LOW_MASK = 0x5555555555555555
+
+"""
+    _column_counts!(counts::Matrix{Int}, s::SnpArray)
+
+Count the four packed genotype codes per column of `s` into `counts`,
+processing eight fully-valid bytes at a time as one 64-bit word.
+"""
 function _column_counts!(counts::Matrix{Int}, s::SnpArray)
     full_bytes, trailing_genotypes = divrem(s.m, 4)
+    full_words = full_bytes >> 3
     @inbounds for column in axes(s.data, 2)
-        count0 = count1 = count2 = count3 = 0
-        for byte_index in 1:full_bytes
+        count1 = count2 = count3 = 0
+        for word_index in 1:full_words
+            base = 8 * (word_index - 1)
+            word = UInt64(s.data[base + 1, column]) |
+                UInt64(s.data[base + 2, column]) << 8 |
+                UInt64(s.data[base + 3, column]) << 16 |
+                UInt64(s.data[base + 4, column]) << 24 |
+                UInt64(s.data[base + 5, column]) << 32 |
+                UInt64(s.data[base + 6, column]) << 40 |
+                UInt64(s.data[base + 7, column]) << 48 |
+                UInt64(s.data[base + 8, column]) << 56
+            low = word & _WORD_LOW_MASK
+            high = (word >> 1) & _WORD_LOW_MASK
+            count1 += count_ones(low & ~high)
+            count2 += count_ones(~low & high)
+            count3 += count_ones(low & high)
+        end
+        for byte_index in (8full_words + 1):full_bytes
             byte_counts = _packed_counts(s.data[byte_index, column])
-            count0 += byte_counts[1]
             count1 += byte_counts[2]
             count2 += byte_counts[3]
             count3 += byte_counts[4]
         end
+        count0 = 4full_bytes - count1 - count2 - count3
         if !iszero(trailing_genotypes)
             byte = s.data[full_bytes + 1, column]
             for offset in 0:(trailing_genotypes - 1)
