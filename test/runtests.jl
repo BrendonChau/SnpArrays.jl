@@ -707,6 +707,8 @@ end
 
 include("linalg_simd.jl")
 
+include("streaming.jl")
+
 @testset "subarrays" begin
 @test all(@view(EUR[1:2:10, 1:2:10]) .==
 [[0x03 0x03 0x02 0x02 0x03];

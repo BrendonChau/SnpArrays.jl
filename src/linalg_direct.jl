@@ -44,8 +44,34 @@ function SnpLinAlg{T}(
 ) where T <: AbstractFloat
     model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL) ||
         throw(ArgumentError("unrecognized model $model"))
-    means = Vector{T}(dropdims(mean(s; dims=1, model=model); dims=1))
+    means = Vector{T}(undef, size(s, 2))
     inverse_standard_deviations = Vector{T}(undef, size(s, 2))
+    values = Matrix{T}(undef, 4, size(s, 2))
+    _fill_statistics!(means, inverse_standard_deviations, values, s, model,
+                      center, scale, impute)
+    return SnpLinAlg{T}(s, model, center, scale, impute, means,
+                        inverse_standard_deviations, values, T[], UInt8[])
+end
+
+"""
+    _fill_statistics!(means, inverse_standard_deviations, values, s, model,
+        center, scale, impute) -> values
+
+Recompute `means`, `inverse_standard_deviations`, and `values` in place from
+the genotype counts of `s`, the shared body of the `SnpLinAlg` constructor
+and `_refill_statistics!`.
+"""
+function _fill_statistics!(
+    means::Vector{T},
+    inverse_standard_deviations::Vector{T},
+    values::Matrix{T},
+    s::AbstractSnpArray,
+    model::Union{Val{1}, Val{2}, Val{3}},
+    center::Bool,
+    scale::Bool,
+    impute::Bool,
+) where T <: AbstractFloat
+    mean!(means, s; dims=1, model=model)
     @inbounds @simd for column in eachindex(means)
         column_mean = means[column]
         variance = model == ADDITIVE_MODEL ?
@@ -55,11 +81,24 @@ function SnpLinAlg{T}(
         inverse_standard_deviations[column] =
             standard_deviation > zero(T) ? inv(standard_deviation) : one(T)
     end
-    values = Matrix{T}(undef, 4, size(s, 2))
     _fill_genotype_values!(values, means, inverse_standard_deviations, model,
                            center, scale, impute)
-    return SnpLinAlg{T}(s, model, center, scale, impute, means,
-                        inverse_standard_deviations, values, T[], UInt8[])
+    return values
+end
+
+"""
+    _refill_statistics!(sla::SnpLinAlg) -> sla
+
+Recompute `sla.μ`, `sla.σinv`, and `sla.values` in place from `sla.s`.
+Callers that overwrite `sla.s.data` must `fill!(sla.s.columncounts, 0)`
+first so the column counts are recomputed. `sla.panel` and `sla.blk` are
+left untouched, so a repeated product at the shape of `sla` still allocates
+nothing.
+"""
+function _refill_statistics!(sla::SnpLinAlg{T}) where T <: AbstractFloat
+    _fill_statistics!(sla.μ, sla.σinv, sla.values, sla.s, sla.model,
+                      sla.center, sla.scale, sla.impute)
+    return sla
 end
 
 function _fill_genotype_values!(
@@ -94,24 +133,38 @@ end
 
 """
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs)
+    LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs, α, β)
 
 Multiply `sla` by a vector or matrix and overwrite `out`. A matrix `rhs`
 with at least `LOOKUP_MIN_RHS` columns on at least `LOOKUP_MIN_ROWS`
 samples uses the lookup-table kernel (`_snparray_AX_lookup_tile!`); other
-shapes use the register-tiled kernel.
+shapes use the register-tiled kernel. The five-argument form computes
+`out = sla * rhs + β * out` and requires `α == 1` and `β ∈ (0, 1)`.
 """
 function mul!(
     out::AbstractVector{T},
     sla::SnpLinAlg{T},
     rhs::AbstractVector{T},
 ) where T <: AbstractFloat
+    return mul!(out, sla, rhs, 1, 0)
+end
+
+function mul!(
+    out::AbstractVector{T},
+    sla::SnpLinAlg{T},
+    rhs::AbstractVector{T},
+    α::Number,
+    β::Number,
+) where T <: AbstractFloat
+    α == 1 || throw(ArgumentError("α must be 1, got $α"))
+    β == 0 || β == 1 || throw(ArgumentError("β must be 0 or 1, got $β"))
     length(out) == size(sla, 1) || throw(DimensionMismatch(
         "output has length $(length(out)); expected $(size(sla, 1))",
     ))
     length(rhs) == size(sla, 2) || throw(DimensionMismatch(
         "right-hand side has length $(length(rhs)); expected $(size(sla, 2))",
     ))
-    fill!(out, zero(T))
+    β == 0 && fill!(out, zero(T))
     _snparray_ax_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
     return out
 end
@@ -121,13 +174,25 @@ function mul!(
     sla::SnpLinAlg{T},
     rhs::AbstractMatrix{T},
 ) where T <: AbstractFloat
+    return mul!(out, sla, rhs, 1, 0)
+end
+
+function mul!(
+    out::AbstractMatrix{T},
+    sla::SnpLinAlg{T},
+    rhs::AbstractMatrix{T},
+    α::Number,
+    β::Number,
+) where T <: AbstractFloat
+    α == 1 || throw(ArgumentError("α must be 1, got $α"))
+    β == 0 || β == 1 || throw(ArgumentError("β must be 0 or 1, got $β"))
     size(out) == (size(sla, 1), size(rhs, 2)) || throw(DimensionMismatch(
         "output has size $(size(out)); expected $((size(sla, 1), size(rhs, 2)))",
     ))
     size(rhs, 1) == size(sla, 2) || throw(DimensionMismatch(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
-    fill!(out, zero(T))
+    β == 0 && fill!(out, zero(T))
     _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, sla.panel,
                        sla.blk)
     return out
