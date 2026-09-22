@@ -344,3 +344,131 @@ end
         end
     end
 end
+
+"""
+    collect_chunks(stream)
+
+Materialize every chunk of `stream` into a `Vector` of named tuples, so that
+two independently constructed streams can be compared chunk by chunk.
+"""
+function collect_chunks(stream)
+    result = []
+    for (cols, chunk) in stream
+        push!(result, (cols = cols, data = copy(chunk.s.data),
+                       values = copy(chunk.values),
+                       counts = copy(counts(chunk.s; dims = 1))))
+    end
+    return result
+end
+
+@testset "parallel and serial chunk reads agree" begin
+    m, n = size(eur_full)
+    reps = 4
+    M = reps * m
+
+    mktempdir(ENV["TMPDIR"]) do dir
+        stacked = SnpArray(undef, M, n)
+        for r in 1:reps
+            stacked[((r - 1) * m + 1):(r * m), :] .= view(eur_full, :, :)
+        end
+        path = joinpath(dir, "stacked.bed")
+        write_bed(path, stacked)
+        open(joinpath(dir, "stacked.bim"), "w") do io
+            for i in 1:n
+                println(io, "1 snp$i 0 $i A C")
+            end
+        end
+
+        T = Float64
+        kwargs = (m = M, center = true, scale = true, impute = true)
+        for width in (1000, 37, n)
+            reference = collect_chunks(SnpLinAlgStream{T}(path;
+                                                           width = width,
+                                                           readers = 1,
+                                                           kwargs...))
+            if width == 1000
+                @test last(reference).cols == (n - 51 + 1):n
+            end
+            for readers in (2, 4, 16)
+                result = collect_chunks(SnpLinAlgStream{T}(path;
+                                                            width = width,
+                                                            readers = readers,
+                                                            kwargs...))
+                @test length(result) == length(reference)
+                for (a, b) in zip(result, reference)
+                    @test a.cols == b.cols
+                    @test a.data == b.data
+                    @test a.values == b.values
+                    @test a.counts == b.counts
+                end
+            end
+            if width == 1000
+                np_stream = SnpLinAlgStream{T}(path; width = width,
+                                               readers = 4, prefetch = false,
+                                               kwargs...)
+                no_prefetch = collect_chunks(np_stream)
+                @test length(no_prefetch) == length(reference)
+                for (a, b) in zip(no_prefetch, reference)
+                    @test a.cols == b.cols
+                    @test a.data == b.data
+                    @test a.values == b.values
+                    @test a.counts == b.counts
+                end
+            end
+        end
+
+        eur_prefix = joinpath(dir, "eur")
+        for suffix in (".bed", ".bim", ".fam")
+            cp(SnpArrays.datadir("EUR_subset" * suffix), eur_prefix * suffix)
+        end
+        compress_plink(eur_prefix, "gz")
+        gz = collect_chunks(SnpLinAlgStream{Float64}(eur_prefix * ".bed.gz";
+                                                      width = 4096,
+                                                      readers = 8,
+                                                      center = true,
+                                                      scale = true))
+        plain = collect_chunks(SnpLinAlgStream{Float64}(eur_prefix * ".bed";
+                                                         width = 4096,
+                                                         readers = 1,
+                                                         center = true,
+                                                         scale = true))
+        @test length(gz) == length(plain)
+        for (a, b) in zip(gz, plain)
+            @test a.cols == b.cols
+            @test a.data == b.data
+            @test a.values == b.values
+            @test a.counts == b.counts
+        end
+    end
+end
+
+@testset "threaded column counts" begin
+    for s in (eur_full, mouse_full)
+        @test length(s.data) >= SnpArrays.COUNT_TASK_MIN_BYTES
+        expected = zeros(Int, 4, size(s, 2))
+        SnpArrays._column_counts_range!(expected, s, 1:size(s, 2))
+        actual = zeros(Int, 4, size(s, 2))
+        SnpArrays._column_counts!(actual, s)
+        @test actual == expected
+        @test actual == counts(s; dims = 1)
+    end
+
+    small = SnpArray(undef, 101, 37)
+    small.data .= view(eur_full.data, 1:26, 1:37)
+    @test length(small.data) < SnpArrays.COUNT_TASK_MIN_BYTES
+    expected = zeros(Int, 4, size(small, 2))
+    SnpArrays._column_counts_range!(expected, small, 1:size(small, 2))
+    actual = zeros(Int, 4, size(small, 2))
+    SnpArrays._column_counts!(actual, small)
+    @test actual == expected
+    @test actual == counts(small; dims = 1)
+end
+
+@testset "readers argument validation" begin
+    @test_throws ArgumentError SnpLinAlgStream{Float64}(
+        SnpArrays.datadir("EUR_subset.bed"); readers = 0)
+    @test_throws ArgumentError SnpLinAlgStream{Float64}(
+        SnpArrays.datadir("EUR_subset.bed"); readers = -1)
+    @test SnpLinAlgStream{Float64}(SnpArrays.datadir("EUR_subset.bed");
+                                   readers = 3).readers == 3
+end

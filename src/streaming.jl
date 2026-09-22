@@ -1,7 +1,7 @@
 """
     SnpLinAlgStream{T}(bedfiles; m=nothing, width=4096, prefetch=true,
-                       model=ADDITIVE_MODEL, center=false, scale=false,
-                       impute=true)
+                       readers=_default_readers(), model=ADDITIVE_MODEL,
+                       center=false, scale=false, impute=true)
 
 Iterate `.bed` files as consecutive column chunks of a `SnpLinAlg`, without
 memory-mapping the whole genotype matrix.
@@ -11,6 +11,8 @@ memory-mapping the whole genotype matrix.
 - `m`: sample count; defaults to the first file's `.fam` line count
 - `width`: chunk width in SNPs
 - `prefetch`: overlaps the next chunk's read with the current chunk's use
+- `readers`: concurrent reader tasks per chunk of a plain `.bed` file;
+  compressed files always use one
 - `model`, `center`, `scale`, `impute`: forwarded to each chunk's `SnpLinAlg`
 
 `for (cols, chunk) in stream` yields `(cols, chunk)` with
@@ -26,6 +28,7 @@ struct SnpLinAlgStream{T}
     offsets::Vector{Int}
     width::Int
     prefetch::Bool
+    readers::Int
     model::Union{Val{1}, Val{2}, Val{3}}
     center::Bool
     scale::Bool
@@ -95,11 +98,21 @@ _make_buffer_pair(
     (_make_buffer(T, m, width, model, center, scale, impute),
      _make_buffer(T, m, width, model, center, scale, impute))
 
+"""
+    _default_readers() -> Int
+
+Return the default number of concurrent reader tasks per plain `.bed`
+chunk: half the thread count, between 1 and 8, so blocking reads do not
+park the threads the prefetch task overlaps with.
+"""
+_default_readers() = max(1, min(8, Threads.nthreads() ÷ 2))
+
 function SnpLinAlgStream{T}(
     bedfiles::Union{AbstractString, AbstractVector{<:AbstractString}};
     m::Union{Integer, Nothing} = nothing,
     width::Integer = 4096,
     prefetch::Bool = true,
+    readers::Integer = _default_readers(),
     model::Union{Val{1}, Val{2}, Val{3}} = ADDITIVE_MODEL,
     center::Bool = false,
     scale::Bool = false,
@@ -114,6 +127,8 @@ function SnpLinAlgStream{T}(
     model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL) ||
         throw(ArgumentError("unrecognized model $model"))
     width >= 1 || throw(ArgumentError("width must be at least 1, got $width"))
+    readers >= 1 ||
+        throw(ArgumentError("readers must be at least 1, got $readers"))
     row_count = m === nothing ? _fam_row_count(first(files)) : Int(m)
     drows = (row_count + 3) >> 2
     ns = Vector{Int}(undef, length(files))
@@ -136,8 +151,8 @@ function SnpLinAlgStream{T}(
     full_buffers = _make_buffer_pair(T, row_count, Int(width), model, center,
                                      scale, impute)
     return SnpLinAlgStream{T}(files, row_count, ns, offsets, Int(width),
-                              prefetch, model, center, scale, impute,
-                              full_buffers,
+                              prefetch, Int(readers), model, center, scale,
+                              impute, full_buffers,
                               Dict{Int, NTuple{2, SnpLinAlg{T}}}())
 end
 
@@ -182,23 +197,103 @@ function _check_bed_magic!(io::IO, path::AbstractString)
 end
 
 """
-    _read_chunk!(io, buffer) -> buffer
+    _open_handles(path, io, readers) -> Vector{IOStream}
 
-Read one chunk of packed genotypes into `buffer.s.data` and refill
-`buffer`'s statistics from the freshly read codes.
+Return `io` plus `readers - 1` further read handles on `path` when
+`readers > 1` and `io` is a seekable `IOStream`; otherwise an empty vector,
+which selects the serial chunk read.
 """
-function _read_chunk!(io::IO, buffer::SnpLinAlg{T}) where T <: AbstractFloat
-    read!(io, buffer.s.data)
+function _open_handles(path::AbstractString, io::IO, readers::Int)
+    (readers > 1 && io isa IOStream) || return IOStream[]
+    handles = Vector{IOStream}(undef, readers)
+    handles[1] = io
+    for index in 2:readers
+        handles[index] = open(path, "r")
+    end
+    return handles
+end
+
+"""
+    _finish_chunk!(buffer) -> buffer
+
+Zero `buffer`'s cached counts and refill its statistics from the freshly
+read codes in `buffer.s.data`.
+"""
+function _finish_chunk!(buffer::SnpLinAlg{T}) where T <: AbstractFloat
     fill!(buffer.s.columncounts, 0)
     fill!(buffer.s.rowcounts, 0)
     _refill_statistics!(buffer)
     return buffer
 end
 
+"""
+    _read_chunk!(io, buffer) -> buffer
+
+Read one chunk of packed genotypes into `buffer.s.data` with a single
+sequential read and refill `buffer`'s statistics.
+"""
+function _read_chunk!(io::IO, buffer::SnpLinAlg{T}) where T <: AbstractFloat
+    read!(io, buffer.s.data)
+    return _finish_chunk!(buffer)
+end
+
+"""
+    _read_block!(io, data, file_offset, byte_first, nbytes) -> data
+
+Seek `io` to `file_offset` and read `nbytes` bytes into `data` starting at
+linear index `byte_first`; throws an `ArgumentError` naming the offset if
+fewer than `nbytes` bytes remain.
+"""
+function _read_block!(
+    io::IOStream,
+    data::Matrix{UInt8},
+    file_offset::Int,
+    byte_first::Int,
+    nbytes::Int,
+)
+    seek(io, file_offset)
+    remaining = filesize(io) - file_offset
+    remaining >= nbytes || throw(ArgumentError(
+        "short read at byte offset $file_offset: $remaining bytes " *
+        "remain, $nbytes needed",
+    ))
+    GC.@preserve data unsafe_read(io, pointer(data, byte_first), UInt(nbytes))
+    return data
+end
+
+"""
+    _read_chunk_parallel!(handles, buffer, byte_offset, drows) -> buffer
+
+Read the chunk starting at file byte `byte_offset` into `buffer.s.data`
+using one task per contiguous block of `DECODE_WIDTH`-aligned columns, one
+block per handle, then refill `buffer`'s statistics.
+"""
+function _read_chunk_parallel!(
+    handles::Vector{IOStream},
+    buffer::SnpLinAlg{T},
+    byte_offset::Int,
+    drows::Int,
+) where T <: AbstractFloat
+    data = buffer.s.data
+    width = size(data, 2)
+    step = cld(cld(width, length(handles)), DECODE_WIDTH) * DECODE_WIDTH
+    @sync for (index, first) in enumerate(1:step:width)
+        last = min(first + step - 1, width)
+        nbytes = drows * (last - first + 1)
+        skip = drows * (first - 1)
+        io = handles[index]
+        Threads.@spawn _read_block!(io, data, byte_offset + skip,
+                                    skip + 1, nbytes)
+    end
+    return _finish_chunk!(buffer)
+end
+
 # Mutable per-iteration state: which file and column within it is next to
-# be handed out, the file's open handle, which buffer of a pair is next to
-# be filled, and (with prefetch) the in-flight read/refill task for the
-# chunk after the one about to be delivered.
+# be handed out, the file's open handle (and, for a plain `.bed` file with
+# multiple readers, the parallel-read handles), which buffer of a pair is
+# next to be filled, the byte offset of the prepared chunk, and (with
+# prefetch) the in-flight read/refill task for the chunk after the one
+# about to be delivered.
 mutable struct SnpLinAlgStreamState
     file_index::Int
     file_col::Int
@@ -209,32 +304,42 @@ mutable struct SnpLinAlgStreamState
     next_width::Int
     next_task::Union{Nothing, Task}
     has_next::Bool
+    handles::Vector{IOStream}
+    byte_offset::Int
 end
 
 # Advance the file/column bookkeeping past one chunk, opening the next
-# file (and closing the previous one) at a file boundary; returns the
-# chunk's global column range, width, and io, or `nothing` once every
-# file is exhausted.
+# file (and closing the previous one, and its extra reader handles) at a
+# file boundary; returns the chunk's global column range, width, io, and
+# starting byte offset, or `nothing` once every file is exhausted.
 function _advance!(
     stream::SnpLinAlgStream{T},
     state::SnpLinAlgStreamState,
 ) where T
     if state.file_col >= stream.ns[state.file_index]
+        for h in state.handles
+            h === state.io || close(h)
+        end
         close(state.io)
         state.file_index += 1
         state.file_index > length(stream.files) && return nothing
-        io = makestream(stream.files[state.file_index])
-        _check_bed_magic!(io, stream.files[state.file_index])
+        path = stream.files[state.file_index]
+        io = makestream(path)
+        _check_bed_magic!(io, path)
         state.io = io
         state.file_col = 0
+        state.handles = _open_handles(path, io, stream.readers)
     end
     file_index = state.file_index
     chunk_width = min(stream.width, stream.ns[file_index] - state.file_col)
     column_first = stream.offsets[file_index] + state.file_col + 1
     column_last = stream.offsets[file_index] + state.file_col + chunk_width
     cols = column_first:column_last
+    drows = (stream.m + 3) >> 2
+    byte_offset = 3 + drows * state.file_col
     state.file_col += chunk_width
-    return (cols=cols, chunk_width=chunk_width, io=state.io)
+    return (cols=cols, chunk_width=chunk_width, io=state.io,
+           byte_offset=byte_offset)
 end
 
 # Prepare (and, with prefetch, start reading) the chunk that will be
@@ -252,20 +357,41 @@ function _kick_off!(
     state.which = which == 1 ? 2 : 1
     buffer = _buffer_pair(stream, desc.chunk_width)[which]
     io = desc.io
+    handles = state.handles
+    byte_offset = desc.byte_offset
     state.next_cols = desc.cols
     state.next_which = which
     state.next_width = desc.chunk_width
+    state.byte_offset = byte_offset
     state.has_next = true
     if stream.prefetch
-        state.next_task = Threads.@spawn _read_chunk!(io, buffer)
+        state.next_task = Threads.@spawn _read_prepared!(
+            stream, handles, byte_offset, io, buffer,
+        )
     else
         state.next_task = nothing
     end
     return state
 end
 
+# Read the prepared chunk into `buffer`, in parallel when `handles` is
+# nonempty, else serially from `io`.
+function _read_prepared!(
+    stream::SnpLinAlgStream{T},
+    handles::Vector{IOStream},
+    byte_offset::Int,
+    io::IO,
+    buffer::SnpLinAlg{T},
+) where T
+    isempty(handles) && return _read_chunk!(io, buffer)
+    drows = (stream.m + 3) >> 2
+    return _read_chunk_parallel!(handles, buffer, byte_offset, drows)
+end
+
 # Wait for (or perform) the read of the prepared chunk, then kick off the
-# following one before returning the prepared chunk to the caller.
+# following one before returning the prepared chunk to the caller. This
+# runs before `_kick_off!` advances the state, so `state.handles` and
+# `state.byte_offset` still describe the prepared chunk.
 function _deliver!(
     stream::SnpLinAlgStream{T},
     state::SnpLinAlgStreamState,
@@ -276,7 +402,12 @@ function _deliver!(
     width = state.next_width
     task = state.next_task
     buffer = _buffer_pair(stream, width)[which]
-    task === nothing ? _read_chunk!(state.io, buffer) : wait(task)
+    if task === nothing
+        _read_prepared!(stream, state.handles, state.byte_offset, state.io,
+                        buffer)
+    else
+        wait(task)
+    end
     _kick_off!(stream, state)
     return (cols, buffer), state
 end
@@ -284,7 +415,9 @@ end
 function Base.iterate(stream::SnpLinAlgStream{T}) where T
     io = makestream(stream.files[1])
     _check_bed_magic!(io, stream.files[1])
-    state = SnpLinAlgStreamState(1, 0, io, 1, 1:0, 1, 0, nothing, false)
+    handles = _open_handles(stream.files[1], io, stream.readers)
+    state = SnpLinAlgStreamState(1, 0, io, 1, 1:0, 1, 0, nothing, false,
+                                 handles, 0)
     _kick_off!(stream, state)
     return _deliver!(stream, state)
 end

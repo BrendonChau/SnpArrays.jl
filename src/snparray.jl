@@ -104,15 +104,25 @@ end
 const _WORD_LOW_MASK = 0x5555555555555555
 
 """
-    _column_counts!(counts::Matrix{Int}, s::SnpArray)
+    COUNT_TASK_MIN_BYTES
 
-Count the four packed genotype codes per column of `s` into `counts`,
-processing eight fully-valid bytes at a time as one 64-bit word.
+Packed-byte count of `s.data` below which `_column_counts!` runs serially;
+smaller arrays do not repay the task spawn.
 """
-function _column_counts!(counts::Matrix{Int}, s::SnpArray)
+const COUNT_TASK_MIN_BYTES = 1 << 20
+
+"""
+    _column_counts_range!(counts::Matrix{Int}, s::SnpArray,
+        columns::UnitRange{Int})
+
+Count the four packed genotype codes per column of `s` in `columns` into
+`counts`, processing eight fully-valid bytes at a time as one 64-bit word.
+"""
+function _column_counts_range!(counts::Matrix{Int}, s::SnpArray,
+    columns::UnitRange{Int})
     full_bytes, trailing_genotypes = divrem(s.m, 4)
     full_words = full_bytes >> 3
-    @inbounds for column in axes(s.data, 2)
+    @inbounds for column in columns
         count1 = count2 = count3 = 0
         for word_index in 1:full_words
             base = 8 * (word_index - 1)
@@ -151,6 +161,27 @@ function _column_counts!(counts::Matrix{Int}, s::SnpArray)
         counts[2, column] = count1
         counts[3, column] = count2
         counts[4, column] = count3
+    end
+    return counts
+end
+
+"""
+    _column_counts!(counts::Matrix{Int}, s::SnpArray)
+
+Count the four packed genotype codes per column of `s` into `counts`,
+splitting the columns across tasks when `s.data` holds at least
+`COUNT_TASK_MIN_BYTES` bytes and more than one thread is available;
+results are identical to the serial pass.
+"""
+function _column_counts!(counts::Matrix{Int}, s::SnpArray)
+    n = size(s.data, 2)
+    if Threads.nthreads() == 1 || length(s.data) < COUNT_TASK_MIN_BYTES
+        return _column_counts_range!(counts, s, 1:n)
+    end
+    step = _task_axis_step(n, n)
+    @sync for first in 1:step:n
+        last = min(first + step - 1, n)
+        Threads.@spawn _column_counts_range!(counts, s, first:last)
     end
     return counts
 end

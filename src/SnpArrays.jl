@@ -31,6 +31,7 @@ const DOMINANT_MODEL = Val(2)
 const RECESSIVE_MODEL = Val(3)
 
 include("codec.jl")
+include("tuning.jl")
 include("snparray.jl")
 include("stackedsnparray.jl")
 include("snparray_statistics.jl")
