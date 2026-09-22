@@ -7,31 +7,17 @@ Iterate `.bed` files as consecutive column chunks of a `SnpLinAlg`, without
 memory-mapping the whole genotype matrix.
 
 # Arguments
-- `bedfiles`: a `.bed` path, or a vector of `.bed` paths concatenated
-  column-wise (each file's row count must match)
-- `m`: sample count; defaults to the line count of the first file's `.fam`
+- `bedfiles`: a `.bed` path, or paths concatenated column-wise
+- `m`: sample count; defaults to the first file's `.fam` line count
 - `width`: chunk width in SNPs
-- `prefetch`: overlap the next chunk's `.bed` read with the caller's use of
-  the current chunk
-- `model`, `center`, `scale`, `impute`: forwarded to each chunk's
-  `SnpLinAlg`
+- `prefetch`: overlaps the next chunk's read with the current chunk's use
+- `model`, `center`, `scale`, `impute`: forwarded to each chunk's `SnpLinAlg`
 
-# Iteration
-`for (cols, chunk) in stream` yields, in column order and never straddling
-a file boundary, a global column range `cols::UnitRange{Int}` and a
-`chunk::SnpLinAlg{T}` of size `(m, length(cols))`. `chunk` wraps one of two
-reused buffers per chunk width, so it is only valid until the next chunk is
-requested: the caller must finish with `chunk` before advancing the `for`
-loop. Iterating a stream with no state (`iterate(stream)`) reopens every
-file from the start, so the same stream can be swept repeatedly.
-
-# Prefetch
-With `prefetch=true`, while the caller works on the chunk just returned, a
-background task both `read!`s and refills the statistics of the following
-chunk into the other buffer of the pair; the next call to `iterate` waits
-on that task. This is only correct because the caller is done with the
-current chunk before requesting the next one, which a `for` loop
-guarantees.
+`for (cols, chunk) in stream` yields `(cols, chunk)` with
+`cols::UnitRange{Int}` the global column range and `chunk::SnpLinAlg{T}`
+of size `(m, length(cols))`; chunks never straddle a file. `chunk` is a
+reused buffer valid only until the next chunk is requested. A fresh `for`
+restarts from the first column.
 """
 struct SnpLinAlgStream{T}
     files::Vector{String}
@@ -78,8 +64,7 @@ end
 """
     _make_buffer(T, m, width, model, center, scale, impute) -> SnpLinAlg{T}
 
-Build one reusable `m × width` chunk buffer, zeroed and ready for a first
-`_read_chunk!`.
+Build one reusable, zeroed `m × width` chunk buffer.
 """
 function _make_buffer(
     ::Type{T},
@@ -101,7 +86,7 @@ end
     _make_buffer_pair(T, m, width, model, center, scale, impute)
         -> NTuple{2, SnpLinAlg{T}}
 
-Build the two alternating chunk buffers of one buffer pair.
+Build the two alternating chunk buffers of a buffer pair.
 """
 _make_buffer_pair(
     ::Type{T}, m::Int, width::Int, model::Union{Val{1}, Val{2}, Val{3}},
@@ -167,9 +152,8 @@ Base.eltype(::Type{<:SnpLinAlgStream{T}}) where T =
 """
     _buffer_pair(stream, width) -> NTuple{2, SnpLinAlg{T}}
 
-Return `stream`'s buffer pair for chunk width `width`, creating and caching
-one lazily the first time a non-default width (a final short chunk) is
-seen.
+Return `stream`'s buffer pair for chunk width `width`, creating and
+caching one lazily the first time a non-default width is seen.
 """
 function _buffer_pair(stream::SnpLinAlgStream{T}, width::Int) where T
     width == stream.width && return stream.full_buffers
@@ -183,8 +167,7 @@ end
     _check_bed_magic!(io, path) -> io
 
 Verify `io`'s three-byte `.bed` header, closing `io` and throwing an
-`ArgumentError` naming `path` if the magic number or orientation byte is
-wrong.
+`ArgumentError` naming `path` if it is wrong.
 """
 function _check_bed_magic!(io::IO, path::AbstractString)
     if read(io, UInt16) != 0x1b6c
@@ -202,8 +185,7 @@ end
     _read_chunk!(io, buffer) -> buffer
 
 Read one chunk of packed genotypes into `buffer.s.data` and refill
-`buffer`'s means, inverse standard deviations, and genotype values from
-the freshly read codes.
+`buffer`'s statistics from the freshly read codes.
 """
 function _read_chunk!(io::IO, buffer::SnpLinAlg{T}) where T <: AbstractFloat
     read!(io, buffer.s.data)
@@ -346,10 +328,8 @@ end
 """
     _streamed_grm_mul!(V, stream, Q_kernel, scale_kernel, U, V_scratch)
 
-Run the per-chunk products of `streamed_grm_mul!` in `Q_kernel`'s element
-type, accumulating into `V` directly when `V_scratch === nothing` (the
-uniform-precision path) or through `V_scratch` otherwise (the mixed
-Float32/Float64 path); `V` is assumed already zeroed.
+Run the per-chunk products in `Q_kernel`'s type and accumulate into the
+already zeroed `V`, through `V_scratch` when given.
 """
 function _streamed_grm_mul!(
     V::AbstractMatrix{TV},
@@ -389,14 +369,11 @@ end
                       scale=inv(size(stream, 2)), U=nothing)
 
 Accumulate `V = Σ_c A_c diag(s_c) transpose(A_c) Q` over the chunks `A_c`
-of `stream`, where `s_c` is `scale` restricted to chunk `c`'s columns
-(`scale` may be a scalar or a length-`size(stream, 2)` vector). When `U` is
+of `stream`, where `s_c` is `scale` restricted to chunk `c`'s columns and
+`scale` may be a scalar or a length-`size(stream, 2)` vector. When `U` is
 an `AbstractMatrix`, also write the unscaled `transpose(A) * Q` into it.
-Matrix `Q` and `V` only; reshape a vector right-hand side yourself. With a
-`Float32` stream and `Float64` `V`, `Q` (and `U`), each chunk's product
-runs in single precision and is accumulated into `V` (and `U`) in double
-precision, so the rounding error is bounded by the chunk width rather than
-by `n`; with matching element types everything runs in that one type.
+With a `Float32` stream and `Float64` `V` and `Q`, each chunk's product
+runs in single precision and is accumulated into `V` in double precision.
 """
 function streamed_grm_mul!(
     V::AbstractMatrix{T},

@@ -57,9 +57,8 @@ end
     _fill_statistics!(means, inverse_standard_deviations, values, s, model,
         center, scale, impute) -> values
 
-Recompute `means`, `inverse_standard_deviations`, and `values` in place from
-the genotype counts of `s`, the shared body of the `SnpLinAlg` constructor
-and `_refill_statistics!`.
+Recompute `means`, `inverse_standard_deviations`, and `values` in place
+from the genotype counts of `s`.
 """
 function _fill_statistics!(
     means::Vector{T},
@@ -89,11 +88,8 @@ end
 """
     _refill_statistics!(sla::SnpLinAlg) -> sla
 
-Recompute `sla.μ`, `sla.σinv`, and `sla.values` in place from `sla.s`.
-Callers that overwrite `sla.s.data` must `fill!(sla.s.columncounts, 0)`
-first so the column counts are recomputed. `sla.panel` and `sla.blk` are
-left untouched, so a repeated product at the shape of `sla` still allocates
-nothing.
+Recompute `sla.μ`, `sla.σinv`, and `sla.values` from `sla.s`; the caller
+must zero `sla.s.columncounts` first if the data changed.
 """
 function _refill_statistics!(sla::SnpLinAlg{T}) where T <: AbstractFloat
     _fill_statistics!(sla.μ, sla.σinv, sla.values, sla.s, sla.model,
