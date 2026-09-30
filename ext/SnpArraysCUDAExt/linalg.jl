@@ -292,6 +292,7 @@ function mul!(
         return out
     end
     k == 1 && return (mul!(vec(out), st, vec(X)); out)
+    _uses_wmma_t(s, k) && return _wmma_t_mul!(out, s, X)
     (BM, BN, BK, TN, TK) = ATX_TILES[_tile_band(k)]
     # Halve the sample step until the tiles fit in 48 KiB of static
     # shared memory (needed for Float64).
