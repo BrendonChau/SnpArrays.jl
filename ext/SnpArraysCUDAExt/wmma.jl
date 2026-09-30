@@ -223,53 +223,91 @@ Write a warp's `4 x FN` fragments, unrolled.
 end
 
 """
-    _decode_tile!(gh, gl, words, tables, tid, word_row0, word_stop, wr_count,
-                  column0, column_stop, columns)
+    _load_words(words, tid, word_row0, word_stop, wr_count, column0,
+                column_stop) -> NTuple{2, UInt32}
 
-Decode the `wr_count x columns` packed words starting at word row
-`word_row0 + 1` and column `column0 + 1` into the `[sample, SNP]` Float16
-tiles `gh`, `gl`; words past `word_stop` or `column_stop` decode to 0.
+Load thread `tid`'s two packed words of a 512-word tile, `wr_count` word
+rows deep, starting at word row `word_row0 + 1` and column `column0 + 1`;
+words past `word_stop` or `column_stop` load as 0.
 """
-@inline function _decode_tile!(gh, gl, words, tables, tid::Int32,
-    word_row0::Int32, word_stop::Int32, wr_count::Int32, column0::Int32,
-    column_stop::Int32, columns::Int32)
-    u = tid
-    while u < wr_count * columns
-        wr = u % wr_count
-        j = u ÷ wr_count
-        column = column0 + j + Int32(1)
-        word_row = word_row0 + wr + Int32(1)
+@inline function _load_words(words, tid::Int32, word_row0::Int32,
+    word_stop::Int32, wr_count::Int32, column0::Int32, column_stop::Int32)
+    return ntuple(Val(2)) do r
+        u = tid + Int32(256 * (r - 1))
+        column = column0 + u ÷ wr_count + Int32(1)
+        word_row = word_row0 + u % wr_count + Int32(1)
         live = (column <= column_stop) & (word_row <= word_stop)
-        w = live ? (@inbounds words[word_row, column]) : UInt32(0)
-        th = live ? (@inbounds tables[1, column]) : UInt64(0)
-        tl = live ? (@inbounds tables[2, column]) : UInt64(0)
-        d = _decode_split(w, th, tl)
-        @inbounds gh[Int32(2) * wr + Int32(1), j + Int32(1)] = d[1]
-        @inbounds gh[Int32(2) * wr + Int32(2), j + Int32(1)] = d[2]
-        @inbounds gl[Int32(2) * wr + Int32(1), j + Int32(1)] = d[3]
-        @inbounds gl[Int32(2) * wr + Int32(2), j + Int32(1)] = d[4]
-        u += Int32(256)
+        live ? (@inbounds words[word_row, column]) : UInt32(0)
     end
+end
+
+"""
+    _store_words!(gh, gl, loaded, tables, tid, wr_count, column0,
+                  column_stop)
+
+Decode the words from `_load_words` with their columns' packed tables into
+the `[sample, SNP]` Float16 tiles `gh`, `gl`.
+"""
+@inline function _store_words!(gh, gl, loaded, tables, tid::Int32,
+    wr_count::Int32, column0::Int32, column_stop::Int32)
+    _store_word!(gh, gl, loaded[1], tables, tid, wr_count, column0,
+        column_stop)
+    _store_word!(gh, gl, loaded[2], tables, tid + Int32(256), wr_count,
+        column0, column_stop)
     return nothing
 end
 
 """
-    _stage_rhs!(bh, bl, yh, yl, tid, source0, rhs0, depth, width)
+    _store_word!(gh, gl, w, tables, u, wr_count, column0, column_stop)
 
-Copy the `depth ÷ 8 x width` 128-bit words of the split rhs starting at
-row word `source0 + 1` and column `rhs0 + 1` into shared memory.
+Decode word `w`, unit `u` of the tile, into `gh`, `gl`; columns past
+`column_stop` decode to 0.
 """
-@inline function _stage_rhs!(bh, bl, yh, yl, tid::Int32, source0::Int32,
-    rhs0::Int32, depth::Int32, width::Int32)
-    u = tid
-    while u < (depth ÷ Int32(8)) * width
-        ii = u % (depth ÷ Int32(8))
-        tt = u ÷ (depth ÷ Int32(8))
-        @inbounds bh[ii + Int32(1), tt + Int32(1)] =
-            yh[source0 + ii + Int32(1), rhs0 + tt + Int32(1)]
-        @inbounds bl[ii + Int32(1), tt + Int32(1)] =
-            yl[source0 + ii + Int32(1), rhs0 + tt + Int32(1)]
-        u += Int32(256)
+@inline function _store_word!(gh, gl, w::UInt32, tables, u::Int32,
+    wr_count::Int32, column0::Int32, column_stop::Int32)
+    wr = u % wr_count
+    j = u ÷ wr_count
+    column = column0 + j + Int32(1)
+    live = column <= column_stop
+    th = live ? (@inbounds tables[1, column]) : UInt64(0)
+    tl = live ? (@inbounds tables[2, column]) : UInt64(0)
+    d = _decode_split(w, th, tl)
+    @inbounds gh[Int32(2) * wr + Int32(1), j + Int32(1)] = d[1]
+    @inbounds gh[Int32(2) * wr + Int32(2), j + Int32(1)] = d[2]
+    @inbounds gl[Int32(2) * wr + Int32(1), j + Int32(1)] = d[3]
+    @inbounds gl[Int32(2) * wr + Int32(2), j + Int32(1)] = d[4]
+    return nothing
+end
+
+"""
+    _load_rhs(yh, yl, tid, source0, rhs0, Val(BK)) -> (UInt128, UInt128)
+
+Load thread `tid`'s 128-bit words of the `4 x BK` split rhs tile (32 rows)
+starting at row word `source0 + 1` and column `rhs0 + 1`; threads past the
+tile load 0.
+"""
+@inline function _load_rhs(yh, yl, tid::Int32, source0::Int32, rhs0::Int32,
+    ::Val{BK}) where {BK}
+    live = tid < Int32(4 * BK)
+    row = source0 + tid % Int32(4) + Int32(1)
+    col = rhs0 + tid ÷ Int32(4) + Int32(1)
+    h = live ? (@inbounds yh[row, col]) : UInt128(0)
+    l = live ? (@inbounds yl[row, col]) : UInt128(0)
+    return (h, l)
+end
+
+"""
+    _store_rhs!(bh, bl, loaded, tid, Val(BK))
+
+Write the words from `_load_rhs` into shared memory.
+"""
+@inline function _store_rhs!(bh, bl, loaded, tid::Int32,
+    ::Val{BK}) where {BK}
+    if tid < Int32(4 * BK)
+        row = tid % Int32(4) + Int32(1)
+        col = tid ÷ Int32(4) + Int32(1)
+        @inbounds bh[row, col] = loaded[1]
+        @inbounds bl[row, col] = loaded[2]
     end
     return nothing
 end
@@ -313,13 +351,22 @@ function _aX_wmma_kernel!(
 
     acc = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
     column0 = (split - Int32(1)) * split_columns
+    word_row0 = sample0 ÷ Int32(16)
+    word_stop = cld(m, Int32(16))
+    wr_count = Int32(WMMA_BM ÷ 16)
+    loaded = _load_words(words, tid, word_row0, word_stop, wr_count,
+        column0, column_stop)
     while column0 < column_stop
-        _decode_tile!(gh, gl, words, tables, tid, sample0 ÷ Int32(16),
-            cld(m, Int32(16)), Int32(WMMA_BM ÷ 16), column0, column_stop,
-            Int32(WMMA_BN))
-        _stage_rhs!(bh, bl, yh, yl, tid, column0 ÷ Int32(8), rhs0,
-            Int32(WMMA_BN), Int32(BK))
+        _store_words!(gh, gl, loaded, tables, tid, wr_count, column0,
+            column_stop)
+        _store_rhs!(bh, bl, _load_rhs(yh, yl, tid, column0 ÷ Int32(8), rhs0,
+            Val(BK)), tid, Val(BK))
         sync_threads()
+        next = column0 + Int32(WMMA_BN)
+        if next < column_stop
+            loaded = _load_words(words, tid, word_row0, word_stop,
+                wr_count, next, column_stop)
+        end
         stage = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
         kk = Int32(0)
         while kk < Int32(WMMA_BN)
@@ -331,7 +378,7 @@ function _aX_wmma_kernel!(
         end
         acc = _fragment_add(acc, stage)
         sync_threads()
-        column0 += Int32(WMMA_BN)
+        column0 = next
     end
     _wmma_store_all!(out, scratch, acc, scale_inv, warp, lane,
         sample0 + wm * Int32(64), rhs0 + wn * Int32(16 * FN), m, k, split)
@@ -377,12 +424,18 @@ function _atX_wmma_kernel!(
 
     acc = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
     wr0 = (split - Int32(1)) * split_word_rows
+    loaded = _load_words(words, tid, wr0, word_stop, Int32(WR), snp0,
+        n)
     while wr0 < word_stop
-        _decode_tile!(gh, gl, words, tables, tid, wr0, word_stop, Int32(WR),
-            snp0, n, Int32(WMMA_T_BR))
-        _stage_rhs!(bh, bl, xh, xl, tid, Int32(2) * wr0, rhs0,
-            Int32(WMMA_T_BS), Int32(BK))
+        _store_words!(gh, gl, loaded, tables, tid, Int32(WR), snp0, n)
+        _store_rhs!(bh, bl, _load_rhs(xh, xl, tid, Int32(2) * wr0, rhs0,
+            Val(BK)), tid, Val(BK))
         sync_threads()
+        next = wr0 + Int32(WR)
+        if next < word_stop
+            loaded = _load_words(words, tid, next, word_stop,
+                Int32(WR), snp0, n)
+        end
         stage = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
         kk = Int32(0)
         while kk < Int32(WMMA_T_BS)
@@ -394,7 +447,7 @@ function _atX_wmma_kernel!(
         end
         acc = _fragment_add(acc, stage)
         sync_threads()
-        wr0 += Int32(WR)
+        wr0 = next
     end
     _wmma_store_all!(out, scratch, acc, scale_inv, warp, lane,
         snp0 + wm * Int32(64), rhs0 + wn * Int32(16 * FN), n, k, split)
