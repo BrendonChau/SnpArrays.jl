@@ -11,8 +11,8 @@ using CUDACore: @cuda, CuArray, CuDynamicSharedArray, CuEvent, CuMatrix,
     unsafe_free!
 using LinearAlgebra: Adjoint, Transpose
 using SnpArrays: ADDITIVE_MODEL, CuSnpArray, DOMINANT_MODEL, RECESSIVE_MODEL,
-    SnpArray, SnpLinAlgStream, _packed_words, mean
-import SnpArrays: streamed_mul!
+    SnpArray, SnpLinAlgStream, _check_streamed_grm_dims, _packed_words, mean
+import SnpArrays: streamed_grm_mul!, streamed_mul!
 
 include("kernels.jl")
 include("lookup.jl")
