@@ -1,14 +1,8 @@
 """WMMA shape and accumulator type of the tensor-core kernels."""
 const WMMA_CONFIG = WMMA.Config{16, 16, 16, Float32}
 
-"""Samples per block of the tensor-core `A*X` kernel (4 warps x 64)."""
-const WMMA_BM = 256
-
 """SNP columns per shared-memory stage of the tensor-core `A*X` kernel."""
 const WMMA_BN = 32
-
-"""SNP columns per block of the tensor-core `transpose(A)*X` kernel."""
-const WMMA_T_BR = 256
 
 """
 Samples per shared-memory stage of the tensor-core `transpose(A)*X`
@@ -31,9 +25,20 @@ const WMMA_BLOCKS_PER_SM = 16
 """
     _wmma_rhs_width(k) -> Int
 
-Rhs columns per block for `k` columns: 32 up to `k = 32`, else 64.
+Rhs columns per block for `k` columns: the power of two from 32 to 256
+that covers `k`, capped at 256.
 """
-_wmma_rhs_width(k::Integer) = k <= 32 ? 32 : 64
+_wmma_rhs_width(k::Integer) = clamp(nextpow(2, k), 32, 256)
+
+"""
+    _wmma_block_rows(BK) -> Int
+
+Output rows per block (samples for `A*X`, SNPs for `transpose(A)*X`) at
+rhs width `BK`: 256 up to `BK = 64`, then `16384 ÷ BK`. Each warp's tile
+stays 64 x 32 or smaller, and a decoded genotype tile serves all `BK` rhs
+columns of its block.
+"""
+_wmma_block_rows(BK::Integer) = BK <= 64 ? 256 : 16384 ÷ BK
 
 """
     _half_pointer(p, offset)
@@ -224,37 +229,46 @@ end
 
 """
     _load_words(words, tid, word_row0, word_stop, wr_count, column0,
-                column_stop) -> NTuple{2, UInt32}
+                column_stop, Val(UNITS)) -> NTuple{cld(UNITS, 256), UInt32}
 
-Load thread `tid`'s two packed words of a 512-word tile, `wr_count` word
+Load thread `tid`'s packed words of a `UNITS`-word tile, `wr_count` word
 rows deep, starting at word row `word_row0 + 1` and column `column0 + 1`;
-words past `word_stop` or `column_stop` load as 0.
+words past `word_stop`, `column_stop` or the tile load as 0.
 """
 @inline function _load_words(words, tid::Int32, word_row0::Int32,
-    word_stop::Int32, wr_count::Int32, column0::Int32, column_stop::Int32)
-    return ntuple(Val(2)) do r
+    word_stop::Int32, wr_count::Int32, column0::Int32, column_stop::Int32,
+    ::Val{UNITS}) where {UNITS}
+    return ntuple(Val(cld(UNITS, 256))) do r
         u = tid + Int32(256 * (r - 1))
         column = column0 + u ÷ wr_count + Int32(1)
         word_row = word_row0 + u % wr_count + Int32(1)
-        live = (column <= column_stop) & (word_row <= word_stop)
+        live = (column <= column_stop) & (word_row <= word_stop) &
+            (u < Int32(UNITS))
         live ? (@inbounds words[word_row, column]) : UInt32(0)
     end
 end
 
 """
     _store_words!(gh, gl, loaded, tables, tid, wr_count, column0,
-                  column_stop)
+                  column_stop, Val(UNITS))
 
 Decode the words from `_load_words` with their columns' packed tables into
 the `[sample, SNP]` Float16 tiles `gh`, `gl`.
 """
-@inline function _store_words!(gh, gl, loaded, tables, tid::Int32,
-    wr_count::Int32, column0::Int32, column_stop::Int32)
-    _store_word!(gh, gl, loaded[1], tables, tid, wr_count, column0,
-        column_stop)
-    _store_word!(gh, gl, loaded[2], tables, tid + Int32(256), wr_count,
-        column0, column_stop)
-    return nothing
+@generated function _store_words!(gh, gl, loaded::NTuple{R, UInt32}, tables,
+    tid::Int32, wr_count::Int32, column0::Int32, column_stop::Int32,
+    ::Val{UNITS}) where {R, UNITS}
+    stores = map(1:R) do r
+        store = :(_store_word!(gh, gl, loaded[$r], tables,
+            tid + Int32($(256 * (r - 1))), wr_count, column0, column_stop))
+        256 * r <= UNITS ? store :
+            :(tid + Int32($(256 * (r - 1))) < Int32($UNITS) && $store)
+    end
+    return quote
+        Base.@_inline_meta
+        $(stores...)
+        return nothing
+    end
 end
 
 """
@@ -311,13 +325,15 @@ shared buffer `buffer` (0 or 1) of `bh`, `bl`, and commit the copies.
 """
 @inline function _copy_rhs_async!(bh, bl, yh, yl, tid::Int32,
     source0::Int32, rhs0::Int32, buffer::Int32, ::Val{BK}) where {BK}
-    if tid < Int32(4 * BK)
-        row = tid % Int32(4)
-        col = tid ÷ Int32(4)
+    u = tid
+    while u < Int32(4 * BK)
+        row = u % Int32(4)
+        col = u ÷ Int32(4)
         dst = Int(row + Int32(size(bh, 1)) * (col + Int32(BK) * buffer)) + 1
         src = Int(source0 + row) + size(yh, 1) * Int(rhs0 + col) + 1
         _cp_async!(pointer(bh, dst), pointer(yh, src))
         _cp_async!(pointer(bl, dst), pointer(yl, src))
+        u += Int32(256)
     end
     _cp_async_commit()
     return nothing
@@ -325,20 +341,24 @@ end
 
 """
     _aX_wmma_kernel!(out, words, tables, yh, yl, scale_inv, m, n, k,
-                     split_columns, Val(BK))
+                     split_columns, Val(BK), Val(BM))
 
 Tensor-core `A*X` kernel on the centered lookup values. A block of 8 warps
-covers `WMMA_BM` samples x `BK` rhs columns over the SNP columns of split
-`blockIdx().z`, `WMMA_BN` per stage.
+covers `BM` samples x `BK` rhs columns over the SNP columns of split
+`blockIdx().z`, `WMMA_BN` per stage; warps tile it `BM ÷ 64` down.
 """
 function _aX_wmma_kernel!(
     out::AbstractArray{Float32, 3}, words::AbstractMatrix{UInt32},
     tables::AbstractMatrix{UInt64}, yh::AbstractMatrix{UInt128},
     yl::AbstractMatrix{UInt128}, scale_inv::AbstractVector{Float32},
     m::Int32, n::Int32, k::Int32, split_columns::Int32, ::Val{BK},
-) where {BK}
-    FN = BK ÷ 32
-    LDG = WMMA_BM + 8
+    ::Val{BM},
+) where {BK, BM}
+    WM = BM ÷ 64
+    WN = 8 ÷ WM
+    FN = BK ÷ (16 * WN)
+    UNITS = 2 * BM
+    LDG = BM + 8
     LDB = WMMA_BN + 8
     G8 = LDG ÷ 8
     B8 = LDB ÷ 8
@@ -353,9 +373,9 @@ function _aX_wmma_kernel!(
     tid = Int32(threadIdx().x) - Int32(1)
     warp = tid ÷ Int32(32)
     lane = tid % Int32(32)
-    wm = warp % Int32(4)
-    wn = warp ÷ Int32(4)
-    sample0 = (Int32(blockIdx().x) - Int32(1)) * Int32(WMMA_BM)
+    wm = warp % Int32(WM)
+    wn = warp ÷ Int32(WM)
+    sample0 = (Int32(blockIdx().x) - Int32(1)) * Int32(BM)
     rhs0 = (Int32(blockIdx().y) - Int32(1)) * Int32(BK)
     split = Int32(blockIdx().z)
     column_stop = min(split * split_columns, n)
@@ -364,21 +384,21 @@ function _aX_wmma_kernel!(
     column0 = (split - Int32(1)) * split_columns
     word_row0 = sample0 ÷ Int32(16)
     word_stop = cld(m, Int32(16))
-    wr_count = Int32(WMMA_BM ÷ 16)
+    wr_count = Int32(BM ÷ 16)
     loaded = _load_words(words, tid, word_row0, word_stop, wr_count,
-        column0, column_stop)
+        column0, column_stop, Val(UNITS))
     buffer = Int32(0)
     _copy_rhs_async!(bh, bl, yh, yl, tid, column0 ÷ Int32(8), rhs0, buffer,
         Val(BK))
     while column0 < column_stop
         _store_words!(gh, gl, loaded, tables, tid, wr_count, column0,
-            column_stop)
+            column_stop, Val(UNITS))
         _cp_async_wait()
         sync_threads()
         next = column0 + Int32(WMMA_BN)
         if next < column_stop
             loaded = _load_words(words, tid, word_row0, word_stop,
-                wr_count, next, column_stop)
+                wr_count, next, column_stop, Val(UNITS))
             _copy_rhs_async!(bh, bl, yh, yl, tid, next ÷ Int32(8), rhs0,
                 Int32(1) - buffer, Val(BK))
         end
@@ -403,37 +423,41 @@ end
 
 """
     _atX_wmma_kernel!(out, words, tables, xh, xl, scale_inv, m, n, k,
-                      split_word_rows, Val(BK))
+                      split_word_rows, Val(BK), Val(BR))
 
 Tensor-core `transpose(A)*X` kernel on the centered lookup values. A block
-of 8 warps covers `WMMA_T_BR` SNP columns x `BK` rhs columns over the word
-rows of split `blockIdx().z`, `WMMA_T_BS` samples per stage; the
-`[sample, SNP]` tiles load row major as `Vᵀ`.
+of 8 warps covers `BR` SNP columns x `BK` rhs columns over the word rows of
+split `blockIdx().z`, `WMMA_T_BS` samples per stage; the `[sample, SNP]`
+tiles load row major as `Vᵀ`.
 """
 function _atX_wmma_kernel!(
     out::AbstractArray{Float32, 3}, words::AbstractMatrix{UInt32},
     tables::AbstractMatrix{UInt64}, xh::AbstractMatrix{UInt128},
     xl::AbstractMatrix{UInt128}, scale_inv::AbstractVector{Float32},
     m::Int32, n::Int32, k::Int32, split_word_rows::Int32, ::Val{BK},
-) where {BK}
-    FN = BK ÷ 32
+    ::Val{BR},
+) where {BK, BR}
+    WM = BR ÷ 64
+    WN = 8 ÷ WM
+    FN = BK ÷ (16 * WN)
     LDS = WMMA_T_BS + 8
     L8 = LDS ÷ 8
     WR = WMMA_T_BS ÷ 16
-    gh = CuDynamicSharedArray(UInt128, (L8, WMMA_T_BR))
-    gl = CuDynamicSharedArray(UInt128, (L8, WMMA_T_BR), 16 * L8 * WMMA_T_BR)
-    bh = CuDynamicSharedArray(UInt128, (L8, BK, 2), 32 * L8 * WMMA_T_BR)
+    UNITS = WR * BR
+    gh = CuDynamicSharedArray(UInt128, (L8, BR))
+    gl = CuDynamicSharedArray(UInt128, (L8, BR), 16 * L8 * BR)
+    bh = CuDynamicSharedArray(UInt128, (L8, BK, 2), 32 * L8 * BR)
     bl = CuDynamicSharedArray(UInt128, (L8, BK, 2),
-        32 * L8 * WMMA_T_BR + 32 * L8 * BK)
+        32 * L8 * BR + 32 * L8 * BK)
     scratch = CuDynamicSharedArray(Float32, (16, 16, 8),
-        32 * L8 * WMMA_T_BR + 64 * L8 * BK)
+        32 * L8 * BR + 64 * L8 * BK)
 
     tid = Int32(threadIdx().x) - Int32(1)
     warp = tid ÷ Int32(32)
     lane = tid % Int32(32)
-    wm = warp % Int32(4)
-    wn = warp ÷ Int32(4)
-    snp0 = (Int32(blockIdx().x) - Int32(1)) * Int32(WMMA_T_BR)
+    wm = warp % Int32(WM)
+    wn = warp ÷ Int32(WM)
+    snp0 = (Int32(blockIdx().x) - Int32(1)) * Int32(BR)
     rhs0 = (Int32(blockIdx().y) - Int32(1)) * Int32(BK)
     split = Int32(blockIdx().z)
     word_stop = min(split * split_word_rows, cld(m, Int32(16)))
@@ -441,18 +465,19 @@ function _atX_wmma_kernel!(
     acc = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
     wr0 = (split - Int32(1)) * split_word_rows
     loaded = _load_words(words, tid, wr0, word_stop, Int32(WR), snp0,
-        n)
+        n, Val(UNITS))
     buffer = Int32(0)
     _copy_rhs_async!(bh, bl, xh, xl, tid, Int32(2) * wr0, rhs0, buffer,
         Val(BK))
     while wr0 < word_stop
-        _store_words!(gh, gl, loaded, tables, tid, Int32(WR), snp0, n)
+        _store_words!(gh, gl, loaded, tables, tid, Int32(WR), snp0, n,
+            Val(UNITS))
         _cp_async_wait()
         sync_threads()
         next = wr0 + Int32(WR)
         if next < word_stop
             loaded = _load_words(words, tid, next, word_stop,
-                Int32(WR), snp0, n)
+                Int32(WR), snp0, n, Val(UNITS))
             _copy_rhs_async!(bh, bl, xh, xl, tid, Int32(2) * next, rhs0,
                 Int32(1) - buffer, Val(BK))
         end
@@ -527,7 +552,8 @@ function _wmma_mul!(
     tables = _split_tables(s.values)
     yh, yl, scale_inv = _split_rhs(X, WMMA_BN * cld(n, WMMA_BN),
         BK * cld(k, BK))
-    row_blocks = cld(m, WMMA_BM)
+    BM = _wmma_block_rows(BK)
+    row_blocks = cld(m, BM)
     rhs_blocks = cld(k, BK)
     sms = attribute(device(), DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
     splits = clamp(cld(WMMA_BLOCKS_PER_SM * sms, row_blocks * rhs_blocks), 1,
@@ -536,12 +562,12 @@ function _wmma_mul!(
     splits = cld(n, split_columns)
     partials = splits == 1 ? reshape(out, m, k, 1) :
         CuArray{Float32, 3}(undef, m, k, splits)
-    G8 = (WMMA_BM + 8) ÷ 8
+    G8 = (BM + 8) ÷ 8
     B8 = (WMMA_BN + 8) ÷ 8
     shmem = 32 * G8 * WMMA_BN + 64 * B8 * BK + 4 * 16 * 16 * 8
     _launch_wmma!(_aX_wmma_kernel!, (partials, s.data, tables, yh, yl,
         scale_inv, Int32(m), Int32(n), Int32(k), Int32(split_columns),
-        Val(BK)), (row_blocks, rhs_blocks, splits), shmem)
+        Val(BK), Val(BM)), (row_blocks, rhs_blocks, splits), shmem)
     splits == 1 || _reduce_splits!(out, partials, splits)
     for a in (tables, yh, yl, scale_inv)
         unsafe_free!(a)
@@ -565,7 +591,8 @@ function _wmma_t_mul!(
     tables = _split_tables(s.values)
     xh, xl, scale_inv = _split_rhs(X, WMMA_T_BS * cld(m, WMMA_T_BS),
         BK * cld(k, BK))
-    row_blocks = cld(n, WMMA_T_BR)
+    BR = _wmma_block_rows(BK)
+    row_blocks = cld(n, BR)
     rhs_blocks = cld(k, BK)
     word_rows = cld(m, 16)
     step = WMMA_T_BS ÷ 16
@@ -577,10 +604,10 @@ function _wmma_t_mul!(
     partials = splits == 1 ? reshape(out, n, k, 1) :
         CuArray{Float32, 3}(undef, n, k, splits)
     L8 = (WMMA_T_BS + 8) ÷ 8
-    shmem = 32 * L8 * WMMA_T_BR + 64 * L8 * BK + 4 * 16 * 16 * 8
+    shmem = 32 * L8 * BR + 64 * L8 * BK + 4 * 16 * 16 * 8
     _launch_wmma!(_atX_wmma_kernel!, (partials, s.data, tables, xh, xl,
         scale_inv, Int32(m), Int32(n), Int32(k), Int32(split_word_rows),
-        Val(BK)), (row_blocks, rhs_blocks, splits), shmem)
+        Val(BK), Val(BR)), (row_blocks, rhs_blocks, splits), shmem)
     splits == 1 || _reduce_splits!(out, partials, splits)
     for a in (tables, xh, xl, scale_inv)
         unsafe_free!(a)
