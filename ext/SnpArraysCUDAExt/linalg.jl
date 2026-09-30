@@ -62,21 +62,69 @@ end
 
 `_packed_words(data, m)` built on the device in column chunks of about
 `chunk_bytes`, so host memory stays bounded for genotype files larger than
-RAM.
+RAM. Each chunk's columns are copied by all threads into one of two
+pinned staging buffers, zero padded and masked in place, and sent to the
+device asynchronously while the other buffer fills.
 """
-function _upload_packed_words(data::AbstractMatrix{UInt8}, m::Integer;
+function _upload_packed_words(data::Matrix{UInt8}, m::Integer;
     chunk_bytes::Integer=2^28)
     word_rows = cld(m, 16)
     n = size(data, 2)
     words = CuMatrix{UInt32}(undef, word_rows, n)
     step = max(1, chunk_bytes ÷ (4 * word_rows))
-    for first_column in 1:step:n
+    staging = ntuple(_ -> pin(Vector{UInt32}(undef, word_rows * step)), 2)
+    events = Union{Nothing, CuEvent}[nothing, nothing]
+    for (index, first_column) in enumerate(1:step:n)
+        slot = isodd(index) ? 1 : 2
+        events[slot] === nothing || synchronize(events[slot])
         columns = first_column:min(first_column + step - 1, n)
-        chunk = _packed_words(view(data, :, columns), m)
-        copyto!(words, (first_column - 1) * word_rows + 1, chunk, 1,
-            length(chunk))
+        buffer = staging[slot]
+        _stage_columns!(buffer, data, columns, m)
+        copyto!(words, (first_column - 1) * word_rows + 1, buffer, 1,
+            word_rows * length(columns))
+        event = CuEvent()
+        record(event)
+        events[slot] = event
     end
+    synchronize()
     return words
+end
+
+"""
+    _stage_columns!(buffer::Vector{UInt32}, data::Matrix{UInt8}, columns, m)
+        -> buffer
+
+Copy the PLINK bytes of `columns` of `data` into consecutive
+`cld(m, 16)`-word columns of `buffer` in parallel, zeroing the padding
+bytes and the bits of samples past `m`.
+"""
+function _stage_columns!(buffer::Vector{UInt32}, data::Matrix{UInt8},
+    columns::UnitRange{Int}, m::Integer)
+    column_bytes = size(data, 1)
+    padded_bytes = 4 * cld(m, 16)
+    remainder = mod(m, 4)
+    mask = UInt8((1 << (2 * remainder)) - 1)
+    GC.@preserve buffer data begin
+        base = Ptr{UInt8}(pointer(buffer))
+        Threads.@threads for j in eachindex(columns)
+            destination = base + (j - 1) * padded_bytes
+            source = pointer(data, (columns[j] - 1) * column_bytes + 1)
+            unsafe_copyto!(destination, source, column_bytes)
+            for offset in column_bytes:(padded_bytes - 1)
+                unsafe_store!(destination + offset, 0x00)
+            end
+            if remainder != 0
+                last = destination + column_bytes - 1
+                unsafe_store!(last, unsafe_load(last) & mask)
+            end
+        end
+    end
+    return buffer
+end
+
+function _upload_packed_words(data::AbstractMatrix{UInt8}, m::Integer;
+    chunk_bytes::Integer=2^28)
+    return _upload_packed_words(Matrix{UInt8}(data), m; chunk_bytes)
 end
 
 """
