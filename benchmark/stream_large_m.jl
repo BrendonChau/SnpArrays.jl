@@ -232,6 +232,83 @@ function print_summary(t_map::Vector{Float64}, t_s1::Vector{Float64},
 end
 
 """
+    forward_sweep!(V, stream, U)
+
+Fill `V` with `A * U` for the streamed genotype matrix `A`, accumulating
+each chunk's product with the matching rows of `U` copied into a per-width
+scratch buffer.
+"""
+function forward_sweep!(V::Matrix{T}, stream::SnpLinAlgStream{T},
+                        U::Matrix{T}) where T
+    k = size(U, 2)
+    buffers = Dict{Int, Matrix{T}}()
+    fill!(V, zero(T))
+    for (cols, chunk) in stream
+        piece = get!(buffers, length(cols)) do
+            Matrix{T}(undef, length(cols), k)
+        end
+        copyto!(piece, view(U, cols, :))
+        mul!(V, chunk, piece, one(T), one(T))
+    end
+    return V
+end
+
+"""
+    run_forward_rounds(target, k, width, passes, ::Type{T})
+
+Run `passes` rounds of the mapped `A * U` and the readers=1 and
+readers=default streamed forward sweeps, checking each streamed result
+against the mapped result, and print the per-round times and ratios.
+"""
+function run_forward_rounds(target::BenchTarget, k::Int, width::Int,
+                            passes::Int, ::Type{T}) where T
+    println()
+    m = target.m
+    n = target.n
+    U = randn(Xoshiro(2), T, n, k)
+    V_map = Matrix{T}(undef, m, k)
+    V_s1 = Matrix{T}(undef, m, k)
+    V_sd = Matrix{T}(undef, m, k)
+    default_readers = SnpArrays._default_readers()
+    stream1 = SnpLinAlgStream{T}(target.path; m=m, width=width, readers=1,
+                                 center=true, scale=true, impute=true)
+    stream_default = SnpLinAlgStream{T}(target.path; m=m, width=width,
+                                        readers=default_readers, center=true,
+                                        scale=true, impute=true)
+    sla = SnpLinAlg{T}(SnpArray(target.path); center=true, scale=true,
+                       impute=true)
+    tol = 32 * sqrt(T(max(m, n))) * eps(T)
+    t_map = Vector{Float64}(undef, passes)
+    t_s1 = Vector{Float64}(undef, passes)
+    t_sd = Vector{Float64}(undef, passes)
+    for round in 1:passes
+        t_map[round] = timed("mapped A*U (round $round)", target, mul!,
+                             V_map, sla, U)
+        for (label, stream, V, t) in
+            (("readers=1", stream1, V_s1, t_s1),
+             ("readers=$default_readers", stream_default, V_sd, t_sd))
+            t[round] = timed("streamed A*U $label (round $round)", target,
+                             forward_sweep!, V, stream, U)
+            err = norm(V - V_map) / norm(V_map)
+            println("correctness A*U $label (round $round): rel err = ", err,
+                    " (tol = ", tol, ")")
+            err < tol || error("streamed A*U $label correctness check " *
+                               "failed: rel err $err >= tol $tol")
+        end
+    end
+    @printf("%-6s %12s %12s %12s %10s %10s\n", "round", "mapped A*U",
+            "streamed r1", "streamed rd", "rd/mapped", "rd/r1")
+    for round in 1:passes
+        @printf("%-6d %12.3f %12.3f %12.3f %10.3f %10.3f\n", round,
+                t_map[round], t_s1[round], t_sd[round],
+                t_sd[round] / t_map[round], t_sd[round] / t_s1[round])
+    end
+    @printf("A*U median ratio streamed(default)/mapped = %.3f\n",
+            median(t_sd ./ t_map))
+    return nothing
+end
+
+"""
     refill_once!(buffer)
 
 Zero `buffer`'s cached counts and refill its statistics, timing only the
@@ -342,6 +419,10 @@ function main()
 
     (t_scan, t_map, t_s1, t_sd) = run_rounds(target, k, width, passes, T)
     print_summary(t_map, t_s1, t_sd, t_scan, passes)
+
+    GC.gc()
+
+    run_forward_rounds(target, k, width, passes, T)
 
     GC.gc()
 
