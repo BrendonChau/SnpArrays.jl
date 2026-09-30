@@ -160,3 +160,25 @@ end
     @test_throws DimensionMismatch mul!(CuMatrix{Float32}(undef, n + 1, 4),
         transpose(A), CUDA.zeros(Float32, m, 4))
 end
+
+@testset "CuSnpArray lookup and decode A*X agree" begin
+    ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
+    rng = Random.Xoshiro(13)
+    # m not a multiple of 16, n not a multiple of 4, and n large enough
+    # for several SNP splits and table stages.
+    for (m, n) in ((37, 5), (1001, 2049), (4099, 3001)), T in (Float32,
+            Float64)
+        codes = rand(rng, UInt8(0):UInt8(3), m, n)
+        s = golden_snparray(codes)
+        rtol = T == Float32 ? 1e-5 : 1e-12
+        dense = missing_as_zero(s, codes, T, ADDITIVE_MODEL, true, true)
+        A = CuSnpArray{T}(s; center=true, scale=true)
+        for k in (1, 2, 8, 9, 40)
+            X = randn(rng, T, n, k)
+            out = CuMatrix{T}(undef, m, k)
+            @test relerr(Array(mul!(out, A, CuArray(X))), dense * X) < rtol
+            ext._decode_mul!(out, A, CuArray(X))
+            @test relerr(Array(out), dense * X) < rtol
+        end
+    end
+end
