@@ -1,30 +1,13 @@
-using .CUDA, Adapt
+module SnpArraysCUDAExt
 
-struct CuSnpArray{T} <: AbstractMatrix{UInt8}
-    data::CuMatrix{UInt8}
-    m::Int
-    model::Union{Val{1}, Val{2}, Val{3}}
-    center::Bool
-    scale::Bool
-    impute::Bool
-    μ::CuVector{T}
-    σinv::CuVector{T}
-    storagev1::CuVector{T}
-    storagev2::CuVector{T}
-end
+import LinearAlgebra: mul!
 
-"""
-    CuSnpArray{T}(s; model=ADDITIVE_MODEL, center=false, scale=false, impute=true)
+using Adapt: adapt
+using CUDA
+using LinearAlgebra: Adjoint, Transpose, dot
+using SnpArrays: CuSnpArray, SnpArray, ADDITIVE_MODEL, DOMINANT_MODEL,
+    RECESSIVE_MODEL, mean
 
-Copy a `SnpArray` to a CUDA GPU to perform linear algebera operations.
-
-# Arguments
-- s: a `SnpArray`.
-- model: one of `ADDITIVE_MODEL`(default), `DOMINANT_MODEL`, `RECESSIVE_MODEL`.
-- center: whether to center (default: false).
-- scale: whether to scale to standard deviation 1 (default: false).
-- impute: whether to impute missing value with column mean (default: true).
-"""
 function CuSnpArray{T}(s::SnpArray; 
     model = ADDITIVE_MODEL,
     center::Bool = false,
@@ -88,9 +71,6 @@ function CuSnpArray{T}(s::SnpArray;
     storagev2 = CuVector{T}(undef, size(s, 2))
     CuSnpArray{T}(data, s.m, model, center, scale, impute, μ, σinv, storagev1, storagev2)
 end
-
-Base.size(s::CuSnpArray) = s.m, size(s.data, 2)
-eltype(s::CuSnpArray) = eltype(s.μ)
 
 for (_ftn!, expr) in [
         (:_snparray_cuda_ax_additive!, :(((Aij >= 2) + (Aij >= 3)) * v[j])),
@@ -182,13 +162,13 @@ function mul!(
 end
 
 """
-    LinearAlgebra.mul!(out::CuVector{T}, s::Union{Transpose{T, CuSnpArray{T}}, Adjoint{T, CuSnpArray{T}}}, v::CuVector{T})
+    LinearAlgebra.mul!(out::CuVector{T}, s::Union{Transpose{T, <:CuSnpArray{T}}, Adjoint{T, <:CuSnpArray{T}}}, v::CuVector{T})
 
 In-place matrix-vector multiplication on a GPU, with transposed CuSnpArray.
 """
 function mul!(
     out::CuVector{T}, 
-    st::Union{Transpose{T, CuSnpArray{T}}, Adjoint{T, CuSnpArray{T}}},
+    st::Union{Transpose{T, <:CuSnpArray{T}}, Adjoint{T, <:CuSnpArray{T}}},
     v::CuVector{T}) where T <: AbstractFloat
     @assert length(out) == size(st, 1) && length(v) == size(st, 2)
     fill!(out, zero(T))
@@ -223,3 +203,5 @@ function mul!(
         return out
     end
 end
+
+end # module

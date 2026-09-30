@@ -3,8 +3,8 @@ __precompile__()
 module SnpArrays
 
 using CodecZlib, CodecXz, CodecBzip2, CodecZstd,  TranscodingStreams
-using Adapt, Glob, LinearAlgebra, Missings, Mmap, Printf, SIMD
-using Requires, SparseArrays, Statistics, StatsBase, Random
+using Glob, LinearAlgebra, Missings, Mmap, Printf, SIMD
+using SparseArrays, Statistics, StatsBase, Random
 import Base: IndexStyle, convert, copyto!, eltype, getindex, setindex!, length, size
 import DataFrames: DataFrame, rename!, eachrow
 import DelimitedFiles: readdlm, writedlm
@@ -61,6 +61,7 @@ include("reorder.jl")
 include("vcf2plink.jl")
 include("admixture.jl")
 include("simulation.jl")
+include("cuda_types.jl")
 
 datadir(parts...) = joinpath(@__DIR__, "..", "data", parts...)
 
@@ -68,7 +69,6 @@ function __init__()
     VECTOR_BYTES[] = _detect_vector_bytes()
     ATX_TILE_COLUMNS[] = _detect_atx_tile_columns(VECTOR_BYTES[])
     LOOKUP_MIN_RHS[] = _detect_lookup_min_rhs()
-    @require CUDA="052768ef-5323-5732-b1bb-66c8b64840ba" include("cuda.jl")
 end
 
 end # module
