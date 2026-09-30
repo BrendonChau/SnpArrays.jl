@@ -51,9 +51,32 @@ function CuSnpArray{T}(s::SnpArray;
     end
     values = _lookup_values(μ, σinv, model, center, scale, impute)
     return CuSnpArray{T}(
-        CuArray(_packed_words(s.data, s.m)), s.m, model, center, scale,
+        _upload_packed_words(s.data, s.m), s.m, model, center, scale,
         impute, CuArray(μ), CuArray(σinv), CuArray(values),
     )
+end
+
+"""
+    _upload_packed_words(data::AbstractMatrix{UInt8}, m;
+                         chunk_bytes=2^28) -> CuMatrix{UInt32}
+
+`_packed_words(data, m)` built on the device in column chunks of about
+`chunk_bytes`, so host memory stays bounded for genotype files larger than
+RAM.
+"""
+function _upload_packed_words(data::AbstractMatrix{UInt8}, m::Integer;
+    chunk_bytes::Integer=2^28)
+    word_rows = cld(m, 16)
+    n = size(data, 2)
+    words = CuMatrix{UInt32}(undef, word_rows, n)
+    step = max(1, chunk_bytes ÷ (4 * word_rows))
+    for first_column in 1:step:n
+        columns = first_column:min(first_column + step - 1, n)
+        chunk = _packed_words(view(data, :, columns), m)
+        copyto!(words, (first_column - 1) * word_rows + 1, chunk, 1,
+            length(chunk))
+    end
+    return words
 end
 
 """
