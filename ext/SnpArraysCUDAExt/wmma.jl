@@ -58,16 +58,34 @@ four code values of each column (code `c` in bits `16c:16c+15`), row 2 the
 low parts `Float16(v - high)`.
 """
 function _split_tables(values::CuMatrix{Float32})
-    high = Float16.(values)
-    low = Float16.(values .- Float32.(high))
-    bits(x) = UInt64(reinterpret(UInt16, x))
-    pack(a, b, c, d) = bits(a) | (bits(b) << 16) | (bits(c) << 32) |
-        (bits(d) << 48)
-    th = pack.(view(high, 1, :), view(high, 2, :), view(high, 3, :),
-        view(high, 4, :))
-    tl = pack.(view(low, 1, :), view(low, 2, :), view(low, 3, :),
-        view(low, 4, :))
-    return vcat(transpose(th), transpose(tl))
+    n = size(values, 2)
+    tables = CuMatrix{UInt64}(undef, 2, n)
+    @cuda threads=256 blocks=cld(n, 256) _split_tables_kernel!(tables, values)
+    return tables
+end
+
+"""
+    _split_tables_kernel!(tables, values)
+
+One thread per column of `_split_tables`.
+"""
+function _split_tables_kernel!(tables::AbstractMatrix{UInt64},
+    values::AbstractMatrix{Float32})
+    j = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if j <= size(values, 2)
+        th = UInt64(0)
+        tl = UInt64(0)
+        for c in 1:4
+            v = @inbounds values[c, j]
+            h = Float16(v)
+            l = Float16(v - Float32(h))
+            th |= UInt64(reinterpret(UInt16, h)) << (16 * (c - 1))
+            tl |= UInt64(reinterpret(UInt16, l)) << (16 * (c - 1))
+        end
+        @inbounds tables[1, j] = th
+        @inbounds tables[2, j] = tl
+    end
+    return
 end
 
 """
@@ -79,20 +97,80 @@ high and low Float16 parts, returned 8 per `UInt128`; `scale_inv` undoes
 the scaling.
 """
 function _split_rhs(X::CuMatrix{Float32}, rows_padded::Int, k_padded::Int)
+    scale_inv = CuVector{Float32}(undef, k_padded)
+    @cuda threads=256 blocks=k_padded _column_scale_kernel!(scale_inv, X)
+    high = CuMatrix{Float16}(undef, rows_padded, k_padded)
+    low = CuMatrix{Float16}(undef, rows_padded, k_padded)
+    sms = attribute(device(), DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+    blocks = min(cld(rows_padded * k_padded, 256), 32 * sms)
+    @cuda threads=256 blocks=blocks _split_rhs_kernel!(high, low, X,
+        scale_inv)
+    return reinterpret(UInt128, high), reinterpret(UInt128, low), scale_inv
+end
+
+"""
+    _column_scale_kernel!(scale_inv, X)
+
+One block per column `j` of `scale_inv`: `1 / scale` for the power of two
+`scale = 2^(14 - exponent(max |X[:, j]|))`, or 1 for a zero or padding
+column.
+"""
+function _column_scale_kernel!(scale_inv::AbstractVector{Float32},
+    X::AbstractMatrix{Float32})
+    col = Int(blockIdx().x)
+    tid = Int(threadIdx().x)
+    largest = 0.0f0
+    if col <= size(X, 2)
+        i = tid
+        while i <= size(X, 1)
+            largest = max(largest, abs(@inbounds X[i, col]))
+            i += 256
+        end
+    end
+    for offset in (16, 8, 4, 2, 1)
+        largest = max(largest, shfl_down_sync(0xffffffff, largest, offset))
+    end
+    partial = CuStaticSharedArray(Float32, 8)
+    lane = (tid - 1) % 32
+    warp = (tid - 1) ÷ 32 + 1
+    lane == 0 && (@inbounds partial[warp] = largest)
+    sync_threads()
+    if tid == 1
+        for w in 2:8
+            largest = max(largest, @inbounds partial[w])
+        end
+        e = Int32((reinterpret(UInt32, max(largest, floatmin(Float32))) >>
+            23) & 0xff) - Int32(127)
+        scale = largest > 0 ? exp2(Float32(14 - e)) : 1.0f0
+        @inbounds scale_inv[col] = inv(scale)
+    end
+    return
+end
+
+"""
+    _split_rhs_kernel!(high, low, X, scale_inv)
+
+Scale each column of `X` by `1 / scale_inv`, zero pad to `size(high)` and
+split into high and low Float16 parts.
+"""
+function _split_rhs_kernel!(high::AbstractMatrix{Float16},
+    low::AbstractMatrix{Float16}, X::AbstractMatrix{Float32},
+    scale_inv::AbstractVector{Float32})
     rows, k = size(X)
-    y = CuArray{Float32}(undef, rows_padded, k_padded)
-    fill!(y, 0.0f0)
-    view(y, 1:rows, 1:k) .= X
-    scale = vec(maximum(abs, y; dims=1))
-    scale .= ifelse.(scale .> 0,
-        exp2.(14 .- Float32.(exponent.(max.(scale, floatmin(Float32))))),
-        1.0f0)
-    y .*= transpose(scale)
-    high = Float16.(y)
-    low = Float16.(y .- Float32.(high))
-    unsafe_free!(y)
-    scale .= inv.(scale)
-    return reinterpret(UInt128, high), reinterpret(UInt128, low), scale
+    rows_padded = size(high, 1)
+    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    stride = gridDim().x * blockDim().x
+    while index <= length(high)
+        r = (index - 1) % rows_padded + 1
+        c = (index - 1) ÷ rows_padded + 1
+        v = r <= rows && c <= k ?
+            (@inbounds X[r, c]) / (@inbounds scale_inv[c]) : 0.0f0
+        h = Float16(v)
+        @inbounds high[index] = h
+        @inbounds low[index] = Float16(v - Float32(h))
+        index += stride
+    end
+    return
 end
 
 """
