@@ -238,6 +238,7 @@ function mul!(
         fill!(out, zero(T))
         return out
     end
+    _uses_wmma(s, k) && return _wmma_mul!(out, s, X)
     return _lookup_mul!(out, s, X, _lookup_config(k))
 end
 
