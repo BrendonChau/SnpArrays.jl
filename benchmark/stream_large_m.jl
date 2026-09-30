@@ -42,9 +42,11 @@ end
 """
     fincore_bytes(path) -> Int
 
-Return the resident page-cache bytes of `path`, from the `fincore` tool.
+Return the resident page-cache bytes of `path`, from the `fincore` tool,
+returning `-1` when `fincore` is not on the `PATH`.
 """
 function fincore_bytes(path::AbstractString)
+    Sys.which("fincore") === nothing && return -1
     output = read(`fincore --bytes --output RES --noheadings $path`, String)
     return parse(Int, strip(output))
 end
