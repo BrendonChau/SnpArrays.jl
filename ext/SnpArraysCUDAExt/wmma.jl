@@ -314,3 +314,261 @@ function _wmma_mul!(
     end
     return out
 end
+
+"""SNP columns per block of the tensor-core `transpose(A)*X` kernel."""
+const WMMA_T_BR = 256
+
+"""
+Samples per shared-memory stage of the tensor-core `transpose(A)*X`
+kernel.
+"""
+const WMMA_T_BS = 32
+
+"""
+Fewest rhs columns for which Float32 `transpose(A)*X` uses the tensor-core
+kernel.
+"""
+const WMMA_T_MIN_RHS = 2
+
+"""
+    _wmma_t_step(acc, gs, bh, bl, a_offset, b_offset, Val(LDS), Val(FN))
+
+Accumulate one 16-sample step into a warp's `4 x FN` fragments; the
+`[sample, SNP]` genotype tile is loaded row major as `Gᵀ`.
+"""
+@generated function _wmma_t_step(acc, gs, bh, bl, a_offset::Int32,
+    b_offset::Int32, ::Val{LDS}, ::Val{FN}) where {LDS, FN}
+    body = Expr[]
+    for i in 1:4
+        push!(body, :($(Symbol(:a, i)) = WMMA.load_a(
+            _half_pointer(pointer(gs),
+                a_offset + Int32($(16 * (i - 1) * LDS))),
+            $LDS, WMMA.RowMajor, WMMA_CONFIG)))
+    end
+    results = Symbol[]
+    for j in 1:FN
+        offset = :(b_offset + Int32($(16 * (j - 1) * LDS)))
+        h = Symbol(:h, j)
+        l = Symbol(:l, j)
+        push!(body, :($h = WMMA.load_b(_half_pointer(pointer(bh), $offset),
+            $LDS, WMMA.ColMajor, WMMA_CONFIG)))
+        push!(body, :($l = WMMA.load_b(_half_pointer(pointer(bl), $offset),
+            $LDS, WMMA.ColMajor, WMMA_CONFIG)))
+        for i in 1:4
+            f = 4 * (j - 1) + i
+            a = Symbol(:a, i)
+            c = Symbol(:c, f)
+            push!(body, :($c = WMMA.mma($a, $l,
+                WMMA.mma($a, $h, acc[$f], WMMA_CONFIG), WMMA_CONFIG)))
+            push!(results, c)
+        end
+    end
+    return quote
+        Base.@_inline_meta
+        $(body...)
+        return ($(results...),)
+    end
+end
+
+"""
+    _wmma_t_store!(out, scratch, frag, scale_inv, β, α, xsum, warp, lane,
+                   row0, col0, n, k, split)
+
+Write one 16 x 16 fragment of `Gᵀ X` at zero-based origin `(row0, col0)`
+of `out[:, :, split]` as `β[row] * acc * scale_inv[col]`, adding
+`α[row] * xsum[col]` in the first split.
+"""
+@inline function _wmma_t_store!(out, scratch, frag, scale_inv, β, α, xsum,
+    warp::Int32, lane::Int32, row0::Int32, col0::Int32, n::Int32, k::Int32,
+    split::Int32)
+    WMMA.store_d(pointer(scratch, Int32(256) * warp + Int32(1)), frag, 16,
+        WMMA.ColMajor, WMMA_CONFIG)
+    e = lane
+    while e < Int32(256)
+        rr = e % Int32(16)
+        cc = e ÷ Int32(16)
+        row = row0 + rr + Int32(1)
+        col = col0 + cc + Int32(1)
+        if row <= n && col <= k
+            v = @inbounds scratch[rr + Int32(1), cc + Int32(1),
+                warp + Int32(1)] * scale_inv[col] * β[row]
+            if split == Int32(1)
+                v += @inbounds α[row] * xsum[col]
+            end
+            @inbounds out[row, col, split] = v
+        end
+        e += Int32(32)
+    end
+    return nothing
+end
+
+"""
+    _wmma_t_store_all!(out, scratch, acc, scale_inv, β, α, xsum, warp,
+                       lane, row0, col0, n, k, split)
+
+Write a warp's `4 x FN` fragments of `transpose(A)*X`, unrolled.
+"""
+@generated function _wmma_t_store_all!(out, scratch, acc::NTuple{L},
+    scale_inv, β, α, xsum, warp::Int32, lane::Int32, row0::Int32,
+    col0::Int32, n::Int32, k::Int32, split::Int32) where {L}
+    stores = [:(_wmma_t_store!(out, scratch, acc[$f], scale_inv, β, α, xsum,
+        warp, lane, row0 + Int32($(16 * ((f - 1) % 4))),
+        col0 + Int32($(16 * ((f - 1) ÷ 4))), n, k, split)) for f in 1:L]
+    return quote
+        Base.@_inline_meta
+        $(stores...)
+        return nothing
+    end
+end
+
+"""
+    _atX_wmma_kernel!(out, words, c1, c2, xh, xl, scale_inv, β, α, xsum,
+                      m, n, k, split_word_rows, Val(BK))
+
+Tensor-core `transpose(A)*X` kernel. A block of 8 warps covers `WMMA_T_BR`
+SNP columns x `BK` rhs columns over the word rows of split `blockIdx().z`,
+decoding raw counts into a `[sample, SNP]` Float16 tile `WMMA_T_BS`
+samples at a time; `xh` and `xl` hold the zero-padded high and low Float16
+parts of the scaled rhs, 8 per `UInt128`.
+"""
+function _atX_wmma_kernel!(
+    out::AbstractArray{Float32, 3}, words::AbstractMatrix{UInt32},
+    c1::UInt64, c2::UInt64, xh::AbstractMatrix{UInt128},
+    xl::AbstractMatrix{UInt128}, scale_inv::AbstractVector{Float32},
+    β::AbstractVector{Float32}, α::AbstractVector{Float32},
+    xsum::AbstractVector{Float32}, m::Int32, n::Int32, k::Int32,
+    split_word_rows::Int32, ::Val{BK},
+) where {BK}
+    FN = BK ÷ 32
+    LDS = WMMA_T_BS + 8
+    WR = WMMA_T_BS ÷ 16
+    gs = CuStaticSharedArray(UInt128, (LDS ÷ 8, WMMA_T_BR))
+    bh = CuStaticSharedArray(UInt128, (LDS ÷ 8, BK))
+    bl = CuStaticSharedArray(UInt128, (LDS ÷ 8, BK))
+    scratch = CuStaticSharedArray(Float32, (16, 16, 8))
+
+    tid = Int32(threadIdx().x) - Int32(1)
+    warp = tid ÷ Int32(32)
+    lane = tid % Int32(32)
+    wm = warp % Int32(4)
+    wn = warp ÷ Int32(4)
+    snp0 = (Int32(blockIdx().x) - Int32(1)) * Int32(WMMA_T_BR)
+    rhs0 = (Int32(blockIdx().y) - Int32(1)) * Int32(BK)
+    split = Int32(blockIdx().z)
+    word_stop = min(split * split_word_rows, cld(m, Int32(16)))
+
+    acc = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
+    wr0 = (split - Int32(1)) * split_word_rows
+    while wr0 < word_stop
+        u = tid
+        while u < Int32(WR * WMMA_T_BR)
+            wr = u % Int32(WR)
+            j = u ÷ Int32(WR)
+            column = snp0 + j + Int32(1)
+            word_row = wr0 + wr + Int32(1)
+            w = (column <= n) & (word_row <= word_stop) ?
+                (@inbounds words[word_row, column]) : UInt32(0)
+            halves = _decode_halves(w, c1, c2)
+            @inbounds gs[Int32(2) * wr + Int32(1), j + Int32(1)] = halves[1]
+            @inbounds gs[Int32(2) * wr + Int32(2), j + Int32(1)] = halves[2]
+            u += Int32(256)
+        end
+        u = tid
+        while u < Int32((WMMA_T_BS ÷ 8) * BK)
+            ii = u % Int32(WMMA_T_BS ÷ 8)
+            tt = u ÷ Int32(WMMA_T_BS ÷ 8)
+            source = Int32(2) * wr0 + ii + Int32(1)
+            @inbounds bh[ii + Int32(1), tt + Int32(1)] =
+                xh[source, rhs0 + tt + Int32(1)]
+            @inbounds bl[ii + Int32(1), tt + Int32(1)] =
+                xl[source, rhs0 + tt + Int32(1)]
+            u += Int32(256)
+        end
+        sync_threads()
+        kk = Int32(0)
+        while kk < Int32(WMMA_T_BS)
+            acc = _wmma_t_step(acc, gs, bh, bl,
+                wm * Int32(64 * LDS) + kk,
+                kk + wn * Int32(16 * FN * LDS), Val(LDS), Val(FN))
+            kk += Int32(16)
+        end
+        sync_threads()
+        wr0 += Int32(WR)
+    end
+    _wmma_t_store_all!(out, scratch, acc, scale_inv, β, α, xsum, warp, lane,
+        snp0 + wm * Int32(64), rhs0 + wn * Int32(16 * FN), n, k, split)
+    return
+end
+
+"""
+    _uses_wmma_t(s::CuSnpArray, k) -> Bool
+
+Return whether `transpose(s) * X` with `k` rhs columns runs the
+tensor-core kernel: Float32, `k >= WMMA_T_MIN_RHS`, and no missing-genotype
+term.
+"""
+_uses_wmma_t(::CuSnpArray, ::Integer) = false
+
+function _uses_wmma_t(s::CuSnpArray{Float32}, k::Integer)
+    k >= WMMA_T_MIN_RHS || return false
+    v = s.values
+    return !any(view(v, 2, :) .!= view(v, 1, :))
+end
+
+"""
+    _wmma_t_mul!(out::CuMatrix{Float32}, s::CuSnpArray{Float32},
+                 X::CuMatrix{Float32}) -> out
+
+`out = transpose(s) * X` on tensor cores as
+`β .* (Gᵀ X) + α (1ᵀ X)`, with `X` scaled per column by a power of two and
+split into high and low Float16 parts.
+"""
+function _wmma_t_mul!(
+    out::CuMatrix{Float32}, s::CuSnpArray{Float32}, X::CuMatrix{Float32},
+)
+    m, n = size(s)
+    k = size(X, 2)
+    BK = _wmma_rhs_width(k)
+    c1, c2 = _plane_weights(s.model)
+    top = s.model == ADDITIVE_MODEL ? 2 : 1
+    v = s.values
+    α = v[1, :]
+    β = (v[4, :] .- v[1, :]) ./ Float32(top)
+    k_padded = BK * cld(k, BK)
+    m_padded = WMMA_T_BS * cld(m, WMMA_T_BS)
+    y = CuArray{Float32}(undef, m_padded, k_padded)
+    fill!(y, 0.0f0)
+    view(y, 1:m, 1:k) .= X
+    scale = vec(maximum(abs, y; dims=1))
+    scale .= ifelse.(scale .> 0,
+        exp2.(14 .- Float32.(exponent.(max.(scale, floatmin(Float32))))),
+        1.0f0)
+    y .*= transpose(scale)
+    xh = Float16.(y)
+    xl = Float16.(y .- Float32.(xh))
+    scale .= inv.(scale)
+    xsum = vec(sum(X; dims=1))
+
+    row_blocks = cld(n, WMMA_T_BR)
+    rhs_blocks = cld(k, BK)
+    word_rows = cld(m, 16)
+    step = WMMA_T_BS ÷ 16
+    sms = attribute(device(), DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+    splits = clamp(cld(WMMA_BLOCKS_PER_SM * sms, row_blocks * rhs_blocks), 1,
+        max(1, word_rows ÷ (8 * step)))
+    split_word_rows = step * cld(cld(word_rows, splits), step)
+    splits = cld(word_rows, split_word_rows)
+    partials = splits == 1 ? reshape(out, n, k, 1) :
+        CuArray{Float32, 3}(undef, n, k, splits)
+    @cuda threads=256 blocks=(row_blocks, rhs_blocks, splits) (
+        _atX_wmma_kernel!(partials, s.data, c1, c2,
+            reinterpret(UInt128, xh), reinterpret(UInt128, xl), scale, β, α,
+            xsum, Int32(m), Int32(n), Int32(k), Int32(split_word_rows),
+            Val(BK))
+    )
+    splits == 1 || _reduce_splits!(out, partials, splits)
+    for a in (α, β, y, scale, xh, xl, xsum)
+        unsafe_free!(a)
+    end
+    return out
+end
