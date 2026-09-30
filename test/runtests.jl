@@ -592,6 +592,7 @@ if get(ENV,"JULIA_SNPARRAYS_TEST_CUDA","") == "true"
         end
     end
     end
+    include("cuda.jl")
 end
 
 @testset "SnpLinAlg-vector multiplication meanimpute" begin
@@ -706,6 +707,8 @@ end
 end
 
 include("linalg_simd.jl")
+
+include("cuda_host.jl")
 
 include("streaming.jl")
 
