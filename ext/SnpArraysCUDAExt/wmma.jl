@@ -280,35 +280,46 @@ Decode word `w`, unit `u` of the tile, into `gh`, `gl`; columns past
 end
 
 """
-    _load_rhs(yh, yl, tid, source0, rhs0, Val(BK)) -> (UInt128, UInt128)
+    _cp_async!(dst, src)
 
-Load thread `tid`'s 128-bit words of the `4 x BK` split rhs tile (32 rows)
-starting at row word `source0 + 1` and column `rhs0 + 1`; threads past the
-tile load 0.
+Start an asynchronous 16-byte global-to-shared copy (`cp.async.cg`,
+sm_80+), bypassing registers and L1.
 """
-@inline function _load_rhs(yh, yl, tid::Int32, source0::Int32, rhs0::Int32,
-    ::Val{BK}) where {BK}
-    live = tid < Int32(4 * BK)
-    row = source0 + tid % Int32(4) + Int32(1)
-    col = rhs0 + tid ÷ Int32(4) + Int32(1)
-    h = live ? (@inbounds yh[row, col]) : UInt128(0)
-    l = live ? (@inbounds yl[row, col]) : UInt128(0)
-    return (h, l)
+@inline function _cp_async!(dst::Core.LLVMPtr{T, 3},
+    src::Core.LLVMPtr{T, 1}) where {T}
+    ccall("llvm.nvvm.cp.async.cg.shared.global.16", llvmcall, Cvoid,
+        (Core.LLVMPtr{UInt8, 3}, Core.LLVMPtr{UInt8, 1}),
+        reinterpret(Core.LLVMPtr{UInt8, 3}, dst),
+        reinterpret(Core.LLVMPtr{UInt8, 1}, src))
+    return nothing
 end
 
-"""
-    _store_rhs!(bh, bl, loaded, tid, Val(BK))
+"""Commit this thread's outstanding `cp.async` copies as a group."""
+@inline _cp_async_commit() =
+    ccall("llvm.nvvm.cp.async.commit.group", llvmcall, Cvoid, ())
 
-Write the words from `_load_rhs` into shared memory.
+"""Wait until all of this thread's `cp.async` copies have landed."""
+@inline _cp_async_wait() =
+    ccall("llvm.nvvm.cp.async.wait.all", llvmcall, Cvoid, ())
+
 """
-@inline function _store_rhs!(bh, bl, loaded, tid::Int32,
-    ::Val{BK}) where {BK}
+    _copy_rhs_async!(bh, bl, yh, yl, tid, source0, rhs0, buffer, Val(BK))
+
+Start copying thread `tid`'s 128-bit words of the `4 x BK` split rhs tile
+(32 rows) starting at row word `source0 + 1` and column `rhs0 + 1` into
+shared buffer `buffer` (0 or 1) of `bh`, `bl`, and commit the copies.
+"""
+@inline function _copy_rhs_async!(bh, bl, yh, yl, tid::Int32,
+    source0::Int32, rhs0::Int32, buffer::Int32, ::Val{BK}) where {BK}
     if tid < Int32(4 * BK)
-        row = tid % Int32(4) + Int32(1)
-        col = tid ÷ Int32(4) + Int32(1)
-        @inbounds bh[row, col] = loaded[1]
-        @inbounds bl[row, col] = loaded[2]
+        row = tid % Int32(4)
+        col = tid ÷ Int32(4)
+        dst = Int(row + Int32(size(bh, 1)) * (col + Int32(BK) * buffer)) + 1
+        src = Int(source0 + row) + size(yh, 1) * Int(rhs0 + col) + 1
+        _cp_async!(pointer(bh, dst), pointer(yh, src))
+        _cp_async!(pointer(bl, dst), pointer(yl, src))
     end
+    _cp_async_commit()
     return nothing
 end
 
@@ -333,11 +344,11 @@ function _aX_wmma_kernel!(
     B8 = LDB ÷ 8
     gh = CuDynamicSharedArray(UInt128, (G8, WMMA_BN))
     gl = CuDynamicSharedArray(UInt128, (G8, WMMA_BN), 16 * G8 * WMMA_BN)
-    bh = CuDynamicSharedArray(UInt128, (B8, BK), 32 * G8 * WMMA_BN)
-    bl = CuDynamicSharedArray(UInt128, (B8, BK),
-        32 * G8 * WMMA_BN + 16 * B8 * BK)
-    scratch = CuDynamicSharedArray(Float32, (16, 16, 8),
+    bh = CuDynamicSharedArray(UInt128, (B8, BK, 2), 32 * G8 * WMMA_BN)
+    bl = CuDynamicSharedArray(UInt128, (B8, BK, 2),
         32 * G8 * WMMA_BN + 32 * B8 * BK)
+    scratch = CuDynamicSharedArray(Float32, (16, 16, 8),
+        32 * G8 * WMMA_BN + 64 * B8 * BK)
 
     tid = Int32(threadIdx().x) - Int32(1)
     warp = tid ÷ Int32(32)
@@ -356,28 +367,33 @@ function _aX_wmma_kernel!(
     wr_count = Int32(WMMA_BM ÷ 16)
     loaded = _load_words(words, tid, word_row0, word_stop, wr_count,
         column0, column_stop)
+    buffer = Int32(0)
+    _copy_rhs_async!(bh, bl, yh, yl, tid, column0 ÷ Int32(8), rhs0, buffer,
+        Val(BK))
     while column0 < column_stop
         _store_words!(gh, gl, loaded, tables, tid, wr_count, column0,
             column_stop)
-        _store_rhs!(bh, bl, _load_rhs(yh, yl, tid, column0 ÷ Int32(8), rhs0,
-            Val(BK)), tid, Val(BK))
+        _cp_async_wait()
         sync_threads()
         next = column0 + Int32(WMMA_BN)
         if next < column_stop
             loaded = _load_words(words, tid, word_row0, word_stop,
                 wr_count, next, column_stop)
+            _copy_rhs_async!(bh, bl, yh, yl, tid, next ÷ Int32(8), rhs0,
+                Int32(1) - buffer, Val(BK))
         end
         stage = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
         kk = Int32(0)
         while kk < Int32(WMMA_BN)
             stage = _wmma_step(stage, gh, gl, bh, bl,
                 wm * Int32(64) + kk * Int32(LDG),
-                kk + wn * Int32(16 * FN * LDB), Val(WMMA.ColMajor),
-                Val(LDG), Val(LDB), Val(16), Val(FN))
+                kk + wn * Int32(16 * FN * LDB) + buffer * Int32(BK * LDB),
+                Val(WMMA.ColMajor), Val(LDG), Val(LDB), Val(16), Val(FN))
             kk += Int32(16)
         end
         acc = _fragment_add(acc, stage)
         sync_threads()
+        buffer = Int32(1) - buffer
         column0 = next
     end
     _wmma_store_all!(out, scratch, acc, scale_inv, warp, lane,
@@ -406,11 +422,11 @@ function _atX_wmma_kernel!(
     WR = WMMA_T_BS ÷ 16
     gh = CuDynamicSharedArray(UInt128, (L8, WMMA_T_BR))
     gl = CuDynamicSharedArray(UInt128, (L8, WMMA_T_BR), 16 * L8 * WMMA_T_BR)
-    bh = CuDynamicSharedArray(UInt128, (L8, BK), 32 * L8 * WMMA_T_BR)
-    bl = CuDynamicSharedArray(UInt128, (L8, BK),
-        32 * L8 * WMMA_T_BR + 16 * L8 * BK)
-    scratch = CuDynamicSharedArray(Float32, (16, 16, 8),
+    bh = CuDynamicSharedArray(UInt128, (L8, BK, 2), 32 * L8 * WMMA_T_BR)
+    bl = CuDynamicSharedArray(UInt128, (L8, BK, 2),
         32 * L8 * WMMA_T_BR + 32 * L8 * BK)
+    scratch = CuDynamicSharedArray(Float32, (16, 16, 8),
+        32 * L8 * WMMA_T_BR + 64 * L8 * BK)
 
     tid = Int32(threadIdx().x) - Int32(1)
     warp = tid ÷ Int32(32)
@@ -426,27 +442,33 @@ function _atX_wmma_kernel!(
     wr0 = (split - Int32(1)) * split_word_rows
     loaded = _load_words(words, tid, wr0, word_stop, Int32(WR), snp0,
         n)
+    buffer = Int32(0)
+    _copy_rhs_async!(bh, bl, xh, xl, tid, Int32(2) * wr0, rhs0, buffer,
+        Val(BK))
     while wr0 < word_stop
         _store_words!(gh, gl, loaded, tables, tid, Int32(WR), snp0, n)
-        _store_rhs!(bh, bl, _load_rhs(xh, xl, tid, Int32(2) * wr0, rhs0,
-            Val(BK)), tid, Val(BK))
+        _cp_async_wait()
         sync_threads()
         next = wr0 + Int32(WR)
         if next < word_stop
             loaded = _load_words(words, tid, next, word_stop,
                 Int32(WR), snp0, n)
+            _copy_rhs_async!(bh, bl, xh, xl, tid, Int32(2) * next, rhs0,
+                Int32(1) - buffer, Val(BK))
         end
         stage = ntuple(_ -> WMMA.fill_c(0.0f0, WMMA_CONFIG), Val(4 * FN))
         kk = Int32(0)
         while kk < Int32(WMMA_T_BS)
             stage = _wmma_step(stage, gh, gl, bh, bl,
-                wm * Int32(64 * LDS) + kk, kk + wn * Int32(16 * FN * LDS),
+                wm * Int32(64 * LDS) + kk,
+                kk + wn * Int32(16 * FN * LDS) + buffer * Int32(BK * LDS),
                 Val(WMMA.RowMajor), Val(LDS), Val(LDS), Val(16 * LDS),
                 Val(FN))
             kk += Int32(16)
         end
         acc = _fragment_add(acc, stage)
         sync_threads()
+        buffer = Int32(1) - buffer
         wr0 = next
     end
     _wmma_store_all!(out, scratch, acc, scale_inv, warp, lane,
@@ -516,7 +538,7 @@ function _wmma_mul!(
         CuArray{Float32, 3}(undef, m, k, splits)
     G8 = (WMMA_BM + 8) ÷ 8
     B8 = (WMMA_BN + 8) ÷ 8
-    shmem = 32 * G8 * WMMA_BN + 32 * B8 * BK + 4 * 16 * 16 * 8
+    shmem = 32 * G8 * WMMA_BN + 64 * B8 * BK + 4 * 16 * 16 * 8
     _launch_wmma!(_aX_wmma_kernel!, (partials, s.data, tables, yh, yl,
         scale_inv, Int32(m), Int32(n), Int32(k), Int32(split_columns),
         Val(BK)), (row_blocks, rhs_blocks, splits), shmem)
@@ -555,7 +577,7 @@ function _wmma_t_mul!(
     partials = splits == 1 ? reshape(out, n, k, 1) :
         CuArray{Float32, 3}(undef, n, k, splits)
     L8 = (WMMA_T_BS + 8) ÷ 8
-    shmem = 32 * L8 * WMMA_T_BR + 32 * L8 * BK + 4 * 16 * 16 * 8
+    shmem = 32 * L8 * WMMA_T_BR + 64 * L8 * BK + 4 * 16 * 16 * 8
     _launch_wmma!(_atX_wmma_kernel!, (partials, s.data, tables, xh, xl,
         scale_inv, Int32(m), Int32(n), Int32(k), Int32(split_word_rows),
         Val(BK)), (row_blocks, rhs_blocks, splits), shmem)
