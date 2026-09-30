@@ -315,7 +315,8 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace,
     k = size(out, 2)
     T = eltype(out)
     if _uses_lookup_kernel(rows_filled, k) && T <: SIMD_FLOAT &&
-       out isa Matrix{T} && rhs isa Matrix{T} && packed isa Matrix{UInt8}
+       out isa StridedMatrix{T} && rhs isa StridedMatrix{T} &&
+       packed isa Matrix{UInt8}
         return _snparray_AX_lookup_tile!(out, packed, rhs, values,
                                          rows_filled, workspace, blk)
     end
@@ -406,9 +407,9 @@ Run the build and gather phases of `_snparray_AX_lookup_tile!` for every
 SNP chunk with rhs slices of `NV` vectors of width `W`.
 """
 function _snparray_AX_lookup_chunks!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::Matrix{UInt8},
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     values::Matrix{T},
     rows_filled::Int,
     workspace::Vector{T},

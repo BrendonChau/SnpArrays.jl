@@ -321,7 +321,7 @@ that starts at its own `panel_offset`.
 @inline function _pack_rhs_panel!(
     panel::Vector{T},
     panel_offset::Int,
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     column_first::Int,
     column_last::Int,
     rhs_column::Int,
@@ -391,7 +391,7 @@ Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
 `column_first:column_last`, then add the `valid` leading lanes into `out`.
 """
 @inline function _snparray_AX_micro_tile!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::Matrix{UInt8},
     values::Matrix{T},
     panel::Vector{T},
@@ -437,7 +437,7 @@ Sweep samples `row_first:row_last` with `MR`-row register tiles, finishing
 the tail one sample at a time.
 """
 @inline function _snparray_AX_row_tiles!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::Matrix{UInt8},
     values::Matrix{T},
     panel::Vector{T},
@@ -478,9 +478,9 @@ Run one `A*X` task with a compile-time tile height `MR`, looping over SNP
 column blocks of width `column_step` and rhs tiles of width `2W`.
 """
 function _snparray_AX_task!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::Matrix{UInt8},
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     values::Matrix{T},
     panel::Vector{T},
     panel_offset::Int,
@@ -543,9 +543,9 @@ hot loop compiles to 16 FMAs on zmm accumulators with no spills, 19 of 32
 registers live.
 """
 function _snparray_AX_kernel!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::Matrix{UInt8},
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     values::Matrix{T},
     panel::Vector{T},
     panel_offset::Int,
@@ -686,7 +686,7 @@ SNP `column` and rhs column `rhs_column` over the samples
 `column - out_offset`.
 """
 @inline function _snparray_AtX_micro_tile!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
     values::StridedMatrix{T},
     panel::Vector{T},
@@ -753,7 +753,7 @@ Sweep SNP columns `column_first:column_last` with `MR`-column register
 tiles, finishing the tail one column at a time.
 """
 @inline function _snparray_AtX_column_tiles!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
     values::StridedMatrix{T},
     panel::Vector{T},
@@ -796,9 +796,9 @@ Run one `transpose(A)*X` task with a compile-time tile width `MR`, looping
 over sample blocks of `row_step` samples and rhs tiles of width `2W`.
 """
 function _snparray_AtX_task!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     values::StridedMatrix{T},
     panel::Vector{T},
     panel_offset::Int,
@@ -866,9 +866,9 @@ On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with
 no spills.
 """
 function _snparray_AtX_kernel!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     values::StridedMatrix{T},
     panel::Vector{T},
     panel_offset::Int,
@@ -1030,7 +1030,7 @@ function _lookup_build_tables!(
     stage::Vector{T},
     stage_offset::Int,
     n::Int,
-    rhs::Matrix{T},
+    rhs::StridedMatrix{T},
     values::Matrix{T},
     column_first::Int,
     block_first::Int,
@@ -1182,7 +1182,7 @@ into `out[tile_first:tile_first + tile_rows - 1, rhs_column:rhs_column +
 valid - 1]`.
 """
 function _lookup_flush_tile!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     tile::Vector{T},
     tile_offset::Int,
     tile_first::Int,
@@ -1213,7 +1213,7 @@ SNP `column_first`, then for every `NV * W`-wide rhs slice (tables
 table rows and add them into `out`.
 """
 function _snparray_AX_lookup_task!(
-    out::Matrix{T},
+    out::StridedMatrix{T},
     packed::Matrix{UInt8},
     tables::Vector{T},
     tile::Vector{T},
