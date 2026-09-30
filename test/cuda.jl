@@ -182,3 +182,43 @@ end
         end
     end
 end
+
+@testset "streamed_mul! on CuMatrix" begin
+    rng = Random.Xoshiro(17)
+    dir = mktempdir()
+    # m = 64 takes the copy path (whole 16-sample words), m = 379 the
+    # repacking path; two files test chunks that stop at file boundaries.
+    beds = map(enumerate(((64, 300), (64, 211)))) do (index, (m, n))
+        path = joinpath(dir, "stream_$index.bed")
+        s = SnpArray(path, m, n)
+        s .= rand(rng, (0x00, 0x01, 0x02, 0x03), m, n)
+        write(replace(path, ".bed" => ".fam"), repeat("f s 0 0 1 -9\n", m))
+        write(replace(path, ".bed" => ".bim"), repeat("1 r 0 1 A G\n", n))
+        path
+    end
+    cases = ((beds, 64), (SnpArrays.datadir("EUR_subset.bed"), 379))
+    for (files, m) in cases, T in (Float32, Float64)
+        stream = SnpLinAlgStream{T}(files; width=128, center=true,
+            scale=true)
+        chunks = [copy(chunk.s.data) for (cols, chunk) in stream]
+        s = SnpArray(undef, m, size(stream, 2))
+        s.data .= reduce(hcat, chunks)
+        sla = SnpLinAlg{T}(s; center=true, scale=true)
+        rtol = T == Float32 ? 1e-5 : 1e-12
+        for k in (1, 8, 40)
+            X = randn(rng, T, size(stream, 2), k)
+            Y = randn(rng, T, m, k)
+            out = CuMatrix{T}(undef, m, k)
+            @test relerr(Array(streamed_mul!(out, stream, CuArray(X))),
+                sla * X) < rtol
+            out = CuMatrix{T}(undef, size(stream, 2), k)
+            @test relerr(Array(streamed_mul!(out, stream, CuArray(Y);
+                transpose=true)), transpose(sla) * Y) < rtol
+        end
+    end
+    stream = SnpLinAlgStream{Float32}(beds; width=128)
+    @test_throws DimensionMismatch streamed_mul!(CUDA.zeros(Float32, 64, 2),
+        stream, CUDA.zeros(Float32, 510, 2))
+    @test_throws DimensionMismatch streamed_mul!(CUDA.zeros(Float32, 510, 2),
+        stream, CUDA.zeros(Float32, 64, 2); transpose=true)
+end
