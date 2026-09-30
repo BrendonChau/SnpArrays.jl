@@ -103,6 +103,21 @@ function mul!(
         fill!(out, zero(T))
         return out
     end
+    _lookup_mul!(reshape(out, m, 1), s, reshape(v, n, 1),
+        _lookup_config(1))
+    return out
+end
+
+"""
+    _decode_mul!(out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T})
+
+`out = s * v` with the decode kernel `_ax_direct_kernel!`, kept for
+benchmarks and tests.
+"""
+function _decode_mul!(
+    out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T},
+) where {T <: AbstractFloat}
+    m, n = size(s)
     row_blocks = cld(cld(m, 16), THREADS_PER_BLOCK)
     chunks = _ax_chunks(row_blocks, n)
     chunk_columns = cld(n, chunks)
@@ -223,7 +238,20 @@ function mul!(
         fill!(out, zero(T))
         return out
     end
-    k == 1 && return (mul!(vec(out), s, vec(X)); out)
+    return _lookup_mul!(out, s, X, _lookup_config(k))
+end
+
+"""
+    _decode_mul!(out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T})
+
+`out = s * X` with the decode kernels, kept for benchmarks and tests.
+"""
+function _decode_mul!(
+    out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T},
+) where {T <: AbstractFloat}
+    m, n = size(s)
+    k = size(X, 2)
+    k == 1 && return (_decode_mul!(vec(out), s, vec(X)); out)
     (BM, BN, BK, TM, TK) = AX_TILES[_tile_band(k)]
     row_blocks = cld(m, BM)
     rhs_blocks = cld(k, BK)
