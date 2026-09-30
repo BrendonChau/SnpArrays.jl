@@ -222,3 +222,29 @@ end
     @test_throws DimensionMismatch streamed_mul!(CUDA.zeros(Float32, 510, 2),
         stream, CUDA.zeros(Float32, 64, 2); transpose=true)
 end
+
+@testset "streamed_grm_mul! on CuMatrix" begin
+    rng = Random.Xoshiro(19)
+    bed = SnpArrays.datadir("EUR_subset.bed")
+    m, n = size(EUR)
+    for (TS, TV) in ((Float32, Float32), (Float64, Float64),
+            (Float32, Float64))
+        stream = SnpLinAlgStream{TS}(bed; width=500, center=true, scale=true)
+        rtol = TS == Float32 ? 1e-5 : 1e-12
+        for k in (1, 8, 40)
+            Q = randn(rng, TV, m, k)
+            scale = rand(rng, TV, n)
+            V = zeros(TV, m, k)
+            U = zeros(TV, n, k)
+            streamed_grm_mul!(V, stream, Q; scale, U)
+            Vd = CuMatrix{TV}(undef, m, k)
+            Ud = CuMatrix{TV}(undef, n, k)
+            streamed_grm_mul!(Vd, stream, CuArray(Q); scale, U=Ud)
+            @test relerr(Array(Vd), V) < rtol
+            @test relerr(Array(Ud), U) < rtol
+            streamed_grm_mul!(V, stream, Q)
+            @test relerr(Array(streamed_grm_mul!(Vd, stream, CuArray(Q))),
+                V) < rtol
+        end
+    end
+end
