@@ -612,6 +612,18 @@ end
                            rtol=tolerance, nans=true)
         end
 
+        # 2b. Rhs widths on both sides of the 2W slice and the 32-wide slice,
+        #     including partial last slices.
+        packed, dense = simd_test_fixture(min_rows + 1, 37)
+        reference = simd_test_reference(dense, T, ADDITIVE_MODEL, true, true,
+                                        true)
+        operator = SnpLinAlg{T}(packed; center=true, scale=true)
+        for k in (5, 16, 17, 40, 64)
+            rhs = simd_test_rhs(T, 37, k)
+            @test isapprox(operator * rhs, reference * rhs; atol=tolerance,
+                           rtol=tolerance, nans=true)
+        end
+
         # 3. Every model and transformation at one lookup-path shape.
         packed, dense = simd_test_fixture(min_rows + 5, 9)
         for model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL),

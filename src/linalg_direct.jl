@@ -355,7 +355,10 @@ end
 Accumulate `out += A * rhs` with the lookup-table kernel: per chunk of
 `LOOKUP_CHUNK_SNPS` SNPs, build the 256-row tables of every 4-SNP block
 for all rhs columns (tasks over blocks), then gather them per sample
-(tasks over sample blocks). `workspace` holds the tables, one rhs staging
+(tasks over sample blocks). Tables are laid out `[slice][block][code][lane]`
+over rhs slices of `NV` vectors of width `W = _vector_width(T)`, with
+`NV = 2` for `k ≤ 2W` and `NV = max(2, 32 ÷ W)` otherwise; `k` is padded
+to a whole slice. `workspace` holds the tables, one rhs staging
 slice per build task, and one output tile per gather task; `blk` holds the
 transposed codes of one chunk.
 """
@@ -365,13 +368,15 @@ function _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
     k = size(out, 2)
     T = eltype(out)
     lanes = _vector_width(T)
-    width = Val(lanes)
-    k_padded = cld(k, 2lanes) * 2lanes
+    vectors = k <= 2lanes ? 2 : max(2, 32 ÷ lanes)
+    slice = vectors * lanes
+    k_padded = cld(k, slice) * slice
     nblk_max = min(LOOKUP_CHUNK_SNPS ÷ 4, cld(n, 4))
     row_span = 4 * cld(rows_filled, 4)
+    slice_stride = nblk_max * 256 * slice
     tables_len = nblk_max * 256 * k_padded
     stage_len = 4k_padded
-    tile_len = LOOKUP_ROW_TILE * 2lanes
+    tile_len = LOOKUP_ROW_TILE * slice
     row_step = _task_axis_step(rows_filled, rows_filled)
     row_tasks = cld(rows_filled, row_step)
     block_step = max(1, cld(nblk_max, TASKS_PER_THREAD * Threads.nthreads()))
@@ -380,9 +385,48 @@ function _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
     tile_base = stage_base + block_tasks * stage_len
     _resize_workspace!(workspace, tile_base + row_tasks * tile_len)
     _resize_workspace!(blk, nblk_max * row_span)
-    group = clamp(LOOKUP_GROUP_BUDGET ÷ (256 * 2lanes * sizeof(T)), 1,
+    group = clamp(LOOKUP_GROUP_BUDGET ÷ (256 * slice * sizeof(T)), 1,
                   nblk_max)
     @assert row_step % 4 == 0 "row_step must be a multiple of 4"
+    _snparray_AX_lookup_chunks!(
+        out, packed, rhs, values, rows_filled, workspace, blk, k_padded,
+        slice_stride, stage_len, tile_len, row_span, row_step, block_step,
+        stage_base, tile_base, group, Val(lanes), Val(vectors),
+    )
+    return out
+end
+
+"""
+    _snparray_AX_lookup_chunks!(out, packed, rhs, values, rows_filled,
+        workspace, blk, k_padded, slice_stride, stage_len, tile_len,
+        row_span, row_step, block_step, stage_base, tile_base, group,
+        ::Val{W}, ::Val{NV})
+
+Run the build and gather phases of `_snparray_AX_lookup_tile!` for every
+SNP chunk with rhs slices of `NV` vectors of width `W`.
+"""
+function _snparray_AX_lookup_chunks!(
+    out::Matrix{T},
+    packed::Matrix{UInt8},
+    rhs::Matrix{T},
+    values::Matrix{T},
+    rows_filled::Int,
+    workspace::Vector{T},
+    blk::Vector{UInt8},
+    k_padded::Int,
+    slice_stride::Int,
+    stage_len::Int,
+    tile_len::Int,
+    row_span::Int,
+    row_step::Int,
+    block_step::Int,
+    stage_base::Int,
+    tile_base::Int,
+    group::Int,
+    width::Val{W},
+    count::Val{NV},
+) where {T <: AbstractFloat, W, NV}
+    n = size(packed, 2)
     for column_first in 1:LOOKUP_CHUNK_SNPS:n
         nblk = cld(min(LOOKUP_CHUNK_SNPS, n - column_first + 1), 4)
         @sync begin
@@ -393,7 +437,8 @@ function _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
                 task_index += 1
                 Threads.@spawn _lookup_build_tables!(
                     workspace, workspace, $stage_offset, n, rhs, values,
-                    $column_first, $block_first, $block_last, k_padded, width,
+                    $column_first, $block_first, $block_last, k_padded,
+                    slice_stride, width, count,
                 )
             end
         end
@@ -406,7 +451,7 @@ function _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
                 Threads.@spawn _snparray_AX_lookup_task!(
                     out, packed, workspace, workspace, $tile_offset, blk,
                     row_span, $row_first, $row_last, $column_first, $nblk,
-                    k_padded, group, width,
+                    slice_stride, group, width, count,
                 )
             end
         end
