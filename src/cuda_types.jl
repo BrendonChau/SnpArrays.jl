@@ -1,20 +1,28 @@
 """
-    CuSnpArray{T}(s; model=ADDITIVE_MODEL, center=false, scale=false, impute=true)
+    CuSnpArray{T}(s; model=ADDITIVE_MODEL, center=false, scale=false,
+                  impute=false)
 
-Copy a `SnpArray` to a CUDA GPU to perform linear algebera operations.
+Copy a `SnpArray` to a CUDA GPU to perform linear algebra operations.
 Constructors and `mul!` methods are defined by the `SnpArraysCUDAExt`
 extension, loaded by `using CUDA`.
 
+Genotypes are stored as packed `UInt32` words, 16 samples per word, and
+decoded through a per-column lookup table `values` (4 x n) that holds the
+transformed value of each 2-bit PLINK code.
+
 # Arguments
 - s: a `SnpArray`.
-- model: one of `ADDITIVE_MODEL`(default), `DOMINANT_MODEL`, `RECESSIVE_MODEL`.
+- model: one of `ADDITIVE_MODEL`(default), `DOMINANT_MODEL`,
+  `RECESSIVE_MODEL`.
 - center: whether to center (default: false).
 - scale: whether to scale to standard deviation 1 (default: false).
-- impute: whether to impute missing value with column mean (default: true).
+- impute: whether to impute missing values with the column mean (default:
+  false). With `impute=false` a missing genotype counts as 0 before
+  centering and scaling.
 """
-struct CuSnpArray{T, M <: AbstractMatrix{UInt8}, V <: AbstractVector{T}} <:
-       AbstractMatrix{UInt8}
-    data::M
+struct CuSnpArray{T, D <: AbstractMatrix{UInt32}, V <: AbstractVector{T},
+                  W <: AbstractMatrix{T}} <: AbstractMatrix{UInt8}
+    data::D
     m::Int
     model::Union{Val{1}, Val{2}, Val{3}}
     center::Bool
@@ -22,17 +30,40 @@ struct CuSnpArray{T, M <: AbstractMatrix{UInt8}, V <: AbstractVector{T}} <:
     impute::Bool
     μ::V
     σinv::V
-    storagev1::V
-    storagev2::V
+    values::W
 end
 
-function CuSnpArray{T}(data::M, m::Integer,
+function CuSnpArray{T}(data::D, m::Integer,
     model::Union{Val{1}, Val{2}, Val{3}}, center::Bool, scale::Bool,
-    impute::Bool, μ::V, σinv::V, storagev1::V, storagev2::V
-) where {T, M <: AbstractMatrix{UInt8}, V <: AbstractVector{T}}
-    CuSnpArray{T, M, V}(data, m, model, center, scale, impute, μ, σinv,
-        storagev1, storagev2)
+    impute::Bool, μ::V, σinv::V, values::W
+) where {T, D <: AbstractMatrix{UInt32}, V <: AbstractVector{T},
+         W <: AbstractMatrix{T}}
+    CuSnpArray{T, D, V, W}(data, m, model, center, scale, impute, μ, σinv,
+        values)
 end
 
 size(s::CuSnpArray) = s.m, size(s.data, 2)
-eltype(s::CuSnpArray) = eltype(s.μ)
+eltype(::CuSnpArray{T}) where {T} = T
+
+"""
+    _packed_words(data::AbstractMatrix{UInt8}, m::Integer)
+
+Repack PLINK bytes (4 samples per byte, column major) into a
+`Matrix{UInt32}` of size `(cld(m, 16), size(data, 2))`, 16 samples per
+word, with the bits of samples past `m` zeroed.
+"""
+function _packed_words(data::AbstractMatrix{UInt8}, m::Integer)
+    n = size(data, 2)
+    size(data, 1) == cld(m, 4) || throw(DimensionMismatch(
+        "data has $(size(data, 1)) rows; expected $(cld(m, 4))",
+    ))
+    padded = zeros(UInt8, 4 * cld(m, 16), n)
+    padded[1:size(data, 1), :] .= data
+    remainder = mod(m, 4)
+    if remainder != 0
+        mask = UInt8((1 << (2 * remainder)) - 1)
+        padded[cld(m, 4), :] .&= mask
+    end
+    words = reinterpret(UInt32, vec(padded))
+    return collect(reshape(words, cld(m, 16), n))
+end

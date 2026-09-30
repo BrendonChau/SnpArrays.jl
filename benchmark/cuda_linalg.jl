@@ -17,7 +17,13 @@ const REPETITIONS = 5
 const KS = (1, 8, 32, 128)
 
 function min_elapsed(f::Function, repetitions::Integer)
-    f()
+    # Warm up for at least 3 calls and 0.5 s so the GPU clock ramps up.
+    start = time()
+    calls = 0
+    while calls < 3 || time() - start < 0.5
+        f()
+        calls += 1
+    end
     return minimum(f() for _ in 1:repetitions)
 end
 
@@ -123,14 +129,15 @@ function main()
         "ms", "G elem/s",
     )
 
-    # Current CuSnpArray kernels, k = 1 only.
+    # Packed-word CuSnpArray kernels. The byte-per-sample
+    # kernels they replace ran 26.029 ms (A*X) and 13.886 ms (A'*X) on an
+    # A100 at this shape; see results/cuda_a100_baseline.md.
     cu_snp = CuSnpArray{Float32}(
         stacked; model=ADDITIVE_MODEL, center=true, scale=true,
         impute=false,
     )
     bench_impl!(
-        "CuSnpArray (current)", cu_snp, m, n, x -> CuArray(x), gpu_time,
-        rng; ks=(1,),
+        "CuSnpArray (new)", cu_snp, m, n, x -> CuArray(x), gpu_time, rng,
     )
     cu_snp = nothing
     GC.gc(); CUDA.reclaim()

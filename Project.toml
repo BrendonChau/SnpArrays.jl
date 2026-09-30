@@ -30,7 +30,8 @@ VariantCallFormat = "28eba6e3-a997-4ad9-87c6-d933b8bca6c1"
 [compat]
 Adapt = "3, 4"
 CSV = "0.8, 0.9, 0.10"
-CUDA = "5"
+CUDA = "6"
+CUDACore = "6"
 CodecBzip2 = "0.7, 0.8"
 CodecXz = "0.7"
 CodecZlib = "0.7"
@@ -48,16 +49,16 @@ VariantCallFormat = "0.5"
 julia = "1.10"
 
 [weakdeps]
-Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 
 [extensions]
-SnpArraysCUDAExt = ["CUDA", "Adapt"]
+SnpArraysCUDAExt = "CUDACore"
 
 [extras]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "CUDA", "Adapt"]
+test = ["Test", "CUDA", "CUDACore", "Adapt"]
