@@ -13,25 +13,24 @@ the same four samples.
 end
 
 """
-    _lookup_transpose!(blk, row_span, packed, row_first, row_last,
-        column_first, nblk)
+    _lookup_transpose!(blk, row_span, packed, rows, column_first, nblk)
 
-Write, for samples `row_first:row_last` (`row_first ≡ 1 (mod 4)`) and the
-`nblk` blocks of four SNP columns starting at `column_first`, one byte per
-(block, sample) holding that sample's four codes, at
-`blk[(b - 1) * row_span + row]`. Columns past `size(packed, 2)` read as
-code 0.
+Write, for samples `rows` (`first(rows) ≡ 1 (mod 4)`) and the `nblk` blocks
+of four SNP columns starting at `column_first`, one byte per (block, sample)
+holding that sample's four codes, at `blk[(b - 1) * row_span + row]`.
+Columns past `size(packed, 2)` read as code 0.
 """
 function _lookup_transpose!(
     blk::Vector{UInt8},
     row_span::Int,
     packed::Matrix{UInt8},
-    row_first::Int,
-    row_last::Int,
+    rows::UnitRange{Int},
     column_first::Int,
     nblk::Int,
 )
     n = size(packed, 2)
+    row_first = first(rows)
+    row_last = last(rows)
     byte_first = ((row_first - 1) >>> 2) + 1
     byte_last = ((row_last - 1) >>> 2) + 1
     @inbounds for b in 1:nblk
@@ -68,35 +67,35 @@ Return the four genotype values of SNP `column`, or zeros past `n`.
 end
 
 """
-    _lookup_build_tables!(tables, stage, stage_offset, n, rhs, values,
-        column_first, block_first, block_last, k_padded, slice_stride,
-        ::Val{W}, ::Val{NV})
+    _lookup_build_tables!(workspace, stage_offset, n, rhs, values,
+        column_first, blocks, layout, ::Val{W}, ::Val{NV})
 
-Fill, for blocks `block_first:block_last` of the chunk starting at SNP
-`column_first` and every rhs slice `s` of width `S = NV * W`, the 256 table
-rows `tables[s * slice_stride + ((b - 1) * 256 + code) * S + t] =
-Σ_l values[code_l + 1, j_l] * rhs[j_l, s * S + t]` over the four SNPs `j_l`
-of block `b`, zero past `size(rhs, 2)`. `stage` holds the four rhs rows,
-`4 * k_padded` elements from `stage_offset`.
+Fill, for `blocks` of the chunk starting at SNP `column_first` and every rhs
+slice `s` of width `S = NV * W`, the 256 table rows `workspace[s *
+slice_stride + ((b - 1) * 256 + code) * S + t] = Σ_l values[code_l + 1, j_l]
+* rhs[j_l, s * S + t]` over the four SNPs `j_l` of block `b`, zero past
+`size(rhs, 2)` or SNP `n`. The four rhs rows are staged in `workspace` from
+`stage_offset`.
 """
 function _lookup_build_tables!(
-    tables::Vector{T},
-    stage::Vector{T},
+    workspace::Vector{T},
     stage_offset::Int,
     n::Int,
     rhs::StridedMatrix{T},
     values::Matrix{T},
     column_first::Int,
-    block_first::Int,
-    block_last::Int,
-    k_padded::Int,
-    slice_stride::Int,
+    blocks::UnitRange{Int},
+    layout::LookupLayout,
     ::Val{W},
     ::Val{NV},
 ) where {T <: SIMD_FLOAT, W, NV}
+    tables = workspace
+    stage = workspace
+    k_padded = layout.k_padded
+    slice_stride = layout.slice_stride
     slice = NV * W
     k = size(rhs, 2)
-    @inbounds for b in block_first:block_last
+    @inbounds for b in blocks
         j0 = column_first + 4(b - 1)
         for l in 0:3
             j = j0 + l
@@ -136,21 +135,6 @@ function _lookup_build_tables!(
 end
 
 """
-    _lookup_load(x, offset, ::Val{W}, ::Val{NV}) -> NTuple{NV, Vec{W, T}}
-
-Load the `NV` consecutive `W`-vectors of `x` starting after `offset`.
-"""
-@inline function _lookup_load(
-    x::Vector{T},
-    offset::Int,
-    ::Val{W},
-    ::Val{NV},
-) where {T <: SIMD_FLOAT, W, NV}
-    return ntuple(j -> @inbounds(x[VecRange{W}(offset + (j - 1) * W + 1)]),
-                  Val(NV))
-end
-
-"""
     _lookup_store!(x, offset, vectors::NTuple{NV, Vec{W, T}})
 
 Store `vectors` into consecutive `W`-vectors of `x` starting after `offset`.
@@ -185,36 +169,40 @@ after `offset`.
 end
 
 """
-    _lookup_gather_tile!(tile, tile_offset, tables, blk, row_span, tile_first,
-        tile_rows, nblk, group, slice_offset, ::Val{W}, ::Val{NV})
+    _lookup_gather_tile!(workspace, tile_offset, blk, tile_rows, nblk,
+        slice_offset, layout, ::Val{W}, ::Val{NV})
 
-Set the row-major `tile_rows x NV * W` tile at `tile_offset` to the sum over
-the `nblk` blocks of the table rows selected by `blk`, for the rhs slice
-whose tables start after `slice_offset`, sweeping `group` blocks per pass.
+Set the row-major `length(tile_rows) x NV * W` tile at `tile_offset` to the
+sum over the `nblk` blocks of the table rows selected by `blk` for samples
+`tile_rows`, for the rhs slice whose tables start after `slice_offset`,
+sweeping `layout.group` blocks per pass.
 """
 function _lookup_gather_tile!(
-    tile::Vector{T},
+    workspace::Vector{T},
     tile_offset::Int,
-    tables::Vector{T},
     blk::Vector{UInt8},
-    row_span::Int,
-    tile_first::Int,
-    tile_rows::Int,
+    tile_rows::UnitRange{Int},
     nblk::Int,
-    group::Int,
     slice_offset::Int,
+    layout::LookupLayout,
     width::Val{W},
     count::Val{NV},
 ) where {T <: SIMD_FLOAT, W, NV}
+    tile = workspace
+    tables = workspace
+    row_span = layout.row_span
+    group = layout.group
+    tile_first = first(tile_rows)
+    nrows = length(tile_rows)
     slice = NV * W
-    @inbounds for i in 1:(tile_rows * slice)
+    @inbounds for i in 1:(nrows * slice)
         tile[tile_offset + i] = zero(T)
     end
     @inbounds for g0 in 1:group:nblk
         g1 = min(g0 + group - 1, nblk)
-        for i in 1:tile_rows
+        for i in 1:nrows
             tile_row = tile_offset + (i - 1) * slice
-            accumulators = _lookup_load(tile, tile_row, width, count)
+            accumulators = _load_vectors(tile, tile_row, count, width)
             sample = tile_first + i - 1
             for b in g0:g1
                 code = Int(blk[(b - 1) * row_span + sample])
@@ -228,26 +216,28 @@ function _lookup_gather_tile!(
 end
 
 """
-    _lookup_flush_tile!(out, tile, tile_offset, tile_first, tile_rows,
-        rhs_column, valid, lanes)
+    _lookup_flush_tile!(out, workspace, tile_offset, tile_rows, tile_columns,
+        lanes)
 
-Add the leading `valid` lanes of each row of the `tile_rows x lanes` tile
-into `out[tile_first:tile_first + tile_rows - 1, rhs_column:rhs_column +
-valid - 1]`.
+Add the leading `length(tile_columns)` lanes of each row of the
+`length(tile_rows) x lanes` tile at `tile_offset` into
+`out[tile_rows, tile_columns]`.
 """
 function _lookup_flush_tile!(
     out::StridedMatrix{T},
-    tile::Vector{T},
+    workspace::Vector{T},
     tile_offset::Int,
-    tile_first::Int,
-    tile_rows::Int,
-    rhs_column::Int,
-    valid::Int,
+    tile_rows::UnitRange{Int},
+    tile_columns::UnitRange{Int},
     lanes::Int,
 ) where T <: SIMD_FLOAT
-    @inbounds for t in 1:valid
+    tile = workspace
+    tile_first = first(tile_rows)
+    nrows = length(tile_rows)
+    rhs_column = first(tile_columns)
+    @inbounds for t in 1:length(tile_columns)
         column = rhs_column + t - 1
-        for i in 1:tile_rows
+        for i in 1:nrows
             out[tile_first + i - 1, column] +=
                 tile[tile_offset + (i - 1) * lanes + t]
         end
@@ -256,49 +246,44 @@ function _lookup_flush_tile!(
 end
 
 """
-    _snparray_AX_lookup_gather_task!(out, packed, tables, tile, tile_offset,
-        blk, row_span, row_first, row_last, column_first, nblk, slice_stride,
-        group, ::Val{W}, ::Val{NV})
+    _snparray_AX_lookup_gather_task!(out, packed, workspace, tile_offset, blk,
+        rows, column_first, nblk, layout, ::Val{W}, ::Val{NV})
 
 Run one gather task of the lookup-table `A*X` kernel: transpose the codes
-of samples `row_first:row_last` for the chunk of `nblk` blocks starting at
-SNP `column_first`, then for every `NV * W`-wide rhs slice (tables
-`slice_stride` elements apart) and `LOOKUP_ROW_TILE`-row tile, gather the
-table rows and add them into `out`.
+of samples `rows` for the chunk of `nblk` blocks starting at SNP
+`column_first`, then for every `NV * W`-wide rhs slice and
+`LOOKUP_ROW_TILE`-row tile, gather the table rows and add them into `out`.
 """
 function _snparray_AX_lookup_gather_task!(
     out::StridedMatrix{T},
     packed::Matrix{UInt8},
-    tables::Vector{T},
-    tile::Vector{T},
+    workspace::Vector{T},
     tile_offset::Int,
     blk::Vector{UInt8},
-    row_span::Int,
-    row_first::Int,
-    row_last::Int,
+    rows::UnitRange{Int},
     column_first::Int,
     nblk::Int,
-    slice_stride::Int,
-    group::Int,
+    layout::LookupLayout,
     width::Val{W},
     count::Val{NV},
 ) where {T <: SIMD_FLOAT, W, NV}
+    slice_stride = layout.slice_stride
+    row_last = last(rows)
     slice = NV * W
     k = size(out, 2)
-    _lookup_transpose!(blk, row_span, packed, row_first, row_last,
-                       column_first, nblk)
+    _lookup_transpose!(blk, layout.row_span, packed, rows, column_first, nblk)
     for rhs_column in 1:slice:k
-        valid = min(slice, k - rhs_column + 1)
+        tile_columns = rhs_column:min(rhs_column + slice - 1, k)
         slice_offset = ((rhs_column - 1) ÷ slice) * slice_stride
-        for tile_first in row_first:LOOKUP_ROW_TILE:row_last
-            tile_rows = min(LOOKUP_ROW_TILE, row_last - tile_first + 1)
+        for tile_first in first(rows):LOOKUP_ROW_TILE:row_last
+            tile_rows =
+                tile_first:min(tile_first + LOOKUP_ROW_TILE - 1, row_last)
             _lookup_gather_tile!(
-                tile, tile_offset, tables, blk, row_span, tile_first,
-                tile_rows, nblk, group, slice_offset, width, count,
+                workspace, tile_offset, blk, tile_rows, nblk, slice_offset,
+                layout, width, count,
             )
             _lookup_flush_tile!(
-                out, tile, tile_offset, tile_first, tile_rows, rhs_column,
-                valid, slice,
+                out, workspace, tile_offset, tile_rows, tile_columns, slice,
             )
         end
     end

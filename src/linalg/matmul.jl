@@ -118,19 +118,19 @@ zero-filling the lanes beyond `length(tile_columns)`.
 end
 
 """
-    _load_panel_vectors(panel, offset, unroll, width)
+    _load_vectors(x, offset, ::Val{count}, ::Val{W})
 
-Load the `U` consecutive `Vec{W,T}` vectors of `panel` that start at
+Load the `count` consecutive `Vec{W, T}` vectors of `x` that start at
 element `offset + 1`.
 """
-@inline function _load_panel_vectors(
-    panel::Vector{T},
+@inline function _load_vectors(
+    x::Vector{T},
     offset::Int,
-    ::Val{U},
+    ::Val{count},
     ::Val{W},
-) where {T <: SIMD_FLOAT, U, W}
-    return ntuple(Val(U)) do block
-        @inbounds panel[VecRange{W}(offset + (block - 1) * W + 1)]
+) where {T <: SIMD_FLOAT, count, W}
+    return ntuple(Val(count)) do block
+        @inbounds x[VecRange{W}(offset + (block - 1) * W + 1)]
     end
 end
 
@@ -179,7 +179,7 @@ over SNP `columns`, then add it into `task.out[:, tile_columns]`.
     accumulators = _zero_accumulators(T, tile_rows, unroll, width)
     offset = task.panel_offset
     for column in columns
-        rhs_vectors = _load_panel_vectors(panel, offset, unroll, width)
+        rhs_vectors = _load_vectors(panel, offset, unroll, width)
         accumulators = _multiply_add_rows(
             accumulators, packed, values, rhs_vectors, row, column,
         )
@@ -380,7 +380,7 @@ SNP `column` over samples `rows`, then add it into `task.out` at row
     while row + 3 <= row_last
         bytes = _load_packed_bytes(packed, byte_index, column, tile_width)
         for s in 0:3
-            rhs_vectors = _load_panel_vectors(
+            rhs_vectors = _load_vectors(
                 panel, offset + s * lanes, unroll, width,
             )
             accumulators = _multiply_add_columns(
@@ -392,7 +392,7 @@ SNP `column` over samples `rows`, then add it into `task.out` at row
         byte_index += 1
     end
     while row <= row_last
-        rhs_vectors = _load_panel_vectors(panel, offset, unroll, width)
+        rhs_vectors = _load_vectors(panel, offset, unroll, width)
         accumulators = _multiply_add_columns(
             accumulators, packed, values, rhs_vectors, row, column,
         )
