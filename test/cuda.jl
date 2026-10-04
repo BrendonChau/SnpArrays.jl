@@ -236,10 +236,10 @@ end
             scale = rand(rng, TV, n)
             V = zeros(TV, m, k)
             U = zeros(TV, n, k)
-            streamed_grm_mul!(V, stream, Q; scale, U)
+            streamed_grm_mul!(V, U, stream, Q; scale)
             Vd = CuMatrix{TV}(undef, m, k)
             Ud = CuMatrix{TV}(undef, n, k)
-            streamed_grm_mul!(Vd, stream, CuArray(Q); scale, U=Ud)
+            streamed_grm_mul!(Vd, Ud, stream, CuArray(Q); scale)
             @test relerr(Array(Vd), V) < rtol
             @test relerr(Array(Ud), U) < rtol
             streamed_grm_mul!(V, stream, Q)

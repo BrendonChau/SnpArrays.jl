@@ -72,6 +72,36 @@ function streamed_grm_mul!(
 end
 
 """
+    _check_streamed_grm_dims(V, Q, U, scale, m, n, k) -> nothing
+
+Throw a `DimensionMismatch` unless `V` is `m × k`, `Q` has `m` rows, `U`
+(when given) is `n × k`, and a vector `scale` has length `n`.
+"""
+function _check_streamed_grm_dims(
+    V::AbstractMatrix,
+    Q::AbstractMatrix,
+    U::Union{Nothing, AbstractMatrix},
+    scale::Union{Number, AbstractVector},
+    m::Int,
+    n::Int,
+    k::Int,
+)
+    size(V) == (m, k) || throw(DimensionMismatch(
+        "V has size $(size(V)); expected $((m, k))",
+    ))
+    size(Q, 1) == m || throw(DimensionMismatch(
+        "Q has $(size(Q, 1)) rows; expected $m",
+    ))
+    U === nothing || size(U) == (n, k) || throw(DimensionMismatch(
+        "U has size $(size(U)); expected $((n, k))",
+    ))
+    scale isa Number || length(scale) == n || throw(DimensionMismatch(
+        "scale has length $(length(scale)); expected $n",
+    ))
+    return nothing
+end
+
+"""
     _streamed_grm_mul!(V, U, stream, Q, scale) -> V
 
 Check the arguments, zero `V`, and add each chunk's
@@ -91,18 +121,7 @@ function _streamed_grm_mul!(
     ))
     m, n = size(stream)
     k = size(Q, 2)
-    size(V) == (m, k) || throw(DimensionMismatch(
-        "V has size $(size(V)); expected $((m, k))",
-    ))
-    size(Q, 1) == m || throw(DimensionMismatch(
-        "Q has $(size(Q, 1)) rows; expected $m",
-    ))
-    U === nothing || size(U) == (n, k) || throw(DimensionMismatch(
-        "U has size $(size(U)); expected $((n, k))",
-    ))
-    scale isa TV || length(scale) == n || throw(DimensionMismatch(
-        "scale has length $(length(scale)); expected $n",
-    ))
+    _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
 
     mixed = TV !== TS
     Q_stream = mixed ? Matrix{TS}(Q) : Q
