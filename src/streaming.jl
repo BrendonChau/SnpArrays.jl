@@ -541,3 +541,42 @@ function streamed_grm_mul!(
     _streamed_grm_mul!(V, stream, Q32, scale32, U, V_scratch)
     return V
 end
+
+"""
+    streamed_mul!(out, stream::SnpLinAlgStream, X; transpose=false,
+                  slots=3) -> out
+
+Compute `out = A * X`, or `out = transpose(A) * X` with `transpose=true`,
+for the genotype matrix `A` behind `stream` in one pass over its chunks,
+without holding `A` in memory. Each chunk uses the stream's lookup values,
+so the result matches the `SnpLinAlg` products of `stream`'s chunks.
+
+`out` and `X` are `AbstractMatrix`es, each chunk's product runs on the
+`SnpLinAlg` kernels, and `slots` is ignored.
+"""
+function streamed_mul!(
+    out::AbstractMatrix{T},
+    stream::SnpLinAlgStream{T},
+    X::AbstractMatrix{T};
+    transpose::Bool = false,
+    slots::Integer = 3,
+) where T <: AbstractFloat
+    m, n = size(stream)
+    k = size(X, 2)
+    rows, inner = transpose ? (n, m) : (m, n)
+    size(X, 1) == inner || throw(DimensionMismatch(
+        "right-hand side has $(size(X, 1)) rows; expected $inner",
+    ))
+    size(out) == (rows, k) || throw(DimensionMismatch(
+        "output has size $(size(out)); expected $((rows, k))",
+    ))
+    fill!(out, zero(T))
+    for (cols, chunk) in stream
+        if transpose
+            mul!(view(out, cols, :), Base.transpose(chunk), X)
+        else
+            mul!(out, chunk, view(X, cols, :), one(T), one(T))
+        end
+    end
+    return out
+end

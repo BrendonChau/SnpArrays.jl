@@ -227,6 +227,31 @@ end
     end
 end
 
+@testset "streamed_mul!" begin
+    m, n = size(eur_full)
+    for T in (Float32, Float64)
+        sla = SnpLinAlg{T}(eur_full; center = true, scale = true,
+                           impute = true)
+        stream = SnpLinAlgStream{T}(SnpArrays.datadir("EUR_subset.bed");
+                                    width = 500, center = true, scale = true)
+        tolerance = T == Float32 ? 1e-5 : 1e-12
+        for k in (1, 8)
+            X = randn(Xoshiro(4), T, n, k)
+            Y = randn(Xoshiro(5), T, m, k)
+            out = streamed_mul!(fill(T(NaN), m, k), stream, X)
+            @test norm(out - sla * X) / norm(sla * X) < tolerance
+            out = streamed_mul!(fill(T(NaN), n, k), stream, Y;
+                                transpose = true)
+            expected = transpose(sla) * Y
+            @test norm(out - expected) / norm(expected) < tolerance
+        end
+        @test_throws DimensionMismatch streamed_mul!(zeros(T, m, 2), stream,
+                                                     zeros(T, n + 1, 2))
+        @test_throws DimensionMismatch streamed_mul!(zeros(T, n, 2), stream,
+                                                     zeros(T, m, 2))
+    end
+end
+
 @testset "five-argument forward mul!" begin
     m, n = size(eur_full)
     for T in (Float32, Float64)

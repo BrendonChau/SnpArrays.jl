@@ -16,7 +16,7 @@ import SpecialFunctions: gamma_inc
 import Tables: table
 export AbstractSnpArray, AbstractSnpBitMatrix, AbstractSnpLinAlg
 export SnpArray, SnpBitMatrix, SnpLinAlg, SnpLinAlgStream, SnpData, StackedSnpArray
-export streamed_grm_mul!
+export streamed_grm_mul!, streamed_mul!
 export simulate!
 export compress_plink, decompress_plink, split_plink, merge_plink, write_plink 
 export counts, grm, grm_admixture, maf, mean, mean!, minorallele
