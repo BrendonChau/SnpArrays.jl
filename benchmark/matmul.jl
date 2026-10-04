@@ -1,12 +1,12 @@
-# Benchmark the SnpLinAlg matrix products A*X and Aᵀ*X with k right-hand sides
-# on a PLINK bed file.
+# Time the SnpLinAlg matrix products A*X and Aᵀ*X with k right-hand sides on a
+# PLINK bed file.
 #
-#     julia -t N --project=. benchmark/matmul.jl \
-#       [bed] [k] [repeats] [results_dir]
+#     julia -t N --project=. benchmark/matmul.jl [bed] [k] [results_dir]
 #
+# Each product runs once, with no warm-up, so its time includes compilation.
 # The report is also written to a timestamped markdown file in `results_dir`.
 # Defaults: bed = the synthetic chromosome 21 genotypes below, k = 128,
-# repeats = 3, results_dir = `results/` next to this script.
+# results_dir = `results/` next to this script.
 using Dates
 using LinearAlgebra
 using Printf
@@ -16,8 +16,7 @@ using SnpArrays
 const BED = length(ARGS) >= 1 ? ARGS[1] :
     "/u/scratch/b/bhchau/cudaext_check/synthetic_v1_chr-21.bed"
 const K = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 128
-const REPEATS = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 3
-const RESULTS_DIR = length(ARGS) >= 4 ? ARGS[4] : joinpath(@__DIR__, "results")
+const RESULTS_DIR = length(ARGS) >= 3 ? ARGS[3] : joinpath(@__DIR__, "results")
 
 """
     has_fork_internals() -> Bool
@@ -80,41 +79,27 @@ function print_header(io::IO, m::Int, n::Int)
     print_fact(io, "bed", BED)
     print_fact(io, "m, n", "m = $(m), n = $(n)")
     print_fact(io, "k", K)
-    print_fact(io, "repeats", REPEATS)
     isdefined(SnpArrays, :VECTOR_BYTES) &&
         print_fact(io, "VECTOR_BYTES", SnpArrays.VECTOR_BYTES[])
     return nothing
 end
 
 """
-    time_call(f!, args...; repeats) -> (minimum, median)
+    print_row(io, ::Type{T}, product, variant, seconds, fmas)
 
-Time `f!(args...)` in seconds, after one warm-up call.
-"""
-function time_call(f!::F, args...; repeats::Int) where F
-    f!(args...)
-    times = [@elapsed f!(args...) for _ in 1:repeats]
-    sort!(times)
-    return times[1], times[(repeats + 1) ÷ 2]
-end
-
-"""
-    print_row(io, ::Type{T}, product, variant, times, fmas)
-
-Print one row of the timing table; `times` is `(minimum, median)` in seconds.
+Print one row of the timing table.
 """
 function print_row(
     io::IO,
     ::Type{T},
     product::AbstractString,
     variant::AbstractString,
-    times::NTuple{2, Float64},
+    seconds::Float64,
     fmas::Float64,
 ) where T
     emit(io, @sprintf(
-        "| %s | %s | %d | %s | %.3f | %.3f | %.2f |",
-        T, product, K, variant, 1000 * times[1], 1000 * times[2],
-        fmas / times[1] / 1e9,
+        "| %s | %s | %d | %s | %.3f | %.2f |",
+        T, product, K, variant, seconds, fmas / seconds / 1e9,
     ))
     return nothing
 end
@@ -153,11 +138,10 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
     AtX = Matrix{T}(undef, n, K)
     fmas = Float64(m) * n * K
     print_row(io, T, "A*X", matrix_variant(m, K),
-              time_call(mul!, AX, operator, X; repeats = REPEATS), fmas)
+              @elapsed(mul!(AX, operator, X)), fmas)
     print_row(io, T, "Aᵀ*X",
               has_fork_internals() ? "mul! (register-tiled)" : "mul!",
-              time_call(mul!, AtX, transpose(operator), Y; repeats = REPEATS),
-              fmas)
+              @elapsed(mul!(AtX, transpose(operator), Y)), fmas)
     return [checksum_row(T, "A*X", AX), checksum_row(T, "Aᵀ*X", AtX)]
 end
 
@@ -173,9 +157,8 @@ function main()
     emit(io, "")
     emit(io, "## Timings")
     emit(io, "")
-    emit(io, "| Type | Product | k | Variant | min ms | median ms | " *
-             "GFMA/s |")
-    emit(io, "|---|---|---:|---|---:|---:|---:|")
+    emit(io, "| Type | Product | k | Variant | seconds | GFMA/s |")
+    emit(io, "|---|---|---:|---|---:|---:|")
     checksums = String[]
     for T in (Float32, Float64)
         append!(checksums, run_type(io, T, G))
