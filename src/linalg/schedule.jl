@@ -22,7 +22,7 @@ function _snparray_ax_schedule!(
             row_last = min(row_first + row_step - 1, rows_filled)
             @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
             Threads.@spawn _snparray_ax_kernel!(
-                out, packed, rhs, values, $row_first, $row_last, 1, n,
+                out, packed, rhs, values, $(row_first:row_last), 1:n,
             )
         end
     end
@@ -99,12 +99,14 @@ function _snparray_AX_schedule!(
             for row_first in 1:row_step:rows_filled
                 row_last = min(row_first + row_step - 1, rows_filled)
                 @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
-                panel_offset = task_index * panel_length
+                tile_task = RegisterTileTask(
+                    out, packed, values, workspace,
+                    task_index * panel_length, 0,
+                )
                 task_index += 1
                 Threads.@spawn _snparray_AX_task!(
-                    out, packed, rhs, values, workspace, $panel_offset,
-                    $row_first, $row_last, $column_step, $rhs_first,
-                    $rhs_last, $width,
+                    $tile_task, rhs, $(row_first:row_last), $column_step,
+                    $(rhs_first:rhs_last), $width,
                 )
             end
         end
@@ -261,8 +263,8 @@ function _snparray_atx_schedule!(
                         "row_first must be ≡ 1 (mod 4)",
                     )
                     _snparray_atx_kernel!(
-                        out, packed, rhs, values, row_first, row_last,
-                        $column_first, $column_last, $out_offset,
+                        out, packed, rhs, values, row_first:row_last,
+                        $(column_first:column_last), $out_offset,
                     )
                 end
             end
@@ -307,12 +309,15 @@ function _snparray_AtX_schedule!(
             rhs_last = min(rhs_first + rhs_step - 1, k)
             for column_first in first(cols):column_step:last(cols)
                 column_last = min(column_first + column_step - 1, last(cols))
-                panel_offset = task_index * panel_length
+                tile_task = RegisterTileTask(
+                    out, packed, values, workspace,
+                    task_index * panel_length, out_offset,
+                )
                 task_index += 1
                 Threads.@spawn _snparray_AtX_task!(
-                    out, packed, rhs, values, workspace, $panel_offset,
-                    $row_step, rows_filled, $column_first, $column_last,
-                    $rhs_first, $rhs_last, $out_offset, $width,
+                    $tile_task, rhs, $row_step, rows_filled,
+                    $(column_first:column_last), $(rhs_first:rhs_last),
+                    $width,
                 )
             end
         end

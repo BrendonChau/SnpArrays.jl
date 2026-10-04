@@ -5,14 +5,12 @@ function _snparray_ax_kernel!(
     packed::AbstractMatrix{UInt8},
     rhs::AbstractVector,
     values::AbstractMatrix,
-    row_first::Int,
-    row_last::Int,
-    column_first::Int,
-    column_last::Int,
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
 )
-    @inbounds for column in column_first:column_last
+    @inbounds for column in columns
         rhs_value = rhs[column]
-        for row in row_first:row_last
+        for row in rows
             idx = _unsafe_getindex(packed, row, column) + 1
             out[row] += values[idx, column] * rhs_value
         end
@@ -21,23 +19,20 @@ function _snparray_ax_kernel!(
 end
 
 function _snparray_AX_task!(
-    out::AbstractMatrix,
-    packed::AbstractMatrix{UInt8},
+    task::RegisterTileTask,
     rhs::AbstractMatrix,
-    values::AbstractMatrix,
-    panel::Vector,
-    panel_offset::Int,
-    row_first::Int,
-    row_last::Int,
+    rows::UnitRange{Int},
     column_step::Int,
-    rhs_first::Int,
-    rhs_last::Int,
+    rhs_columns::UnitRange{Int},
     ::Val,
 )
-    @inbounds for rhs_column in rhs_first:rhs_last
+    out = task.out
+    packed = task.packed
+    values = task.values
+    @inbounds for rhs_column in rhs_columns
         for column in 1:size(packed, 2)
             rhs_value = rhs[column, rhs_column]
-            for row in row_first:row_last
+            for row in rows
                 idx = _unsafe_getindex(packed, row, column) + 1
                 out[row, rhs_column] += values[idx, column] * rhs_value
             end
@@ -51,15 +46,13 @@ function _snparray_atx_kernel!(
     packed::AbstractMatrix{UInt8},
     rhs::AbstractVector,
     values::AbstractMatrix,
-    row_first::Int,
-    row_last::Int,
-    column_first::Int,
-    column_last::Int,
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
     out_offset::Int,
 )
-    @inbounds for column in column_first:column_last
+    @inbounds for column in columns
         total = out[column - out_offset]
-        for row in row_first:row_last
+        for row in rows
             idx = _unsafe_getindex(packed, row, column) + 1
             total += values[idx, column] * rhs[row]
         end
@@ -69,23 +62,20 @@ function _snparray_atx_kernel!(
 end
 
 function _snparray_AtX_task!(
-    out::AbstractMatrix,
-    packed::AbstractMatrix{UInt8},
+    task::RegisterTileTask,
     rhs::AbstractMatrix,
-    values::AbstractMatrix,
-    panel::Vector,
-    panel_offset::Int,
     row_step::Int,
     rows_filled::Int,
-    column_first::Int,
-    column_last::Int,
-    rhs_first::Int,
-    rhs_last::Int,
-    out_offset::Int,
+    columns::UnitRange{Int},
+    rhs_columns::UnitRange{Int},
     ::Val,
 )
-    @inbounds for rhs_column in rhs_first:rhs_last
-        for column in column_first:column_last
+    out = task.out
+    packed = task.packed
+    values = task.values
+    out_offset = task.out_offset
+    @inbounds for rhs_column in rhs_columns
+        for column in columns
             total = out[column - out_offset, rhs_column]
             for row in 1:rows_filled
                 idx = _unsafe_getindex(packed, row, column) + 1

@@ -1,4 +1,22 @@
 """
+    RegisterTileTask(out, packed, values, panel, panel_offset, out_offset)
+
+The arrays one register-tiled `A*X` or `transpose(A)*X` task works on. The
+task packs rhs values into the slice of `panel` after `panel_offset`, and
+adds the tile for SNP column `j` into `out` row `j - out_offset`
+(`out_offset = 0` for `A*X`).
+"""
+struct RegisterTileTask{T, O <: AbstractMatrix{T}, P <: AbstractMatrix{UInt8},
+                        V <: AbstractMatrix{T}}
+    out::O
+    packed::P
+    values::V
+    panel::Vector{T}
+    panel_offset::Int    # this task's slice of `panel` starts after it
+    out_offset::Int      # SNP column minus `out` row; 0 for A*X
+end
+
+"""
     _fill_blocks(value, ::Val{U})
 
 Return a length-`U` tuple with every entry set to `value`.
@@ -24,31 +42,73 @@ the scalar `left` to every one of the `U` blocks.
 end
 
 """
-    _pack_rhs_panel!(panel, panel_offset, rhs, column_first, column_last,
-        rhs_column, valid, unroll, width)
+    _zero_accumulators(T, ::Val{MR}, ::Val{U}, ::Val{W})
 
-Copy the `valid` rhs columns starting at `rhs_column` of SNP rows
-`column_first:column_last` into `panel` at `panel_offset` so that the
-`U * W` lanes of one SNP row are contiguous, zero-filling the lanes beyond
-`valid`. `panel` is shared between concurrent tasks, each writing the slice
-that starts at its own `panel_offset`.
+Return `MR` rows of `U` zero `Vec{W,T}` accumulators.
+"""
+@inline function _zero_accumulators(
+    ::Type{T},
+    ::Val{MR},
+    unroll::Val{U},
+    ::Val{W},
+) where {T <: SIMD_FLOAT, MR, U, W}
+    return ntuple(_ -> _fill_blocks(zero(Vec{W, T}), unroll), Val(MR))
+end
+
+"""
+    _add_register_tile!(out, accumulators, out_row, tile_columns)
+
+Add the leading `length(tile_columns)` lanes of accumulator row `i` into
+`out[out_row + i - 1, tile_columns]`.
+"""
+@inline function _add_register_tile!(
+    out::AbstractMatrix{T},
+    accumulators::NTuple{MR, NTuple{U, Vec{W, T}}},
+    out_row::Int,
+    tile_columns::UnitRange{Int},
+) where {T <: SIMD_FLOAT, MR, U, W}
+    valid = length(tile_columns)
+    rhs_column = first(tile_columns)
+    @inbounds for i in 1:MR
+        blocks = accumulators[i]
+        for block in 1:U
+            vector = blocks[block]
+            for lane in 1:W
+                position = (block - 1) * W + lane
+                position <= valid || break
+                out[out_row + i - 1, rhs_column + position - 1] +=
+                    vector[lane]
+            end
+        end
+    end
+    return out
+end
+
+"""
+    _pack_rhs_panel!(task, rhs, rhs_rows, tile_columns, ::Val{U}, ::Val{W})
+
+Copy `rhs[rhs_rows, tile_columns]` into `task.panel` after
+`task.panel_offset` so that the `U * W` lanes of one rhs row are contiguous,
+zero-filling the lanes beyond `length(tile_columns)`.
 """
 @inline function _pack_rhs_panel!(
-    panel::Vector{T},
-    panel_offset::Int,
+    task::RegisterTileTask{T},
     rhs::StridedMatrix{T},
-    column_first::Int,
-    column_last::Int,
-    rhs_column::Int,
-    valid::Int,
+    rhs_rows::UnitRange{Int},
+    tile_columns::UnitRange{Int},
     ::Val{U},
     ::Val{W},
 ) where {T <: SIMD_FLOAT, U, W}
+    panel = task.panel
+    panel_offset = task.panel_offset
+    row_first = first(rhs_rows)
+    rhs_column = first(tile_columns)
+    valid = length(tile_columns)
     lanes = U * W
-    @inbounds for j in 1:(column_last - column_first + 1)
+    @inbounds for j in 1:length(rhs_rows)
         base = panel_offset + (j - 1) * lanes
         for t in 1:valid
-            panel[base + t] = rhs[column_first + j - 1, rhs_column + t - 1]
+            panel[base + t] = rhs[row_first + j - 1, rhs_column + t - 1]
         end
         for t in (valid + 1):lanes
             panel[base + t] = zero(T)
@@ -98,182 +158,153 @@ Fuse the genotypes of samples `row:row + MR - 1` at SNP `column` into the
 end
 
 """
-    _snparray_AX_register_tile!(out, packed, values, panel, panel_offset, row,
-        column_first, column_last, rhs_column, valid, rows, unroll, width)
+    _snparray_AX_register_tile!(task, row, columns, tile_columns, ::Val{MR},
+        ::Val{U}, ::Val{W})
 
-Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
-`row` and rhs column `rhs_column` over the SNP columns
-`column_first:column_last`, then add the `valid` leading lanes into `out`.
+Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample `row`
+over SNP `columns`, then add it into `task.out[:, tile_columns]`.
 """
 @inline function _snparray_AX_register_tile!(
-    out::StridedMatrix{T},
-    packed::Matrix{UInt8},
-    values::Matrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
+    task::RegisterTileTask{T},
     row::Int,
-    column_first::Int,
-    column_last::Int,
-    rhs_column::Int,
-    valid::Int,
-    ::Val{MR},
+    columns::UnitRange{Int},
+    tile_columns::UnitRange{Int},
+    tile_rows::Val{MR},
     unroll::Val{U},
-    ::Val{W},
+    width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, U, W}
-    accumulators = ntuple(_ -> _fill_blocks(zero(Vec{W, T}), unroll), Val(MR))
-    offset = panel_offset
-    for column in column_first:column_last
-        rhs_vectors = _load_panel_vectors(panel, offset, unroll, Val(W))
+    packed = task.packed
+    values = task.values
+    panel = task.panel
+    accumulators = _zero_accumulators(T, tile_rows, unroll, width)
+    offset = task.panel_offset
+    for column in columns
+        rhs_vectors = _load_panel_vectors(panel, offset, unroll, width)
         accumulators = _multiply_add_rows(
             accumulators, packed, values, rhs_vectors, row, column,
         )
         offset += U * W
     end
-    @inbounds for i in 1:MR
-        blocks = accumulators[i]
-        for block in 1:U
-            vector = blocks[block]
-            for lane in 1:W
-                position = (block - 1) * W + lane
-                position <= valid || break
-                out[row + i - 1, rhs_column + position - 1] += vector[lane]
-            end
-        end
-    end
-    return out
+    return _add_register_tile!(task.out, accumulators, row, tile_columns)
 end
 
 """
-    _snparray_AX_row_sweep!(out, packed, values, panel, panel_offset,
-        row_first, row_last, column_first, column_last, rhs_column, valid,
-        rows, unroll, width)
+    _snparray_AX_row_sweep!(task, rows, columns, tile_columns, ::Val{MR},
+        ::Val{U}, ::Val{W})
 
-Sweep samples `row_first:row_last` with `MR`-row register tiles, finishing
-the tail one sample at a time.
+Sweep samples `rows` with `MR`-row register tiles, finishing the tail one
+sample at a time.
 """
 @inline function _snparray_AX_row_sweep!(
-    out::StridedMatrix{T},
-    packed::Matrix{UInt8},
-    values::Matrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
-    row_first::Int,
-    row_last::Int,
-    column_first::Int,
-    column_last::Int,
-    rhs_column::Int,
-    valid::Int,
-    rows::Val{MR},
+    task::RegisterTileTask{T},
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
+    tile_columns::UnitRange{Int},
+    tile_rows::Val{MR},
     unroll::Val{U},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, U, W}
-    row = row_first
+    row = first(rows)
+    row_last = last(rows)
     while row + MR - 1 <= row_last
         _snparray_AX_register_tile!(
-            out, packed, values, panel, panel_offset, row, column_first,
-            column_last, rhs_column, valid, rows, unroll, width,
+            task, row, columns, tile_columns, tile_rows, unroll, width,
         )
         row += MR
     end
     while row <= row_last
         _snparray_AX_register_tile!(
-            out, packed, values, panel, panel_offset, row, column_first,
-            column_last, rhs_column, valid, Val(1), unroll, width,
+            task, row, columns, tile_columns, Val(1), unroll, width,
         )
         row += 1
     end
-    return out
+    return task.out
 end
 
 """
-    _snparray_AX_blocks!(out, packed, rhs, values, panel, panel_offset,
-        row_first, row_last, column_step, rhs_first, rhs_last, rows, width)
+    _snparray_AX_rhs_tile!(task, rhs, rows, columns, tile_columns, ::Val{MR},
+        ::Val{U}, ::Val{W})
+
+Pack `rhs[columns, tile_columns]` into the task's panel, then sweep samples
+`rows` over it.
+"""
+@inline function _snparray_AX_rhs_tile!(
+    task::RegisterTileTask{T},
+    rhs::StridedMatrix{T},
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
+    tile_columns::UnitRange{Int},
+    tile_rows::Val{MR},
+    unroll::Val{U},
+    width::Val{W},
+) where {T <: SIMD_FLOAT, MR, U, W}
+    _pack_rhs_panel!(task, rhs, columns, tile_columns, unroll, width)
+    return _snparray_AX_row_sweep!(
+        task, rows, columns, tile_columns, tile_rows, unroll, width,
+    )
+end
+
+"""
+    _snparray_AX_blocks!(task, rhs, rows, column_step, rhs_columns,
+        ::Val{MR}, ::Val{W})
 
 Run one `A*X` task with a compile-time tile height `MR`, looping over SNP
 column blocks of width `column_step` and rhs tiles of width `2W`.
 """
 function _snparray_AX_blocks!(
-    out::StridedMatrix{T},
-    packed::Matrix{UInt8},
+    task::RegisterTileTask{T},
     rhs::StridedMatrix{T},
-    values::Matrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
-    row_first::Int,
-    row_last::Int,
+    rows::UnitRange{Int},
     column_step::Int,
-    rhs_first::Int,
-    rhs_last::Int,
-    rows::Val{MR},
+    rhs_columns::UnitRange{Int},
+    tile_rows::Val{MR},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, W}
-    n = size(packed, 2)
+    n = size(task.packed, 2)
+    rhs_last = last(rhs_columns)
     for column_first in 1:column_step:n
-        column_last = min(column_first + column_step - 1, n)
-        rhs_column = rhs_first
+        columns = column_first:min(column_first + column_step - 1, n)
+        rhs_column = first(rhs_columns)
         while rhs_column <= rhs_last
-            valid = min(2W, rhs_last - rhs_column + 1)
-            if valid <= W
-                _pack_rhs_panel!(
-                    panel, panel_offset, rhs, column_first, column_last,
-                    rhs_column, valid, Val(1), width,
-                )
-                _snparray_AX_row_sweep!(
-                    out, packed, values, panel, panel_offset, row_first,
-                    row_last, column_first, column_last, rhs_column, valid,
-                    rows, Val(1), width,
+            tile_columns = rhs_column:min(rhs_column + 2W - 1, rhs_last)
+            if length(tile_columns) <= W
+                _snparray_AX_rhs_tile!(
+                    task, rhs, rows, columns, tile_columns, tile_rows,
+                    Val(1), width,
                 )
             else
-                _pack_rhs_panel!(
-                    panel, panel_offset, rhs, column_first, column_last,
-                    rhs_column, valid, Val(2), width,
-                )
-                _snparray_AX_row_sweep!(
-                    out, packed, values, panel, panel_offset, row_first,
-                    row_last, column_first, column_last, rhs_column, valid,
-                    rows, Val(2), width,
+                _snparray_AX_rhs_tile!(
+                    task, rhs, rows, columns, tile_columns, tile_rows,
+                    Val(2), width,
                 )
             end
             rhs_column += 2W
         end
     end
-    return out
+    return task.out
 end
 
 """
-    _snparray_AX_task!(out, packed, rhs, values, panel, panel_offset,
-        row_first, row_last, column_step, rhs_first, rhs_last, width)
+    _snparray_AX_task!(task, rhs, rows, column_step, rhs_columns, width)
 
-Run one `A*X` task over samples `row_first:row_last` and rhs columns
-`rhs_first:rhs_last`, blocking the SNP columns into `column_step`-wide
-inner tiles and accumulating each `MR x 2W` register tile in registers.
-
-The tile shape is `(MR, NR) = _register_tile_shape(T)`. The rhs values of
-one SNP column are packed contiguously into the `2W * column_step` elements
-of `panel` that start at `panel_offset`, zero-padded past the last rhs column
-of a partial tile, so each column contributes `U` full vector loads. On a
-Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with no
-spills, 19 of 32 registers live.
+Run one `A*X` task over samples `rows` and rhs columns `rhs_columns`,
+blocking the SNP columns into `column_step`-wide inner tiles and holding
+each `MR x 2W` tile, `(MR, NR) = _register_tile_shape(T)`, in registers.
+On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with
+no spills, 19 of 32 registers live.
 """
 function _snparray_AX_task!(
-    out::StridedMatrix{T},
-    packed::Matrix{UInt8},
+    task::RegisterTileTask{T, <:StridedMatrix{T}, Matrix{UInt8}, Matrix{T}},
     rhs::StridedMatrix{T},
-    values::Matrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
-    row_first::Int,
-    row_last::Int,
+    rows::UnitRange{Int},
     column_step::Int,
-    rhs_first::Int,
-    rhs_last::Int,
+    rhs_columns::UnitRange{Int},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, W}
-    size(packed, 2) == 0 && return out
+    size(task.packed, 2) == 0 && return task.out
     tile_rows, _ = _register_tile_shape(T)
     return _snparray_AX_blocks!(
-        out, packed, rhs, values, panel, panel_offset, row_first, row_last,
-        column_step, rhs_first, rhs_last, Val(tile_rows), width,
+        task, rhs, rows, column_step, rhs_columns, Val(tile_rows), width,
     )
 end
 
@@ -340,39 +371,35 @@ Fuse the genotypes of sample `row` at the `MR` SNP columns starting at
 end
 
 """
-    _snparray_AtX_register_tile!(out, packed, values, panel, panel_offset,
-        row_first, row_last, column, rhs_column, valid, out_offset, rows,
-        unroll, width)
+    _snparray_AtX_register_tile!(task, rows, column, tile_columns, ::Val{MR},
+        ::Val{U}, ::Val{W})
 
 Accumulate the `MR x (U * W)` register tile of `transpose(A)*X` rooted at
-SNP `column` and rhs column `rhs_column` over the samples
-`row_first:row_last`, then add the `valid` leading lanes into `out` at row
-`column - out_offset`.
+SNP `column` over samples `rows`, then add it into `task.out` at row
+`column - task.out_offset`, columns `tile_columns`.
 """
 @inline function _snparray_AtX_register_tile!(
-    out::StridedMatrix{T},
-    packed::StridedMatrix{UInt8},
-    values::StridedMatrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
-    row_first::Int,
-    row_last::Int,
+    task::RegisterTileTask{T},
+    rows::UnitRange{Int},
     column::Int,
-    rhs_column::Int,
-    valid::Int,
-    out_offset::Int,
-    rows::Val{MR},
+    tile_columns::UnitRange{Int},
+    tile_width::Val{MR},
     unroll::Val{U},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, U, W}
-    accumulators = ntuple(_ -> _fill_blocks(zero(Vec{W, T}), unroll), Val(MR))
+    packed = task.packed
+    values = task.values
+    panel = task.panel
+    row_first = first(rows)
+    row_last = last(rows)
+    accumulators = _zero_accumulators(T, tile_width, unroll, width)
     lanes = U * W
     byte_index = ((row_first - 1) >>> 2) + 1
     row = row_first
-    offset = panel_offset
+    offset = task.panel_offset
     # `row_first ≡ 1 (mod 4)`, so one byte per column covers four samples.
     while row + 3 <= row_last
-        bytes = _load_packed_bytes(packed, byte_index, column, rows)
+        bytes = _load_packed_bytes(packed, byte_index, column, tile_width)
         for s in 0:3
             rhs_vectors = _load_panel_vectors(
                 panel, offset + s * lanes, unroll, width,
@@ -393,161 +420,133 @@ SNP `column` and rhs column `rhs_column` over the samples
         row += 1
         offset += lanes
     end
-    @inbounds for c in 1:MR
-        blocks = accumulators[c]
-        for block in 1:U
-            vector = blocks[block]
-            for lane in 1:W
-                position = (block - 1) * W + lane
-                position <= valid || break
-                out[column - out_offset + c - 1, rhs_column + position - 1] +=
-                    vector[lane]
-            end
-        end
-    end
-    return out
+    return _add_register_tile!(
+        task.out, accumulators, column - task.out_offset, tile_columns,
+    )
 end
 
 """
-    _snparray_AtX_column_sweep!(out, packed, values, panel, panel_offset,
-        row_first, row_last, column_first, column_last, rhs_column, valid,
-        out_offset, rows, unroll, width)
+    _snparray_AtX_column_sweep!(task, rows, columns, tile_columns,
+        ::Val{MR}, ::Val{U}, ::Val{W})
 
-Sweep SNP columns `column_first:column_last` with `MR`-column register
-tiles, finishing the tail one column at a time.
+Sweep SNP `columns` with `MR`-column register tiles, finishing the tail one
+column at a time.
 """
 @inline function _snparray_AtX_column_sweep!(
-    out::StridedMatrix{T},
-    packed::StridedMatrix{UInt8},
-    values::StridedMatrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
-    row_first::Int,
-    row_last::Int,
-    column_first::Int,
-    column_last::Int,
-    rhs_column::Int,
-    valid::Int,
-    out_offset::Int,
-    rows::Val{MR},
+    task::RegisterTileTask{T},
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
+    tile_columns::UnitRange{Int},
+    tile_width::Val{MR},
     unroll::Val{U},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, U, W}
-    column = column_first
+    column = first(columns)
+    column_last = last(columns)
     while column + MR - 1 <= column_last
         _snparray_AtX_register_tile!(
-            out, packed, values, panel, panel_offset, row_first, row_last,
-            column, rhs_column, valid, out_offset, rows, unroll, width,
+            task, rows, column, tile_columns, tile_width, unroll, width,
         )
         column += MR
     end
     while column <= column_last
         _snparray_AtX_register_tile!(
-            out, packed, values, panel, panel_offset, row_first, row_last,
-            column, rhs_column, valid, out_offset, Val(1), unroll, width,
+            task, rows, column, tile_columns, Val(1), unroll, width,
         )
         column += 1
     end
-    return out
+    return task.out
 end
 
 """
-    _snparray_AtX_blocks!(out, packed, rhs, values, panel, panel_offset,
-        row_step, rows_filled, column_first, column_last, rhs_first,
-        rhs_last, out_offset, rows, width)
+    _snparray_AtX_rhs_tile!(task, rhs, rows, columns, tile_columns,
+        ::Val{MR}, ::Val{U}, ::Val{W})
+
+Pack `rhs[rows, tile_columns]` into the task's panel, then sweep SNP
+`columns` over it.
+"""
+@inline function _snparray_AtX_rhs_tile!(
+    task::RegisterTileTask{T},
+    rhs::StridedMatrix{T},
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
+    tile_columns::UnitRange{Int},
+    tile_width::Val{MR},
+    unroll::Val{U},
+    width::Val{W},
+) where {T <: SIMD_FLOAT, MR, U, W}
+    _pack_rhs_panel!(task, rhs, rows, tile_columns, unroll, width)
+    return _snparray_AtX_column_sweep!(
+        task, rows, columns, tile_columns, tile_width, unroll, width,
+    )
+end
+
+"""
+    _snparray_AtX_blocks!(task, rhs, row_step, rows_filled, columns,
+        rhs_columns, ::Val{MR}, ::Val{W})
 
 Run one `transpose(A)*X` task with a compile-time tile width `MR`, looping
 over sample blocks of `row_step` samples and rhs tiles of width `2W`.
 """
 function _snparray_AtX_blocks!(
-    out::StridedMatrix{T},
-    packed::StridedMatrix{UInt8},
+    task::RegisterTileTask{T},
     rhs::StridedMatrix{T},
-    values::StridedMatrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
     row_step::Int,
     rows_filled::Int,
-    column_first::Int,
-    column_last::Int,
-    rhs_first::Int,
-    rhs_last::Int,
-    out_offset::Int,
-    rows::Val{MR},
+    columns::UnitRange{Int},
+    rhs_columns::UnitRange{Int},
+    tile_width::Val{MR},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, W}
+    rhs_last = last(rhs_columns)
     for row_first in 1:row_step:rows_filled
-        row_last = min(row_first + row_step - 1, rows_filled)
-        rhs_column = rhs_first
+        rows = row_first:min(row_first + row_step - 1, rows_filled)
+        rhs_column = first(rhs_columns)
         while rhs_column <= rhs_last
-            valid = min(2W, rhs_last - rhs_column + 1)
-            if valid <= W
-                _pack_rhs_panel!(
-                    panel, panel_offset, rhs, row_first, row_last,
-                    rhs_column, valid, Val(1), width,
-                )
-                _snparray_AtX_column_sweep!(
-                    out, packed, values, panel, panel_offset, row_first,
-                    row_last, column_first, column_last, rhs_column, valid,
-                    out_offset, rows, Val(1), width,
+            tile_columns = rhs_column:min(rhs_column + 2W - 1, rhs_last)
+            if length(tile_columns) <= W
+                _snparray_AtX_rhs_tile!(
+                    task, rhs, rows, columns, tile_columns, tile_width,
+                    Val(1), width,
                 )
             else
-                _pack_rhs_panel!(
-                    panel, panel_offset, rhs, row_first, row_last,
-                    rhs_column, valid, Val(2), width,
-                )
-                _snparray_AtX_column_sweep!(
-                    out, packed, values, panel, panel_offset, row_first,
-                    row_last, column_first, column_last, rhs_column, valid,
-                    out_offset, rows, Val(2), width,
+                _snparray_AtX_rhs_tile!(
+                    task, rhs, rows, columns, tile_columns, tile_width,
+                    Val(2), width,
                 )
             end
             rhs_column += 2W
         end
     end
-    return out
+    return task.out
 end
 
 """
-    _snparray_AtX_task!(out, packed, rhs, values, panel, panel_offset,
-        row_step, rows_filled, column_first, column_last, rhs_first,
-        rhs_last, out_offset, width)
+    _snparray_AtX_task!(task, rhs, row_step, rows_filled, columns,
+        rhs_columns, width)
 
-Run one `transpose(A)*X` task over SNP columns `column_first:column_last`
-and rhs columns `rhs_first:rhs_last`, blocking the samples into
-`row_step`-wide inner blocks and accumulating each `MR x 2W` register tile
-in registers over a whole sample block. `column_first` and `column_last`
-index the full genotype arrays; `out_offset` shifts them onto `out`.
-
-The tile shape is `(MR, NR) = _register_tile_shape(T)`. The rhs values of
-one sample are packed contiguously into the `2W * row_step` elements of
-`panel` that start at `panel_offset`, zero-padded past the last rhs column of
-a partial tile, so each sample contributes `U` full vector loads. The
-reduction reads one packed byte per SNP column per four samples and shifts
-out the four codes. On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm
+Run one `transpose(A)*X` task over SNP `columns` (indices into the full
+genotype arrays) and rhs columns `rhs_columns`, blocking the samples into
+`row_step`-wide inner blocks and holding each `MR x 2W` tile,
+`(MR, NR) = _register_tile_shape(T)`, in registers over a whole sample
+block. On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm
 accumulators with no spills.
 """
 function _snparray_AtX_task!(
-    out::StridedMatrix{T},
-    packed::StridedMatrix{UInt8},
+    task::RegisterTileTask{
+        T, <:StridedMatrix{T}, <:StridedMatrix{UInt8}, <:StridedMatrix{T},
+    },
     rhs::StridedMatrix{T},
-    values::StridedMatrix{T},
-    panel::Vector{T},
-    panel_offset::Int,
     row_step::Int,
     rows_filled::Int,
-    column_first::Int,
-    column_last::Int,
-    rhs_first::Int,
-    rhs_last::Int,
-    out_offset::Int,
+    columns::UnitRange{Int},
+    rhs_columns::UnitRange{Int},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, W}
-    rows_filled == 0 && return out
+    rows_filled == 0 && return task.out
     tile_columns, _ = _register_tile_shape(T)
     return _snparray_AtX_blocks!(
-        out, packed, rhs, values, panel, panel_offset, row_step, rows_filled,
-        column_first, column_last, rhs_first, rhs_last, out_offset,
+        task, rhs, row_step, rows_filled, columns, rhs_columns,
         Val(tile_columns), width,
     )
 end

@@ -67,26 +67,24 @@ end
 end
 
 """
-    _snparray_ax_kernel!(out, packed, rhs, values, row_first, row_last,
-        column_first, column_last)
+    _snparray_ax_kernel!(out, packed, rhs, values, rows, columns)
 
-Accumulate `out[row_first:row_last] += A[row_first:row_last,
-column_first:column_last] * rhs[column_first:column_last]` for a
-`SnpLinAlg` matrix `A`, decoding genotypes with the 16-lane vector decode.
-Requires `row_first ≡ 1 (mod 4)`.
+Accumulate `out[rows] += A[rows, columns] * rhs[columns]` for a `SnpLinAlg`
+matrix `A`, decoding genotypes with the 16-lane vector decode. Requires
+`first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_ax_kernel!(
     out::Vector{T},
     packed::Matrix{UInt8},
     rhs::Vector{T},
     values::Matrix{T},
-    row_first::Int,
-    row_last::Int,
-    column_first::Int,
-    column_last::Int,
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
 ) where T <: SIMD_FLOAT
+    row_first = first(rows)
+    row_last = last(rows)
     vectorized_row_last = row_last - 15
-    @inbounds for column in column_first:column_last
+    @inbounds for column in columns
         rhs_value = rhs[column]
         lookup = _broadcast_lookup(values, column, Val(16))
         row = row_first
@@ -107,32 +105,27 @@ function _snparray_ax_kernel!(
 end
 
 """
-    _snparray_atx_kernel!(out, packed, rhs, values, row_first, row_last,
-        column_first, column_last, out_offset)
+    _snparray_atx_kernel!(out, packed, rhs, values, rows, columns,
+        out_offset)
 
-Accumulate `out[column_first - out_offset:column_last - out_offset] +=
-transpose(A[row_first:row_last, column_first:column_last]) *
-rhs[row_first:row_last]` for a `SnpLinAlg` matrix `A`, decoding genotypes
-with the 16-lane vector decode and reducing each column's partial vector
-with a SIMD tree reduction. Requires `row_first ≡ 1 (mod 4)`.
-
-`column_first` and `column_last` index `packed` and `values`, which are the
-full genotype arrays; `out_offset` shifts them onto `out`, so a restricted
-column range needs no view of the genotypes.
+Accumulate `out[columns .- out_offset] += transpose(A[rows, columns]) *
+rhs[rows]` for a `SnpLinAlg` matrix `A`, decoding genotypes with the 16-lane
+vector decode and a SIMD tree reduction per column. `columns` index the full
+genotype arrays `packed` and `values`; requires `first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_atx_kernel!(
     out::Vector{T},
     packed::StridedMatrix{UInt8},
     rhs::Vector{T},
     values::StridedMatrix{T},
-    row_first::Int,
-    row_last::Int,
-    column_first::Int,
-    column_last::Int,
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
     out_offset::Int,
 ) where T <: SIMD_FLOAT
+    row_first = first(rows)
+    row_last = last(rows)
     vectorized_row_last = row_last - 15
-    @inbounds for column in column_first:column_last
+    @inbounds for column in columns
         total = out[column - out_offset]
         vector_total = zero(Vec{16, T})
         lookup = _broadcast_lookup(values, column, Val(16))
