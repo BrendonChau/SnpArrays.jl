@@ -5,8 +5,10 @@
 #       [bed] [k] [width] [results_dir]
 #
 # Each product is one sweep over the file, run once with no warm-up, so its
-# time includes compilation. The right-hand sides match `matmul.jl`, so the
-# A*X and Aᵀ*X checksums are comparable with its report.
+# time includes compilation. The last row is the mixed-precision product: a
+# Float32 stream with Float64 right-hand sides and output. The right-hand
+# sides match `matmul.jl`, so the A*X and Aᵀ*X checksums are comparable with
+# its report.
 # The report is also written to a timestamped markdown file in `results_dir`.
 # Defaults: bed = the synthetic chromosome 21 genotypes below, k = 128,
 # width = 4096 SNPs per chunk, results_dir = `results/` next to this script.
@@ -86,35 +88,35 @@ function print_header(io::IO, stream::SnpLinAlgStream)
 end
 
 """
-    print_row(io, ::Type{T}, product, seconds, fmas)
+    print_row(io, type, product, seconds, fmas)
 
 Print one row of the timing table.
 """
 function print_row(
     io::IO,
-    ::Type{T},
+    type::AbstractString,
     product::AbstractString,
     seconds::Float64,
     fmas::Float64,
-) where T
+)
     emit(io, @sprintf(
         "| %s | %s | %d | %.3f | %.2f |",
-        T, product, K, seconds, fmas / seconds / 1e9,
+        type, product, K, seconds, fmas / seconds / 1e9,
     ))
     return nothing
 end
 
 """
-    checksum_row(::Type{T}, product, out) -> String
+    checksum_row(type, product, out) -> String
 
 Return the checksum table row holding `sum(abs2, out)`.
 """
 function checksum_row(
-    ::Type{T},
+    type::AbstractString,
     product::AbstractString,
-    out::Matrix{T},
-) where T
-    return @sprintf("| %s | `%s` | %.17g |", T, product, sum(abs2, out))
+    out::Matrix{<:AbstractFloat},
+)
+    return @sprintf("| %s | `%s` | %.17g |", type, product, sum(abs2, out))
 end
 
 """
@@ -131,13 +133,31 @@ function run_type(io::IO, stream::SnpLinAlgStream{T}) where T <: AbstractFloat
     AtX = Matrix{T}(undef, n, K)
     V = Matrix{T}(undef, m, K)
     fmas = Float64(m) * n * K
-    print_row(io, T, "A*X", @elapsed(streamed_mul!(AX, stream, X)), fmas)
-    print_row(io, T, "Aᵀ*X",
+    type = string(T)
+    print_row(io, type, "A*X", @elapsed(streamed_mul!(AX, stream, X)), fmas)
+    print_row(io, type, "Aᵀ*X",
               @elapsed(streamed_mul!(AtX, stream, Y; transpose = true)), fmas)
-    print_row(io, T, "A*(Aᵀ*X)/n", @elapsed(streamed_grm_mul!(V, stream, Y)),
-              2 * fmas)
-    return [checksum_row(T, "A*X", AX), checksum_row(T, "Aᵀ*X", AtX),
-            checksum_row(T, "A*(Aᵀ*X)/n", V)]
+    print_row(io, type, "A*(Aᵀ*X)/n",
+              @elapsed(streamed_grm_mul!(V, stream, Y)), 2 * fmas)
+    return [checksum_row(type, "A*X", AX), checksum_row(type, "Aᵀ*X", AtX),
+            checksum_row(type, "A*(Aᵀ*X)/n", V)]
+end
+
+"""
+    run_mixed(io, stream::SnpLinAlgStream{Float32}) -> Vector{String}
+
+Print the timing row of the mixed-precision A*(Aᵀ*X)/n, with `Float64`
+right-hand sides and output, and return its checksum row.
+"""
+function run_mixed(io::IO, stream::SnpLinAlgStream{Float32})
+    m, n = size(stream)
+    Y = randn(Xoshiro(2), Float64, m, K)
+    V = Matrix{Float64}(undef, m, K)
+    type = "Float32 stream, Float64 X"
+    print_row(io, type, "A*(Aᵀ*X)/n",
+              @elapsed(streamed_grm_mul!(V, stream, Y)),
+              2 * Float64(m) * n * K)
+    return [checksum_row(type, "A*(Aᵀ*X)/n", V)]
 end
 
 """
@@ -167,6 +187,7 @@ function main()
     for T in (Float32, Float64)
         append!(checksums, run_type(io, make_stream(T)))
     end
+    append!(checksums, run_mixed(io, make_stream(Float32)))
     emit(io, "")
     emit(io, "## Checksums")
     emit(io, "")
