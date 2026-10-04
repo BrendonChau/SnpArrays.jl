@@ -1,10 +1,7 @@
 """
     RegisterTileTask(out, packed, values, panel, panel_offset, out_offset)
 
-The arrays one register-tiled `A*X` or `transpose(A)*X` task works on. The
-task packs rhs values into the slice of `panel` after `panel_offset`, and
-adds the tile for SNP column `j` into `out` row `j - out_offset`
-(`out_offset = 0` for `A*X`).
+The arrays one register-tiled `A*X` or `transpose(A)*X` task works on.
 """
 struct RegisterTileTask{T, O <: AbstractMatrix{T}, P <: AbstractMatrix{UInt8},
                         V <: AbstractMatrix{T}}
@@ -28,8 +25,7 @@ end
 """
     _multiply_add_blocks(accumulators, left, right)
 
-Return `muladd(left, right[i], accumulators[i])` for each `i`, applying
-the scalar `left` to every one of the `U` blocks.
+Return `muladd(left, right[i], accumulators[i])` for each of the `U` blocks.
 """
 @inline function _multiply_add_blocks(
     accumulators::NTuple{U, A},

@@ -1,11 +1,9 @@
 """
     _begin_scaled_product!(out, α, β) -> Bool
 
-Prepare `out` for `out = α * product + β * out`, where a kernel then
-accumulates the unscaled product into `out`: replace `out` by
-`(β / α) * out`, which `_finish_scaled_product!` multiplies by `α`. Return
-`false` when `α` is zero; `out` then already holds `β * out` and the caller
-skips the product.
+Scale `out` so that accumulating a product into it and multiplying by `α`
+gives `α * product + β * out`, and return whether `α` is nonzero; when `α`
+is zero, `out` holds `β * out`.
 """
 function _begin_scaled_product!(
     out::AbstractVecOrMat{T},
@@ -25,8 +23,7 @@ end
 """
     _finish_scaled_product!(out, α) -> out
 
-Multiply `out`, prepared by `_begin_scaled_product!` and holding the
-accumulated product, by `α`.
+Multiply `out` by `α`.
 """
 function _finish_scaled_product!(
     out::AbstractVecOrMat{T},
@@ -40,11 +37,8 @@ end
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs)
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs, α, β)
 
-Multiply `sla` by a vector or matrix and overwrite `out`. A matrix `rhs`
-with at least `LOOKUP_MIN_RHS` columns on at least `LOOKUP_MIN_ROWS`
-samples uses the lookup-table kernel (`_snparray_AX_lookup_schedule!`); other
-shapes use the register-tiled kernel. The five-argument form computes
-`out = α * sla * rhs + β * out`.
+Multiply `sla` by a vector or matrix and overwrite `out`. The five-argument
+form computes `out = α * sla * rhs + β * out`.
 Concurrent matrix products on one `SnpLinAlg`, forward or transposed, run
 one at a time.
 """
@@ -108,9 +102,8 @@ end
 
 Multiply the transpose or adjoint of a `SnpLinAlg` by a vector or matrix and
 overwrite `out`. With a `cols::UnitRange{Int}` argument, compute
-`transpose(sla[:, cols]) * rhs` (i.e. restrict the SNP columns of `sla`
-without materializing a new `SnpLinAlg`); `out` then has `length(cols)`
-rows. The five-argument form computes
+`transpose(sla[:, cols]) * rhs`; `out` then has `length(cols)` rows. The
+five-argument form computes
 `out = α * transpose(sla) * rhs + β * out`.
 """
 function mul!(

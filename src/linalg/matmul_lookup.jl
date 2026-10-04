@@ -15,10 +15,9 @@ end
 """
     _lookup_transpose!(blk, row_span, packed, rows, column_first, nblk)
 
-Write, for samples `rows` (`first(rows) ≡ 1 (mod 4)`) and the `nblk` blocks
-of four SNP columns starting at `column_first`, one byte per (block, sample)
-holding that sample's four codes, at `blk[(b - 1) * row_span + row]`.
-Columns past `size(packed, 2)` read as code 0.
+Write into `blk` one byte per sample of `rows` and per 4-SNP block, for the
+`nblk` blocks starting at SNP `column_first`, holding the four codes of that
+sample. Requires `first(rows) ≡ 1 (mod 4)`.
 """
 function _lookup_transpose!(
     blk::Vector{UInt8},
@@ -35,6 +34,8 @@ function _lookup_transpose!(
     byte_last = ((row_last - 1) >>> 2) + 1
     @inbounds for b in 1:nblk
         j0 = column_first + 4(b - 1)
+        # Block `b`, sample `row` goes to `blk[(b - 1) * row_span + row]`;
+        # SNPs past `n` read as code 0.
         base = (b - 1) * row_span + row_first - 1
         for q in byte_first:byte_last
             x = UInt32(packed[q, j0])
@@ -70,12 +71,8 @@ end
     _lookup_build_tables!(workspace, stage_offset, n, rhs, values,
         column_first, blocks, layout, ::Val{W}, ::Val{NV})
 
-Fill, for `blocks` of the chunk starting at SNP `column_first` and every rhs
-slice `s` of width `S = NV * W`, the 256 table rows `workspace[s *
-slice_stride + ((b - 1) * 256 + code) * S + t] = Σ_l values[code_l + 1, j_l]
-* rhs[j_l, s * S + t]` over the four SNPs `j_l` of block `b`, zero past
-`size(rhs, 2)` or SNP `n`. The four rhs rows are staged in `workspace` from
-`stage_offset`.
+Fill the 256-row tables of `blocks` in the chunk starting at SNP
+`column_first`, for every rhs slice of width `NV * W`.
 """
 function _lookup_build_tables!(
     workspace::Vector{T},
@@ -97,6 +94,7 @@ function _lookup_build_tables!(
     k = size(rhs, 2)
     @inbounds for b in blocks
         j0 = column_first + 4(b - 1)
+        # Stage the rhs rows of the four SNPs, zero past SNP `n` or column `k`.
         for l in 0:3
             j = j0 + l
             offset = stage_offset + l * k_padded
@@ -112,6 +110,8 @@ function _lookup_build_tables!(
         w2 = _lookup_weights(values, j0 + 2, n)
         w3 = _lookup_weights(values, j0 + 3, n)
         table_base = (b - 1) * 256 * slice
+        # Row `code` holds the sum over the four SNPs of the value of the SNP's
+        # 2-bit code times its rhs row.
         for code in 0:255
             a0 = Vec{W, T}(w0[(code & 3) + 1])
             a1 = Vec{W, T}(w1[((code >>> 2) & 3) + 1])
@@ -172,10 +172,9 @@ end
     _lookup_gather_tile!(workspace, tile_offset, blk, tile_rows, nblk,
         slice_offset, layout, ::Val{W}, ::Val{NV})
 
-Set the row-major `length(tile_rows) x NV * W` tile at `tile_offset` to the
-sum over the `nblk` blocks of the table rows selected by `blk` for samples
-`tile_rows`, for the rhs slice whose tables start after `slice_offset`,
-sweeping `layout.group` blocks per pass.
+Set the tile at `tile_offset` to the sum over the `nblk` blocks of the table
+rows that `blk` selects for samples `tile_rows`, for the rhs slice whose
+tables start after `slice_offset`.
 """
 function _lookup_gather_tile!(
     workspace::Vector{T},
@@ -249,10 +248,8 @@ end
     _snparray_AX_lookup_gather_task!(out, packed, workspace, tile_offset, blk,
         rows, column_first, nblk, layout, ::Val{W}, ::Val{NV})
 
-Run one gather task of the lookup-table `A*X` kernel: transpose the codes
-of samples `rows` for the chunk of `nblk` blocks starting at SNP
-`column_first`, then for every `NV * W`-wide rhs slice and
-`LOOKUP_ROW_TILE`-row tile, gather the table rows and add them into `out`.
+Add into `out[rows, :]` the lookup-table product of samples `rows` with the
+chunk of `nblk` 4-SNP blocks starting at SNP `column_first`.
 """
 function _snparray_AX_lookup_gather_task!(
     out::StridedMatrix{T},
@@ -272,6 +269,7 @@ function _snparray_AX_lookup_gather_task!(
     slice = NV * W
     k = size(out, 2)
     _lookup_transpose!(blk, layout.row_span, packed, rows, column_first, nblk)
+    # Gather one row tile of one rhs slice at a time, then add it to `out`.
     for rhs_column in 1:slice:k
         tile_columns = rhs_column:min(rhs_column + slice - 1, k)
         slice_offset = ((rhs_column - 1) ÷ slice) * slice_stride

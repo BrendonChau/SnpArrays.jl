@@ -175,11 +175,9 @@ end
     _snparray_AtX_task!(task, rhs, row_step, rows_filled, columns,
         rhs_columns, ::Val{MR}, ::Val{W})
 
-Run one `transpose(A)*X` task over SNP `columns` (indices into the full
-genotype arrays) and rhs columns `rhs_columns`, blocking the samples into
-`row_step`-wide inner blocks and holding each `MR x 2W` tile in registers
-over a whole sample block. On a Xeon 6736P the hot loop compiles to 16 FMAs
-on zmm accumulators with no spills.
+Run one `transpose(A)*X` task over SNP `columns`, which index the full
+genotype arrays, and rhs columns `rhs_columns`, in sample blocks of
+`row_step`.
 """
 function _snparray_AtX_task!(
     task::RegisterTileTask{

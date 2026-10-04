@@ -1,3 +1,5 @@
+# Cache budgets and the block sizes the schedulers cut each product into.
+
 """
     SIMD_FLOAT
 
@@ -9,26 +11,18 @@ const SIMD_FLOAT = Union{Float32, Float64}
     VECTOR_BYTES
 
 SIMD register width in bytes used by the register-tiled kernels: 64 on
-x86_64 hosts whose ISA includes the AVX-512 tier, 32 otherwise (AVX2, or
-NEON packed as two 128-bit registers). Set in `__init__` from
-`_detect_vector_bytes()`; the first use of each `(T, W)` pair compiles
-in-process (no precompile workload). On a Xeon 6736P, 64 measured 1.27x to
-1.92x faster than 32 for every `k` at or above 8, and LLVM emitted zmm
-registers rather than splitting the 512-bit vectors.
+x86_64 hosts whose ISA includes the AVX-512 tier, 32 otherwise.
 """
 const VECTOR_BYTES = Ref{Int}(32)
 
 """
     _detect_vector_bytes() -> Int
 
-Return 64 on x86_64 hosts whose CPU ISA includes AVX-512, else 32. Relies
-on `Base.BinaryPlatforms` internals (`arch_march_isa_mapping`,
-`CPUID.cpu_isa()`) that exist in Julia 1.12 but are not part of the public
-API, so the fallback to 32 is mandatory if they are unavailable or raise
-an error.
+Return 64 on x86_64 hosts whose CPU ISA includes AVX-512, else 32.
 """
 function _detect_vector_bytes()
     Sys.ARCH === :x86_64 || return 32
+    # `Base.BinaryPlatforms.CPUID` is not public API; fall back to 32.
     try
         isa_map = Dict(Base.BinaryPlatforms.arch_march_isa_mapping["x86_64"])
         return isa_map["avx512"] <= Base.BinaryPlatforms.CPUID.cpu_isa() ?
@@ -38,70 +32,65 @@ function _detect_vector_bytes()
     end
 end
 
+# Re-read once per SNP column, so it stays in a 32-48 KB-class L1 data cache
+# with room left for the packed genotype bytes.
 """
     L1_OUT_BUDGET
 
-Byte budget, per task, for the `A*x` output block (read-modified-written
-once per SNP column) and the `transpose(A)*x` rhs block (re-read once per
-column), so it stays resident in a 32-48 KB-class L1 data cache with room
-left for the packed genotype bytes. The best swept alternative on a Xeon
-6736P was 1.13x faster in one of four cells and no better in the rest.
+Byte budget, per task, for the `A*x` output block and the `transpose(A)*x`
+rhs block.
 """
 const L1_OUT_BUDGET = 16_384
 
+# The slab is `k_padded x column_step * sizeof(T)` bytes and fits a 256
+# KB-class private L2 slice.
 """
     L2_PANEL_BUDGET
 
-Byte budget, per task, for the transposed rhs slab (`k_padded x
-column_step * sizeof(T)`) of one inner block, so it fits a 256 KB-class
-private L2 slice. Enlarging it to match the 2 MB private L2 of a Xeon
-6736P measured neutral for `A*X` and worse for `transpose(A)*X`.
+Byte budget, per task, for the transposed rhs slab of one inner block.
 """
 const L2_PANEL_BUDGET = 262_144
 
+# Every following row tile re-touches the lines, so they stay L1-resident.
 """
     PACKED_LINES_BUDGET
 
 Byte budget for the packed cache lines touched by one `A*X` row tile, one
-64-byte line per SNP column of the block, re-touched by every following
-row tile, so they stay L1-resident. The `column_step` it caps sits on a
-flat part of the measured response curve on a Xeon 6736P.
+64-byte line per SNP column of the block.
 """
 const PACKED_LINES_BUDGET = 32_768
 
+# The tile's partial sums, `LOOKUP_ROW_TILE` times the rhs slice width, stay
+# L1-resident while the blocks of a group are gathered.
 """
     LOOKUP_ROW_TILE
 
-Samples per inner tile of the lookup-table `A*X` kernel; the tile's
-row-major partial sums (`LOOKUP_ROW_TILE` times the rhs slice width) stay
-L1-resident while every 4-SNP block of a group is gathered. Initial value
-from `kq_pass.c`.
+Samples per inner tile of the lookup-table `A*X` kernel.
 """
 const LOOKUP_ROW_TILE = 512
 
+# One chunk's tables cost `LOOKUP_CHUNK_SNPS / 4 * 256 * k_padded * sizeof(T)`
+# bytes, built once and shared by every gather task.
 """
     LOOKUP_CHUNK_SNPS
 
-SNPs per chunk of the lookup-table `A*X` kernel (a multiple of 4). One
-chunk's 256-row tables for all `k` rhs columns are built once, shared by
-every gather task, and cost `LOOKUP_CHUNK_SNPS / 4 * 256 * k_padded *
-sizeof(T)` bytes. Initial value from `kq_pass.c`.
+SNPs per chunk of the lookup-table `A*X` kernel (a multiple of 4).
 """
 const LOOKUP_CHUNK_SNPS = 1024
 
+# A group of 4-SNP blocks stays L2-resident across the tile.
 """
     LOOKUP_GROUP_BUDGET
 
-Bytes of lookup tables swept per inner sample tile, so a group of 4-SNP
-blocks stays L2-resident across the tile. Initial value from `kq_pass.c`.
+Bytes of lookup tables swept per inner sample tile.
 """
 const LOOKUP_GROUP_BUDGET = 1 << 20
 
+# Below it the `256 * k` table build per 4-SNP block is not amortised.
 """
     LOOKUP_MIN_ROWS
 
-Fewest samples for which `A*X` uses the lookup-table kernel; below it the
-`256 * k` table build per 4-SNP block is not amortised.
+Fewest samples for which `A*X` uses the lookup-table kernel.
 """
 const LOOKUP_MIN_ROWS = 2048
 
@@ -134,9 +123,7 @@ _vector_width(::Type{T}) where T = VECTOR_BYTES[] ÷ sizeof(T)
     _rhs_width(::Type{T}, k::Int) -> Int
 
 Return the `Vec` lane count for the rhs tile: the largest power of two that
-is at most `_vector_width(T)` and does not exceed `k`, floored at 4. A `k`
-narrower than the register width would otherwise leave lanes idle in every
-tile.
+is at most `_vector_width(T)` and does not exceed `k`, floored at 4.
 """
 function _rhs_width(::Type{T}, k::Int) where T
     width = _vector_width(T)
@@ -149,14 +136,11 @@ end
 """
     _register_tile_shape(::Type{T}) -> (MR, NR)
 
-Return the register-tile shape `(MR, NR)` for element type `T`: `NR =
-2 * _vector_width(T)` rhs lanes and `MR` accumulator rows. Register
-budget: AVX2 Float32 gives `MR=6, NR=16` (12 accumulators + 2 rhs + 1
-broadcast = 15 ymm registers); AVX2 Float64 gives `MR=6, NR=8` (15 ymm);
-AVX-512 gives `MR=8` (19 zmm); NEON packs `W=8` Float32 lanes as two q
-registers, using 30 of 32 registers.
+Return the register-tile shape `(MR, NR)` for element type `T`: `MR`
+accumulator rows and `NR = 2 * _vector_width(T)` rhs lanes.
 """
 function _register_tile_shape(::Type{T}) where T
+    # 2 * MR accumulators, 2 rhs, and 1 broadcast register stay in registers.
     mr = VECTOR_BYTES[] == 64 ? 8 : 6
     return mr, 2 * _vector_width(T)
 end
@@ -176,7 +160,7 @@ end
 
 Return the number of samples or SNPs whose transposed rhs slab, `k` capped at
 256 and padded to a whole register tile, fits `L2_PANEL_BUDGET`, rounded down
-to a multiple of `DECODE_WIDTH`. The caller clamps it to its own bounds.
+to a multiple of `DECODE_WIDTH`.
 """
 function _panel_step(::Type{T}, k::Int) where T <: AbstractFloat
     _, nr = _register_tile_shape(T)
@@ -187,19 +171,16 @@ end
 """
     _rhs_step(k::Int) -> Int
 
-Return the rhs columns per task, `k` capped at 256 (the register tile handles
-all rhs blocking below 256) and at least 1.
+Return the rhs columns per task: `k` capped at 256 and at least 1.
 """
 _rhs_step(k::Int) = max(min(k, 256), 1)
 
 """
     _snparray_ax_row_step(::Type{T}, m::Int) -> row_step
 
-Return the samples per task of `A*x` for `m` samples. `row_step` is a
-multiple of `DECODE_WIDTH`, at least `DECODE_WIDTH`, and keeps the output
-block within `L1_OUT_BUDGET` across the SNP column loop; the vector kernel
-needs no inner column blocking, so each task sweeps every SNP. `m == 0` does
-not error.
+Return the samples each task of `_snparray_ax_schedule!` covers for `m`
+samples: a multiple of `DECODE_WIDTH`, at least `DECODE_WIDTH`. `m == 0`
+does not error.
 """
 function _snparray_ax_row_step(::Type{T}, m::Int) where T <: AbstractFloat
     return _round_down_decode(_task_axis_step(m, L1_OUT_BUDGET ÷ sizeof(T)))
@@ -208,10 +189,10 @@ end
 """
     _snparray_atx_steps(::Type{T}, n::Int) -> (row_step, column_step)
 
-Return the task tile sizes of `transpose(A)*x` for `n` SNPs. `column_step`
-is task-partitioned over SNPs and at least 1; `row_step` is a multiple of
-`DECODE_WIDTH`, at least `DECODE_WIDTH`, and keeps the rhs slice within
-`L1_OUT_BUDGET` across the column loop. `n == 0` does not error.
+Return how `_snparray_atx_schedule!` cuts up `transpose(A)*x` with `n` SNPs:
+`column_step` SNPs per task, swept in blocks of `row_step` samples.
+`row_step` is a multiple of `DECODE_WIDTH` and at least `DECODE_WIDTH`;
+`column_step` is at least 1, also when `n == 0`.
 """
 function _snparray_atx_steps(::Type{T}, n::Int) where T <: AbstractFloat
     row_step = _round_down_decode(L1_OUT_BUDGET ÷ sizeof(T))
@@ -223,16 +204,10 @@ end
     _snparray_AX_steps(::Type{T}, m::Int, k::Int)
         -> (row_step, column_step, rhs_step)
 
-Return the task tile sizes of `A*X` for `m` samples and `k` rhs columns.
-`rhs_step` is `k` capped at 256; `column_step` sizes the transposed rhs slab
-of one column block to `L2_PANEL_BUDGET` and the packed cache lines it
-touches to `PACKED_LINES_BUDGET`; `row_step` sizes the packed genotype block,
-re-read once per rhs tile, to `4 * L2_PANEL_BUDGET / column_step` bytes (the
-`A*X` accumulators live in registers, so `row_step` is not bound by
-`L1_OUT_BUDGET`). `row_step` is a multiple of `DECODE_WIDTH` and at least
-`DECODE_WIDTH`; `column_step` and `rhs_step` are at least 1. `m == 0` does
-not error. A matrix product with one rhs column still runs the register-tiled
-kernel, so it uses this rule at `k = 1`.
+Return how `_snparray_AX_schedule!` cuts up `A*X` with `m` samples and `k`
+rhs columns: `row_step` samples and `rhs_step` rhs columns per task, swept in
+blocks of `column_step` SNPs. `row_step` is a multiple of `DECODE_WIDTH` and
+at least `DECODE_WIDTH`; the others are at least 1, also when `m == 0`.
 """
 function _snparray_AX_steps(
     ::Type{T},
@@ -250,16 +225,11 @@ end
     _snparray_AtX_steps(::Type{T}, n::Int, k::Int)
         -> (row_step, column_step, rhs_step)
 
-Return the task tile sizes of `transpose(A)*X` for `n` SNPs and `k` rhs
-columns. `rhs_step` is `k` capped at 256; `row_step` sizes the transposed rhs
-slab over samples to `L2_PANEL_BUDGET`; `column_step` is task-partitioned
-over SNPs. `row_step` is a multiple of `DECODE_WIDTH` and at least
-`DECODE_WIDTH`; `column_step` and `rhs_step` are at least 1. `n == 0` does
-not error.
-
-Across 106 swept configurations on a Xeon 6736P the step functions of the
-four products were within 1.15x of the best in every operation and element
-type.
+Return how `_snparray_AtX_schedule!` cuts up `transpose(A)*X` with `n` SNPs
+and `k` rhs columns: `column_step` SNPs and `rhs_step` rhs columns per task,
+swept in blocks of `row_step` samples. `row_step` is a multiple of
+`DECODE_WIDTH` and at least `DECODE_WIDTH`; the others are at least 1, also
+when `n == 0`.
 """
 function _snparray_AtX_steps(
     ::Type{T},

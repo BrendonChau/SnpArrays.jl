@@ -112,10 +112,8 @@ end
     _snparray_AX_task!(task, rhs, rows, column_step, rhs_columns, ::Val{MR},
         ::Val{W})
 
-Run one `A*X` task over samples `rows` and rhs columns `rhs_columns`,
-blocking the SNP columns into `column_step`-wide inner tiles and holding
-each `MR x 2W` tile in registers. On a Xeon 6736P the hot loop compiles to
-16 FMAs on zmm accumulators with no spills, 19 of 32 registers live.
+Run one `A*X` task over samples `rows` and rhs columns `rhs_columns`, in
+SNP blocks of `column_step`.
 """
 function _snparray_AX_task!(
     task::RegisterTileTask{T, <:StridedMatrix{T}, Matrix{UInt8}, Matrix{T}},

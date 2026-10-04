@@ -1,8 +1,9 @@
 """
     _snparray_ax_schedule!(out, packed, rhs, values, rows_filled) -> out
 
-Accumulate `out += A * rhs` by spawning one task per block of samples, each
-sweeping every SNP column with `_snparray_ax_kernel!`.
+Accumulate `out += A * rhs` for a vector `rhs` over the first `rows_filled`
+samples, with one `_snparray_ax_kernel!` task per `_snparray_ax_row_step`
+samples.
 """
 function _snparray_ax_schedule!(
     out::AbstractVector{T},
@@ -12,6 +13,7 @@ function _snparray_ax_schedule!(
     rows_filled::Int,
 ) where T <: AbstractFloat
     n = size(packed, 2)
+    # One task per block of samples; each sweeps every SNP column.
     row_step = _snparray_ax_row_step(T, rows_filled)
     @assert(
         row_step % DECODE_WIDTH == 0,
@@ -32,8 +34,7 @@ end
 """
     _resize_workspace!(workspace, count) -> workspace
 
-Resize the shared panel workspace to exactly `count` elements. Repeated
-products at one shape reuse the buffer; a change of shape reallocates.
+Resize the shared panel workspace to exactly `count` elements.
 """
 function _resize_workspace!(workspace::Vector, count::Int)
     length(workspace) == count || resize!(workspace, count)
@@ -60,9 +61,9 @@ _supports_lookup(out, packed, rhs) = false
     _snparray_AX_schedule!(out, packed, rhs, values, rows_filled, workspace,
         blk) -> out
 
-Accumulate `out += A * rhs` with the lookup-table kernel when the shape and
-array types allow it, else by spawning one register-tiled task per row block
-and rhs tile.
+Accumulate `out += A * rhs` for a matrix `rhs` over the first `rows_filled`
+samples, with `_snparray_AX_lookup_schedule!` when `_uses_lookup_kernel`
+holds and else with tasks sized by `_snparray_AX_steps`.
 """
 function _snparray_AX_schedule!(
     out::AbstractMatrix{T},
@@ -79,6 +80,7 @@ function _snparray_AX_schedule!(
         return _snparray_AX_lookup_schedule!(out, packed, rhs, values,
                                              rows_filled, workspace, blk)
     end
+    # One register-tiled task per block along the task axis and rhs tile.
     row_step, column_step, rhs_step =
         _snparray_AX_steps(T, rows_filled, k)
     lanes = _rhs_width(T, k)
@@ -91,6 +93,7 @@ function _snparray_AX_schedule!(
     tasks = cld(rows_filled, row_step) * cld(k, rhs_step)
     _resize_workspace!(workspace, tasks * panel_length)
     tile_rows, _ = _register_tile_shape(T)
+    # `Val`s enter here: one dynamic call per product, static dispatch below.
     return _snparray_AX_spawn_tasks!(
         out, packed, rhs, values, rows_filled, workspace, row_step,
         column_step, rhs_step, panel_length, Val(tile_rows), Val(lanes),
@@ -103,9 +106,7 @@ end
         ::Val{W}) -> out
 
 Spawn one `_snparray_AX_task!` per row block and rhs tile, each with its own
-`panel_length` slice of `workspace`. The tile shape enters as `Val`s here so
-that each product makes one dynamic call, and the spawn loop and every task
-call inside it dispatch statically.
+`panel_length` slice of `workspace`.
 """
 function _snparray_AX_spawn_tasks!(
     out::AbstractMatrix{T},
@@ -147,8 +148,9 @@ end
 """
     _snparray_atx_schedule!(out, packed, rhs, values, rows_filled, cols) -> out
 
-Accumulate `out += transpose(A[:, cols]) * rhs` by spawning one task per block
-of SNP columns, each sweeping every sample with `_snparray_atx_kernel!`.
+Accumulate `out += transpose(A[:, cols]) * rhs` for a vector `rhs` over the
+first `rows_filled` samples, with `_snparray_atx_kernel!` tasks sized by
+`_snparray_atx_steps`.
 """
 function _snparray_atx_schedule!(
     out::AbstractVector{T},
@@ -160,6 +162,7 @@ function _snparray_atx_schedule!(
 ) where T <: AbstractFloat
     n = length(cols)
     out_offset = first(cols) - 1
+    # One task per block of SNP columns; each sweeps the samples in blocks.
     row_step, column_step = _snparray_atx_steps(T, n)
     @assert(
         row_step % DECODE_WIDTH == 0,
@@ -190,8 +193,8 @@ end
     _snparray_AtX_schedule!(out, packed, rhs, values, rows_filled, cols,
         workspace) -> out
 
-Accumulate `out += transpose(A[:, cols]) * rhs` by spawning one register-tiled
-task per block of SNP columns and rhs tile.
+Accumulate `out += transpose(A[:, cols]) * rhs` for a matrix `rhs` over the
+first `rows_filled` samples, with tasks sized by `_snparray_AtX_steps`.
 """
 function _snparray_AtX_schedule!(
     out::AbstractMatrix{T},
@@ -204,6 +207,7 @@ function _snparray_AtX_schedule!(
 ) where T <: AbstractFloat
     n = length(cols)
     k = size(out, 2)
+    # One register-tiled task per block along the task axis and rhs tile.
     row_step, column_step, rhs_step =
         _snparray_AtX_steps(T, n, k)
     lanes = _rhs_width(T, k)

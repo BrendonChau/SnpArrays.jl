@@ -22,13 +22,8 @@ end
     _snparray_AX_lookup_schedule!(out, packed, rhs, values, rows_filled,
         workspace, blk)
 
-Accumulate `out += A * rhs` with the lookup-table kernel: per chunk of
-`LOOKUP_CHUNK_SNPS` SNPs, build the 256-row tables of every 4-SNP block
-for all rhs columns (tasks over blocks), then gather them per sample
-(tasks over sample blocks). Rhs slices hold `NV` vectors of width
-`W = _vector_width(T)`, with `NV = 2` for `k ≤ 2W` and
-`NV = max(2, 32 ÷ W)` otherwise; `workspace` is laid out as in
-`LookupLayout`, and `blk` holds the transposed codes of one chunk.
+Accumulate `out += A * rhs` with the lookup-table kernel, resizing
+`workspace` and `blk` to the layout of this product.
 """
 function _snparray_AX_lookup_schedule!(
     out::StridedMatrix{T},
@@ -42,9 +37,11 @@ function _snparray_AX_lookup_schedule!(
     n = size(packed, 2)
     k = size(out, 2)
     lanes = _vector_width(T)
+    # An rhs slice is `vectors` registers wide; tables are built per slice.
     vectors = k <= 2lanes ? 2 : max(2, 32 ÷ lanes)
     slice = vectors * lanes
     k_padded = cld(k, slice) * slice
+    # One 256-row table per 4-SNP block of a chunk, for every slice.
     nblk_max = min(LOOKUP_CHUNK_SNPS ÷ 4, cld(n, 4))
     row_span = 4 * cld(rows_filled, 4)
     slice_stride = nblk_max * 256 * slice
@@ -55,6 +52,8 @@ function _snparray_AX_lookup_schedule!(
     row_tasks = cld(rows_filled, row_step)
     block_step = max(1, cld(nblk_max, TASKS_PER_THREAD * Threads.nthreads()))
     block_tasks = cld(nblk_max, block_step)
+    # Workspace: tables, then a staging slice per build task, then an
+    # output tile per gather task.
     stage_base = tables_len
     tile_base = stage_base + block_tasks * stage_len
     _resize_workspace!(workspace, tile_base + row_tasks * tile_len)
@@ -66,6 +65,7 @@ function _snparray_AX_lookup_schedule!(
         k_padded, slice_stride, row_span, group, stage_base, stage_len,
         tile_base, tile_len, row_step, block_step,
     )
+    # `Val`s enter here: one dynamic call per product, static dispatch below.
     _snparray_AX_lookup_chunks!(
         out, packed, rhs, values, rows_filled, workspace, blk, layout,
         Val(lanes), Val(vectors),
@@ -77,10 +77,8 @@ end
     _snparray_AX_lookup_chunks!(out, packed, rhs, values, rows_filled,
         workspace, blk, layout, ::Val{W}, ::Val{NV})
 
-Run the build and gather phases of `_snparray_AX_lookup_schedule!` for every
-SNP chunk with rhs slices of `NV` vectors of width `W`. The `Val`s enter
-here so that each product makes one dynamic call and every spawned task
-call dispatches statically.
+Accumulate `out += A * rhs` chunk by chunk of `LOOKUP_CHUNK_SNPS` SNPs, with
+rhs slices of `NV` vectors of width `W`.
 """
 function _snparray_AX_lookup_chunks!(
     out::StridedMatrix{T},
@@ -105,6 +103,7 @@ function _snparray_AX_lookup_chunks!(
     n = size(packed, 2)
     for column_first in 1:LOOKUP_CHUNK_SNPS:n
         nblk = cld(min(LOOKUP_CHUNK_SNPS, n - column_first + 1), 4)
+        # Build the tables of this chunk, one task per run of blocks.
         @sync begin
             task_index = 0
             for block_first in 1:block_step:nblk
@@ -118,6 +117,7 @@ function _snparray_AX_lookup_chunks!(
                 )
             end
         end
+        # Gather the tables into `out`, one task per run of samples.
         @sync begin
             task_index = 0
             for row_first in 1:row_step:rows_filled

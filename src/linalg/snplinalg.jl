@@ -25,16 +25,21 @@ AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
     SnpLinAlg{T}(s; model=ADDITIVE_MODEL, center=false, scale=false,
                  impute=true)
 
-Wrap a `SnpArray` for direct linear algebra without materializing its genotypes.
-Missing genotypes use the column mean before centering and scaling when
-`impute=true`, and use `NaN` otherwise.
+Wrap a `SnpArray` for linear algebra without materializing its genotypes.
 
 # Arguments
-- `s`: a `SnpArray`
-- `model`: `ADDITIVE_MODEL`, `DOMINANT_MODEL`, or `RECESSIVE_MODEL`
-- `center`: center each column when `true`
-- `scale`: scale each column to unit standard deviation when `true`
-- `impute`: replace missing genotypes with the column mean when `true`
+- `s::AbstractSnpArray`: the genotypes to wrap
+
+# Keywords
+- `model = ADDITIVE_MODEL`: `ADDITIVE_MODEL`, `DOMINANT_MODEL`, or
+  `RECESSIVE_MODEL`
+- `center::Bool = false`: center each column
+- `scale::Bool = false`: scale each column to unit standard deviation
+- `impute::Bool = true`: replace a missing genotype with the column mean
+  before centering and scaling; `NaN` when `false`
+
+# Throws
+- `ArgumentError`: `model` is not one of the three models
 """
 function SnpLinAlg{T}(
     s::AbstractSnpArray;

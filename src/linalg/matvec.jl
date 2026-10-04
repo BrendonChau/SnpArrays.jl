@@ -30,7 +30,7 @@ end
     _broadcast_lookup(values, column, ::Val{N})
 
 Broadcast the four genotype-code values of SNP `column` into `N`-lane
-vectors, once per column rather than once per 16-sample decode step.
+vectors.
 """
 @inline function _broadcast_lookup(
     values::StridedMatrix{T},
@@ -70,8 +70,7 @@ end
     _snparray_ax_kernel!(out, packed, rhs, values, rows, columns)
 
 Accumulate `out[rows] += A[rows, columns] * rhs[columns]` for a `SnpLinAlg`
-matrix `A`, decoding genotypes with the 16-lane vector decode. Requires
-`first(rows) ≡ 1 (mod 4)`.
+matrix `A`. Requires `first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_ax_kernel!(
     out::Vector{T},
@@ -88,6 +87,7 @@ function _snparray_ax_kernel!(
         rhs_value = rhs[column]
         lookup = _broadcast_lookup(values, column, Val(16))
         row = row_first
+        # Decode 16 samples per step; the tail runs one sample at a time.
         while row <= vectorized_row_last
             byte_index = ((row - 1) >>> 2) + 1
             genotypes = _decode_genotypes(packed, lookup, byte_index, column)
@@ -109,9 +109,8 @@ end
         out_offset)
 
 Accumulate `out[columns .- out_offset] += transpose(A[rows, columns]) *
-rhs[rows]` for a `SnpLinAlg` matrix `A`, decoding genotypes with the 16-lane
-vector decode and a SIMD tree reduction per column. `columns` index the full
-genotype arrays `packed` and `values`; requires `first(rows) ≡ 1 (mod 4)`.
+rhs[rows]` for a `SnpLinAlg` matrix `A`. `columns` index the full genotype
+arrays `packed` and `values`; requires `first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_atx_kernel!(
     out::Vector{T},
@@ -130,6 +129,7 @@ function _snparray_atx_kernel!(
         vector_total = zero(Vec{16, T})
         lookup = _broadcast_lookup(values, column, Val(16))
         row = row_first
+        # Decode 16 samples per step; the tail runs one sample at a time.
         while row <= vectorized_row_last
             byte_index = ((row - 1) >>> 2) + 1
             genotypes = _decode_genotypes(packed, lookup, byte_index, column)
