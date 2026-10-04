@@ -48,7 +48,7 @@ function _check_streamed_grm_dims(
     V::AbstractMatrix,
     Q::AbstractMatrix,
     U::Union{Nothing, AbstractMatrix},
-    scale::Union{Number, AbstractVector},
+    scale::Union{AbstractFloat, AbstractVector{<:AbstractFloat}},
     m::Int,
     n::Int,
     k::Int,
@@ -71,6 +71,16 @@ function _check_streamed_grm_dims(
 end
 
 """
+    _chunk_scale(scale, cols)
+
+Return `scale` for the SNP columns `cols`: a scalar applies to every
+column, and a per-SNP vector is restricted to `cols`.
+"""
+_chunk_scale(scale::AbstractFloat, cols::UnitRange{Int}) = scale
+_chunk_scale(scale::AbstractVector{<:AbstractFloat}, cols::UnitRange{Int}) =
+    view(scale, cols)
+
+"""
     _streamed_grm_mul!(V, stream, Q_kernel, scale_kernel, U, V_scratch)
 
 Run the per-chunk products in `Q_kernel`'s type and accumulate into the
@@ -80,7 +90,7 @@ function _streamed_grm_mul!(
     V::AbstractMatrix{TV},
     stream::SnpLinAlgStream{TS},
     Q_kernel::AbstractMatrix{TS},
-    scale_kernel::Union{Number, AbstractVector{TS}},
+    scale_kernel::Union{TS, AbstractVector{TS}},
     U::Union{Nothing, AbstractMatrix{TV}},
     V_scratch::Union{Nothing, Matrix{TS}},
 ) where {TV <: AbstractFloat, TS <: AbstractFloat}
@@ -93,9 +103,7 @@ function _streamed_grm_mul!(
         end
         mul!(chunk_output, transpose(chunk), Q_kernel)
         U !== nothing && copyto!(view(U, cols, :), chunk_output)
-        chunk_scale = scale_kernel isa AbstractVector ?
-            view(scale_kernel, cols) : scale_kernel
-        chunk_output .*= chunk_scale
+        chunk_output .*= _chunk_scale(scale_kernel, cols)
         if V_scratch === nothing
             mul!(V, chunk, chunk_output, 1, 1)
         else
@@ -115,16 +123,17 @@ end
 
 Accumulate `V = Σ_c A_c diag(s_c) transpose(A_c) Q` over the chunks `A_c`
 of `stream`, where `s_c` is `scale` restricted to chunk `c`'s columns and
-`scale` may be a scalar or a length-`size(stream, 2)` vector. When `U` is
-an `AbstractMatrix`, also write the unscaled `transpose(A) * Q` into it.
-With a `Float32` stream and `Float64` `V` and `Q`, each chunk's product
-runs in single precision and is accumulated into `V` in double precision.
+`scale` is a scalar or length-`size(stream, 2)` vector with the element
+type of `V`. When `U` is an `AbstractMatrix`, also write the unscaled
+`transpose(A) * Q` into it. With a `Float32` stream and `Float64` `V` and
+`Q`, each chunk's product runs in single precision and is accumulated into
+`V` in double precision.
 """
 function streamed_grm_mul!(
     V::AbstractMatrix{T},
     stream::SnpLinAlgStream{T},
     Q::AbstractMatrix{T};
-    scale::Union{Number, AbstractVector{T}} = inv(size(stream, 2)),
+    scale::Union{T, AbstractVector{T}} = inv(T(size(stream, 2))),
     U::Union{Nothing, AbstractMatrix{T}} = nothing,
 ) where T <: AbstractFloat
     m, n = size(stream)
@@ -139,7 +148,7 @@ function streamed_grm_mul!(
     V::AbstractMatrix{Float64},
     stream::SnpLinAlgStream{Float32},
     Q::AbstractMatrix{Float64};
-    scale::Union{Number, AbstractVector{<:Real}} = inv(size(stream, 2)),
+    scale::Union{Float64, AbstractVector{Float64}} = inv(size(stream, 2)),
     U::Union{Nothing, AbstractMatrix{Float64}} = nothing,
 )
     m, n = size(stream)
@@ -147,8 +156,7 @@ function streamed_grm_mul!(
     _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
     fill!(V, zero(Float64))
     Q32 = Matrix{Float32}(Q)
-    scale32 = scale isa AbstractVector ? Vector{Float32}(scale) :
-              Float32(scale)
+    scale32 = Float32.(scale)
     V_scratch = Matrix{Float32}(undef, m, k)
     _streamed_grm_mul!(V, stream, Q32, scale32, U, V_scratch)
     return V

@@ -183,6 +183,11 @@ end
                     V, stream, Q; U = Matrix{T}(undef, n + 1, k))
                 @test_throws DimensionMismatch streamed_grm_mul!(
                     V, stream, Q; scale = Vector{T}(undef, n + 1))
+                other = T == Float32 ? Float64 : Float32
+                @test_throws TypeError streamed_grm_mul!(
+                    V, stream, Q; scale = one(other))
+                @test_throws TypeError streamed_grm_mul!(
+                    V, stream, Q; scale = ones(other, n))
             end
         end
 
