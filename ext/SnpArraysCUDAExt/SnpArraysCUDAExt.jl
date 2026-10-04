@@ -15,7 +15,6 @@ using SnpArrays: ADDITIVE_MODEL, CuSnpArray, DOMINANT_MODEL, RECESSIVE_MODEL,
 import SnpArrays: streamed_grm_mul!, streamed_mul!
 
 include("kernels.jl")
-include("lookup.jl")
 include("wmma.jl")
 include("linalg.jl")
 include("stream.jl")

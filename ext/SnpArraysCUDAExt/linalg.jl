@@ -182,16 +182,13 @@ function mul!(
         fill!(out, zero(T))
         return out
     end
-    _lookup_mul!(reshape(out, m, 1), s, reshape(v, n, 1),
-        _lookup_config(1))
-    return out
+    return _decode_mul!(out, s, v)
 end
 
 """
     _decode_mul!(out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T})
 
-`out = s * v` with the decode kernel `_ax_direct_kernel!`, kept for
-benchmarks and tests.
+`out = s * v` with the decode kernel `_ax_direct_kernel!`.
 """
 function _decode_mul!(
     out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T},
@@ -318,13 +315,13 @@ function mul!(
         return out
     end
     _uses_wmma(s, k) && return _wmma_mul!(out, s, X)
-    return _lookup_mul!(out, s, X, _lookup_config(k))
+    return _decode_mul!(out, s, X)
 end
 
 """
     _decode_mul!(out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T})
 
-`out = s * X` with the decode kernels, kept for benchmarks and tests.
+`out = s * X` with the decode kernels.
 """
 function _decode_mul!(
     out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T},

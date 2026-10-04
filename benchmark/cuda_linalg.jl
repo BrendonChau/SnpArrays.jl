@@ -139,7 +139,8 @@ function main()
     bench_impl!(
         "CuSnpArray (new)", cu_snp, m, n, x -> CuArray(x), gpu_time, rng,
     )
-    # The decode kernels that `A*X` used before the lookup-table kernel.
+    # The decode kernels, which Float32 `A*X` leaves for tensor cores at
+    # k >= 16.
     ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
     for k in KS
         X = operand(rng, Float32, n, k, CuArray)

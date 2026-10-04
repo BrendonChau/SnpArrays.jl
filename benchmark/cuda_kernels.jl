@@ -1,5 +1,5 @@
 # Benchmark the CuSnpArray mul! kernels on simulated genotypes against the
-# lookup and decode kernels and CuBLAS on the materialized dense matrix.
+# decode kernels and CuBLAS on the materialized dense matrix.
 #
 #     julia -t N --project=<env with CUDA and SnpArrays> \
 #       benchmark/cuda_kernels.jl [m] [n] [prefix] [results_dir]
@@ -183,16 +183,6 @@ function bench_row!(
 end
 
 """
-    lookup_mul!(out, A, X) -> out
-
-Set `out = A * X` with the lookup-table kernel.
-"""
-function lookup_mul!(out::CuMatrix{T}, A::CuSnpArray{T},
-                     X::CuMatrix{T}) where T <: AbstractFloat
-    return EXT._lookup_mul!(out, A, X, EXT._lookup_config(size(X, 2)))
-end
-
-"""
     decode_mul!(out, A, X) -> out
 
 Set `out = A * X` with the decode kernels.
@@ -239,8 +229,7 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
                             impute = true))
     x = CuArray(randn(Xoshiro(1), T, n))
     out = CuVector{T}(undef, m)
-    expected = bench_row!(io, T, "A*x", 1, "mul!", mul!, out, A, x, nothing)
-    bench_row!(io, T, "A*x", 1, "decode", decode_mul!, out, A, x, expected)
+    bench_row!(io, T, "A*x", 1, "mul!", mul!, out, A, x, nothing)
     y = CuArray(randn(Xoshiro(2), T, m))
     out_t = CuVector{T}(undef, n)
     bench_row!(io, T, "Aᵀ*y", 1, "mul!", mul!, out_t, transpose(A), y,
@@ -252,12 +241,11 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
         AtX = CuMatrix{T}(undef, n, k)
         tensor = EXT._uses_wmma(A, k)
         expected = bench_row!(
-            io, T, "A*X", k, tensor ? "mul! (tensor-core)" : "mul! (lookup)",
+            io, T, "A*X", k, tensor ? "mul! (tensor-core)" : "mul! (decode)",
             mul!, AX, A, X, nothing,
         )
-        tensor && bench_row!(io, T, "A*X", k, "lookup", lookup_mul!, AX, A,
+        tensor && bench_row!(io, T, "A*X", k, "decode", decode_mul!, AX, A,
                              X, expected)
-        bench_row!(io, T, "A*X", k, "decode", decode_mul!, AX, A, X, expected)
         bench_row!(io, T, "A*X", k, "CuBLAS dense", mul!, AX, dense, X,
                    expected)
         T <: Float32 && bench_row!(io, T, "A*X", k, "CuBLAS dense TF32",

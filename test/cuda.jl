@@ -161,11 +161,11 @@ end
         transpose(A), CUDA.zeros(Float32, m, 4))
 end
 
-@testset "CuSnpArray lookup and decode A*X agree" begin
+@testset "CuSnpArray decode and tensor-core A*X agree" begin
     ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
     rng = Random.Xoshiro(13)
     # m not a multiple of 16, n not a multiple of 4, and n large enough
-    # for several SNP splits and table stages.
+    # for several SNP splits.
     for (m, n) in ((37, 5), (1001, 2049), (4099, 3001)), T in (Float32,
             Float64)
         codes = rand(rng, UInt8(0):UInt8(3), m, n)
