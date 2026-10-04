@@ -131,7 +131,7 @@ function main()
 
     # Packed-word CuSnpArray kernels. The byte-per-sample
     # kernels they replace ran 26.029 ms (A*X) and 13.886 ms (A'*X) on an
-    # A100 at this shape; see results/cuda_a100_baseline.md.
+    # A100 at this shape.
     cu_snp = CuSnpArray{Float32}(
         stacked; model=ADDITIVE_MODEL, center=true, scale=true,
         impute=false,
