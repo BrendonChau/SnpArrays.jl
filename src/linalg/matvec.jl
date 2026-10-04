@@ -1,6 +1,18 @@
-const SIMD_FLOAT = Union{Float32, Float64}
+"""
+    PACKED_EXPANSION
+
+Shuffle that copies each of four packed bytes into four adjacent lanes of a
+16-lane vector, one lane per sample.
+"""
 const PACKED_EXPANSION = Val((0, 0, 0, 0, 1, 1, 1, 1,
                               2, 2, 2, 2, 3, 3, 3, 3))
+
+"""
+    PACKED_SHIFTS
+
+Per-lane right shifts that bring the 2-bit code of each sample to the low bits
+of its lane after `PACKED_EXPANSION`.
+"""
 const PACKED_SHIFTS = Vec{16, UInt8}((0, 2, 4, 6, 0, 2, 4, 6,
                                       0, 2, 4, 6, 0, 2, 4, 6))
 

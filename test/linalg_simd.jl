@@ -498,7 +498,7 @@ end
 
 @testset "SnpLinAlg micro-kernel edge cases" begin
     for T in (Float32, Float64)
-        mr, nr = SnpArrays._micro_tile(T)
+        mr, nr = SnpArrays._register_tile_shape(T)
         w = SnpArrays._vector_width(T)
         tolerance = T(64) * eps(T)
 

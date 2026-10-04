@@ -1,58 +1,4 @@
 """
-    LOOKUP_ROW_TILE
-
-Samples per inner tile of the lookup-table `A*X` kernel; the tile's
-row-major partial sums (`LOOKUP_ROW_TILE` times the rhs slice width) stay
-L1-resident
-while every 4-SNP block of a group is gathered. Initial value from
-`kq_pass.c`.
-"""
-const LOOKUP_ROW_TILE = 512
-
-"""
-    LOOKUP_CHUNK_SNPS
-
-SNPs per chunk of the lookup-table `A*X` kernel (a multiple of 4). One
-chunk's 256-row tables for all `k` rhs columns are built once, shared by
-every gather task, and cost `LOOKUP_CHUNK_SNPS / 4 * 256 * k_padded *
-sizeof(T)` bytes. Initial value from `kq_pass.c`.
-"""
-const LOOKUP_CHUNK_SNPS = 1024
-
-"""
-    LOOKUP_GROUP_BUDGET
-
-Bytes of lookup tables swept per inner sample tile, so a group of 4-SNP
-blocks stays L2-resident across the tile. Initial value from `kq_pass.c`.
-"""
-const LOOKUP_GROUP_BUDGET = 1 << 20
-
-"""
-    LOOKUP_MIN_ROWS
-
-Fewest samples for which `A*X` uses the lookup-table kernel; below it the
-`256 * k` table build per 4-SNP block is not amortised.
-"""
-const LOOKUP_MIN_ROWS = 2048
-
-"""
-    LOOKUP_MIN_RHS
-
-Fewest rhs columns for which `A*X` uses the lookup-table kernel.
-"""
-const LOOKUP_MIN_RHS = 4
-
-"""
-    _uses_lookup_kernel(m::Int, k::Int) -> Bool
-
-Return whether `A*X` with `m` samples and `k` rhs columns runs the
-lookup-table kernel rather than the register-tiled kernel.
-"""
-function _uses_lookup_kernel(m::Int, k::Int)
-    return m >= LOOKUP_MIN_ROWS && k >= LOOKUP_MIN_RHS
-end
-
-"""
     _lookup_gather4(x::UInt32, s::Int) -> UInt8
 
 Return the byte holding the four 2-bit codes of sample `s` (0 to 3) from
@@ -310,8 +256,8 @@ function _lookup_flush_tile!(
 end
 
 """
-    _snparray_AX_lookup_task!(out, packed, tables, tile, tile_offset, blk,
-        row_span, row_first, row_last, column_first, nblk, slice_stride,
+    _snparray_AX_lookup_gather_task!(out, packed, tables, tile, tile_offset,
+        blk, row_span, row_first, row_last, column_first, nblk, slice_stride,
         group, ::Val{W}, ::Val{NV})
 
 Run one gather task of the lookup-table `A*X` kernel: transpose the codes
@@ -320,7 +266,7 @@ SNP `column_first`, then for every `NV * W`-wide rhs slice (tables
 `slice_stride` elements apart) and `LOOKUP_ROW_TILE`-row tile, gather the
 table rows and add them into `out`.
 """
-function _snparray_AX_lookup_task!(
+function _snparray_AX_lookup_gather_task!(
     out::StridedMatrix{T},
     packed::Matrix{UInt8},
     tables::Vector{T},

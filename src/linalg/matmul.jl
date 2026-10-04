@@ -98,14 +98,14 @@ Fuse the genotypes of samples `row:row + MR - 1` at SNP `column` into the
 end
 
 """
-    _snparray_AX_micro_tile!(out, packed, values, panel, panel_offset, row,
+    _snparray_AX_register_tile!(out, packed, values, panel, panel_offset, row,
         column_first, column_last, rhs_column, valid, rows, unroll, width)
 
 Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
 `row` and rhs column `rhs_column` over the SNP columns
 `column_first:column_last`, then add the `valid` leading lanes into `out`.
 """
-@inline function _snparray_AX_micro_tile!(
+@inline function _snparray_AX_register_tile!(
     out::StridedMatrix{T},
     packed::Matrix{UInt8},
     values::Matrix{T},
@@ -144,14 +144,14 @@ Accumulate the `MR x (U * W)` register tile of `A*X` rooted at sample
 end
 
 """
-    _snparray_AX_row_tiles!(out, packed, values, panel, panel_offset,
+    _snparray_AX_row_sweep!(out, packed, values, panel, panel_offset,
         row_first, row_last, column_first, column_last, rhs_column, valid,
         rows, unroll, width)
 
 Sweep samples `row_first:row_last` with `MR`-row register tiles, finishing
 the tail one sample at a time.
 """
-@inline function _snparray_AX_row_tiles!(
+@inline function _snparray_AX_row_sweep!(
     out::StridedMatrix{T},
     packed::Matrix{UInt8},
     values::Matrix{T},
@@ -169,14 +169,14 @@ the tail one sample at a time.
 ) where {T <: SIMD_FLOAT, MR, U, W}
     row = row_first
     while row + MR - 1 <= row_last
-        _snparray_AX_micro_tile!(
+        _snparray_AX_register_tile!(
             out, packed, values, panel, panel_offset, row, column_first,
             column_last, rhs_column, valid, rows, unroll, width,
         )
         row += MR
     end
     while row <= row_last
-        _snparray_AX_micro_tile!(
+        _snparray_AX_register_tile!(
             out, packed, values, panel, panel_offset, row, column_first,
             column_last, rhs_column, valid, Val(1), unroll, width,
         )
@@ -186,13 +186,13 @@ the tail one sample at a time.
 end
 
 """
-    _snparray_AX_task!(out, packed, rhs, values, panel, panel_offset,
+    _snparray_AX_blocks!(out, packed, rhs, values, panel, panel_offset,
         row_first, row_last, column_step, rhs_first, rhs_last, rows, width)
 
 Run one `A*X` task with a compile-time tile height `MR`, looping over SNP
 column blocks of width `column_step` and rhs tiles of width `2W`.
 """
-function _snparray_AX_task!(
+function _snparray_AX_blocks!(
     out::StridedMatrix{T},
     packed::Matrix{UInt8},
     rhs::StridedMatrix{T},
@@ -218,7 +218,7 @@ function _snparray_AX_task!(
                     panel, panel_offset, rhs, column_first, column_last,
                     rhs_column, valid, Val(1), width,
                 )
-                _snparray_AX_row_tiles!(
+                _snparray_AX_row_sweep!(
                     out, packed, values, panel, panel_offset, row_first,
                     row_last, column_first, column_last, rhs_column, valid,
                     rows, Val(1), width,
@@ -228,7 +228,7 @@ function _snparray_AX_task!(
                     panel, panel_offset, rhs, column_first, column_last,
                     rhs_column, valid, Val(2), width,
                 )
-                _snparray_AX_row_tiles!(
+                _snparray_AX_row_sweep!(
                     out, packed, values, panel, panel_offset, row_first,
                     row_last, column_first, column_last, rhs_column, valid,
                     rows, Val(2), width,
@@ -241,23 +241,21 @@ function _snparray_AX_task!(
 end
 
 """
-    _snparray_AX_kernel!(out, packed, rhs, values, panel, panel_offset,
+    _snparray_AX_task!(out, packed, rhs, values, panel, panel_offset,
         row_first, row_last, column_step, rhs_first, rhs_last, width)
 
 Run one `A*X` task over samples `row_first:row_last` and rhs columns
 `rhs_first:rhs_last`, blocking the SNP columns into `column_step`-wide
 inner tiles and accumulating each `MR x 2W` register tile in registers.
 
-The tile shape is `(MR, NR) = _micro_tile(T)`: AVX2 `Float32` gives
-`MR = 6`, `NR = 16`, i.e. 12 accumulators + 2 rhs vectors + 1 broadcast
-genotype = 15 of 16 ymm registers. The rhs values of one SNP column are
-packed contiguously into the `2W * column_step` elements of `panel` that
-start at `panel_offset`, zero-padded past the last rhs column of a partial
-tile, so each column contributes `U` full vector loads. On a Xeon 6736P the
-hot loop compiles to 16 FMAs on zmm accumulators with no spills, 19 of 32
-registers live.
+The tile shape is `(MR, NR) = _register_tile_shape(T)`. The rhs values of
+one SNP column are packed contiguously into the `2W * column_step` elements
+of `panel` that start at `panel_offset`, zero-padded past the last rhs column
+of a partial tile, so each column contributes `U` full vector loads. On a
+Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with no
+spills, 19 of 32 registers live.
 """
-function _snparray_AX_kernel!(
+function _snparray_AX_task!(
     out::StridedMatrix{T},
     packed::Matrix{UInt8},
     rhs::StridedMatrix{T},
@@ -272,8 +270,8 @@ function _snparray_AX_kernel!(
     width::Val{W},
 ) where {T <: SIMD_FLOAT, W}
     size(packed, 2) == 0 && return out
-    tile_rows, _ = _micro_tile(T)
-    return _snparray_AX_task!(
+    tile_rows, _ = _register_tile_shape(T)
+    return _snparray_AX_blocks!(
         out, packed, rhs, values, panel, panel_offset, row_first, row_last,
         column_step, rhs_first, rhs_last, Val(tile_rows), width,
     )
@@ -342,7 +340,7 @@ Fuse the genotypes of sample `row` at the `MR` SNP columns starting at
 end
 
 """
-    _snparray_AtX_micro_tile!(out, packed, values, panel, panel_offset,
+    _snparray_AtX_register_tile!(out, packed, values, panel, panel_offset,
         row_first, row_last, column, rhs_column, valid, out_offset, rows,
         unroll, width)
 
@@ -351,7 +349,7 @@ SNP `column` and rhs column `rhs_column` over the samples
 `row_first:row_last`, then add the `valid` leading lanes into `out` at row
 `column - out_offset`.
 """
-@inline function _snparray_AtX_micro_tile!(
+@inline function _snparray_AtX_register_tile!(
     out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
     values::StridedMatrix{T},
@@ -411,14 +409,14 @@ SNP `column` and rhs column `rhs_column` over the samples
 end
 
 """
-    _snparray_AtX_column_tiles!(out, packed, values, panel, panel_offset,
+    _snparray_AtX_column_sweep!(out, packed, values, panel, panel_offset,
         row_first, row_last, column_first, column_last, rhs_column, valid,
         out_offset, rows, unroll, width)
 
 Sweep SNP columns `column_first:column_last` with `MR`-column register
 tiles, finishing the tail one column at a time.
 """
-@inline function _snparray_AtX_column_tiles!(
+@inline function _snparray_AtX_column_sweep!(
     out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
     values::StridedMatrix{T},
@@ -437,14 +435,14 @@ tiles, finishing the tail one column at a time.
 ) where {T <: SIMD_FLOAT, MR, U, W}
     column = column_first
     while column + MR - 1 <= column_last
-        _snparray_AtX_micro_tile!(
+        _snparray_AtX_register_tile!(
             out, packed, values, panel, panel_offset, row_first, row_last,
             column, rhs_column, valid, out_offset, rows, unroll, width,
         )
         column += MR
     end
     while column <= column_last
-        _snparray_AtX_micro_tile!(
+        _snparray_AtX_register_tile!(
             out, packed, values, panel, panel_offset, row_first, row_last,
             column, rhs_column, valid, out_offset, Val(1), unroll, width,
         )
@@ -454,14 +452,14 @@ tiles, finishing the tail one column at a time.
 end
 
 """
-    _snparray_AtX_task!(out, packed, rhs, values, panel, panel_offset,
+    _snparray_AtX_blocks!(out, packed, rhs, values, panel, panel_offset,
         row_step, rows_filled, column_first, column_last, rhs_first,
         rhs_last, out_offset, rows, width)
 
 Run one `transpose(A)*X` task with a compile-time tile width `MR`, looping
 over sample blocks of `row_step` samples and rhs tiles of width `2W`.
 """
-function _snparray_AtX_task!(
+function _snparray_AtX_blocks!(
     out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
     rhs::StridedMatrix{T},
@@ -488,7 +486,7 @@ function _snparray_AtX_task!(
                     panel, panel_offset, rhs, row_first, row_last,
                     rhs_column, valid, Val(1), width,
                 )
-                _snparray_AtX_column_tiles!(
+                _snparray_AtX_column_sweep!(
                     out, packed, values, panel, panel_offset, row_first,
                     row_last, column_first, column_last, rhs_column, valid,
                     out_offset, rows, Val(1), width,
@@ -498,7 +496,7 @@ function _snparray_AtX_task!(
                     panel, panel_offset, rhs, row_first, row_last,
                     rhs_column, valid, Val(2), width,
                 )
-                _snparray_AtX_column_tiles!(
+                _snparray_AtX_column_sweep!(
                     out, packed, values, panel, panel_offset, row_first,
                     row_last, column_first, column_last, rhs_column, valid,
                     out_offset, rows, Val(2), width,
@@ -511,7 +509,7 @@ function _snparray_AtX_task!(
 end
 
 """
-    _snparray_AtX_kernel!(out, packed, rhs, values, panel, panel_offset,
+    _snparray_AtX_task!(out, packed, rhs, values, panel, panel_offset,
         row_step, rows_filled, column_first, column_last, rhs_first,
         rhs_last, out_offset, width)
 
@@ -521,17 +519,15 @@ and rhs columns `rhs_first:rhs_last`, blocking the samples into
 in registers over a whole sample block. `column_first` and `column_last`
 index the full genotype arrays; `out_offset` shifts them onto `out`.
 
-The tile shape is `(MR, NR) = _micro_tile(T)`: AVX2 `Float32` gives
-`MR = 6`, `NR = 16`, i.e. 12 accumulators + 2 rhs vectors + 1 broadcast
-genotype = 15 of 16 ymm registers. The rhs values of one sample are packed
-contiguously into the `2W * row_step` elements of `panel` that start at
-`panel_offset`, zero-padded past the last rhs column of a partial tile, so
-each sample contributes `U` full vector loads. The reduction reads one
-packed byte per SNP column per four samples and shifts out the four codes.
-On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with
-no spills.
+The tile shape is `(MR, NR) = _register_tile_shape(T)`. The rhs values of
+one sample are packed contiguously into the `2W * row_step` elements of
+`panel` that start at `panel_offset`, zero-padded past the last rhs column of
+a partial tile, so each sample contributes `U` full vector loads. The
+reduction reads one packed byte per SNP column per four samples and shifts
+out the four codes. On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm
+accumulators with no spills.
 """
-function _snparray_AtX_kernel!(
+function _snparray_AtX_task!(
     out::StridedMatrix{T},
     packed::StridedMatrix{UInt8},
     rhs::StridedMatrix{T},
@@ -548,8 +544,8 @@ function _snparray_AtX_kernel!(
     width::Val{W},
 ) where {T <: SIMD_FLOAT, W}
     rows_filled == 0 && return out
-    tile_columns, _ = _micro_tile(T)
-    return _snparray_AtX_task!(
+    tile_columns, _ = _register_tile_shape(T)
+    return _snparray_AtX_blocks!(
         out, packed, rhs, values, panel, panel_offset, row_step, rows_filled,
         column_first, column_last, rhs_first, rhs_last, out_offset,
         Val(tile_columns), width,

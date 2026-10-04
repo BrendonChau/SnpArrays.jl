@@ -1,8 +1,23 @@
-function _snparray_ax_tile!(out, packed, rhs, values, rows_filled)
+"""
+    _snparray_ax_schedule!(out, packed, rhs, values, rows_filled) -> out
+
+Accumulate `out += A * rhs` by spawning one task per block of samples, each
+sweeping every SNP column with `_snparray_ax_kernel!`.
+"""
+function _snparray_ax_schedule!(
+    out::AbstractVector{T},
+    packed::AbstractMatrix{UInt8},
+    rhs::AbstractVector{T},
+    values::AbstractMatrix{T},
+    rows_filled::Int,
+) where T <: AbstractFloat
     n = size(packed, 2)
     row_step, column_step, _ =
-        _tile_sizes(eltype(out), rows_filled, n, 1, :forward; vector=true)
-    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
+        _tile_sizes(T, rows_filled, n, 1, :forward; vector=true)
+    @assert(
+        row_step % DECODE_WIDTH == 0,
+        "row_step must be a multiple of DECODE_WIDTH",
+    )
     @sync begin
         for row_first in 1:row_step:rows_filled
             row_last = min(row_first + row_step - 1, rows_filled)
@@ -32,22 +47,54 @@ function _resize_workspace!(workspace::Vector, count::Int)
     return workspace
 end
 
-function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace,
-                            blk)
+"""
+    _supports_lookup(out, packed, rhs) -> Bool
+
+Return whether the argument types are the dense `Float32` or `Float64` arrays
+that the lookup-table `A*X` kernel accepts.
+"""
+function _supports_lookup(
+    ::StridedMatrix{T},
+    ::Matrix{UInt8},
+    ::StridedMatrix{T},
+) where T <: SIMD_FLOAT
+    return true
+end
+
+_supports_lookup(out, packed, rhs) = false
+
+"""
+    _snparray_AX_schedule!(out, packed, rhs, values, rows_filled, workspace,
+        blk) -> out
+
+Accumulate `out += A * rhs` with the lookup-table kernel when the shape and
+array types allow it, else by spawning one register-tiled task per row block
+and rhs tile.
+"""
+function _snparray_AX_schedule!(
+    out::AbstractMatrix{T},
+    packed::AbstractMatrix{UInt8},
+    rhs::AbstractMatrix{T},
+    values::AbstractMatrix{T},
+    rows_filled::Int,
+    workspace::Vector{T},
+    blk::Vector{UInt8},
+) where T <: AbstractFloat
     n = size(packed, 2)
     k = size(out, 2)
-    T = eltype(out)
-    if _uses_lookup_kernel(rows_filled, k) && T <: SIMD_FLOAT &&
-       out isa StridedMatrix{T} && rhs isa StridedMatrix{T} &&
-       packed isa Matrix{UInt8}
-        return _snparray_AX_lookup_tile!(out, packed, rhs, values,
-                                         rows_filled, workspace, blk)
+    if _uses_lookup_kernel(rows_filled, k) &&
+       _supports_lookup(out, packed, rhs)
+        return _snparray_AX_lookup_schedule!(out, packed, rhs, values,
+                                             rows_filled, workspace, blk)
     end
     row_step, column_step, rhs_step =
         _tile_sizes(T, rows_filled, n, k, :forward; vector=false)
     lanes = _rhs_width(T, k)
     width = Val(lanes)
-    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
+    @assert(
+        row_step % DECODE_WIDTH == 0,
+        "row_step must be a multiple of DECODE_WIDTH",
+    )
     # One panel slice per spawned task, so concurrent tasks never overlap.
     panel_length = 2lanes * column_step
     tasks = cld(rows_filled, row_step) * cld(k, rhs_step)
@@ -61,7 +108,7 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace,
                 @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
                 panel_offset = task_index * panel_length
                 task_index += 1
-                Threads.@spawn _snparray_AX_kernel!(
+                Threads.@spawn _snparray_AX_task!(
                     out, packed, rhs, values, workspace, $panel_offset,
                     $row_first, $row_last, $column_step, $rhs_first,
                     $rhs_last, $width,
@@ -73,7 +120,7 @@ function _snparray_AX_tile!(out, packed, rhs, values, rows_filled, workspace,
 end
 
 """
-    _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
+    _snparray_AX_lookup_schedule!(out, packed, rhs, values, rows_filled,
         workspace, blk)
 
 Accumulate `out += A * rhs` with the lookup-table kernel: per chunk of
@@ -86,11 +133,17 @@ to a whole slice. `workspace` holds the tables, one rhs staging
 slice per build task, and one output tile per gather task; `blk` holds the
 transposed codes of one chunk.
 """
-function _snparray_AX_lookup_tile!(out, packed, rhs, values, rows_filled,
-                                   workspace, blk)
+function _snparray_AX_lookup_schedule!(
+    out::StridedMatrix{T},
+    packed::Matrix{UInt8},
+    rhs::StridedMatrix{T},
+    values::Matrix{T},
+    rows_filled::Int,
+    workspace::Vector{T},
+    blk::Vector{UInt8},
+) where T <: SIMD_FLOAT
     n = size(packed, 2)
     k = size(out, 2)
-    T = eltype(out)
     lanes = _vector_width(T)
     vectors = k <= 2lanes ? 2 : max(2, 32 ÷ lanes)
     slice = vectors * lanes
@@ -126,7 +179,7 @@ end
         row_span, row_step, block_step, stage_base, tile_base, group,
         ::Val{W}, ::Val{NV})
 
-Run the build and gather phases of `_snparray_AX_lookup_tile!` for every
+Run the build and gather phases of `_snparray_AX_lookup_schedule!` for every
 SNP chunk with rhs slices of `NV` vectors of width `W`.
 """
 function _snparray_AX_lookup_chunks!(
@@ -172,7 +225,7 @@ function _snparray_AX_lookup_chunks!(
                 row_last = min(row_first + row_step - 1, rows_filled)
                 tile_offset = tile_base + task_index * tile_len
                 task_index += 1
-                Threads.@spawn _snparray_AX_lookup_task!(
+                Threads.@spawn _snparray_AX_lookup_gather_task!(
                     out, packed, workspace, workspace, $tile_offset, blk,
                     row_span, $row_first, $row_last, $column_first, $nblk,
                     slice_stride, group, width, count,
@@ -183,19 +236,38 @@ function _snparray_AX_lookup_chunks!(
     return out
 end
 
-function _snparray_atx_tile!(out, packed, rhs, values, rows_filled, cols)
+"""
+    _snparray_atx_schedule!(out, packed, rhs, values, rows_filled, cols) -> out
+
+Accumulate `out += transpose(A[:, cols]) * rhs` by spawning one task per block
+of SNP columns, each sweeping every sample with `_snparray_atx_kernel!`.
+"""
+function _snparray_atx_schedule!(
+    out::AbstractVector{T},
+    packed::AbstractMatrix{UInt8},
+    rhs::AbstractVector{T},
+    values::AbstractMatrix{T},
+    rows_filled::Int,
+    cols::UnitRange{Int},
+) where T <: AbstractFloat
     n = length(cols)
     out_offset = first(cols) - 1
     row_step, column_step, _ =
-        _tile_sizes(eltype(out), rows_filled, n, 1, :transpose; vector=true)
-    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
+        _tile_sizes(T, rows_filled, n, 1, :transpose; vector=true)
+    @assert(
+        row_step % DECODE_WIDTH == 0,
+        "row_step must be a multiple of DECODE_WIDTH",
+    )
     @sync begin
         for column_first in first(cols):column_step:last(cols)
             column_last = min(column_first + column_step - 1, last(cols))
             Threads.@spawn begin
                 for row_first in 1:row_step:rows_filled
                     row_last = min(row_first + row_step - 1, rows_filled)
-                    @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
+                    @assert(
+                        (row_first - 1) % 4 == 0,
+                        "row_first must be ≡ 1 (mod 4)",
+                    )
                     _snparray_atx_kernel!(
                         out, packed, rhs, values, row_first, row_last,
                         $column_first, $column_last, $out_offset,
@@ -207,17 +279,33 @@ function _snparray_atx_tile!(out, packed, rhs, values, rows_filled, cols)
     return out
 end
 
-function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled, cols,
-                             workspace)
+"""
+    _snparray_AtX_schedule!(out, packed, rhs, values, rows_filled, cols,
+        workspace) -> out
+
+Accumulate `out += transpose(A[:, cols]) * rhs` by spawning one register-tiled
+task per block of SNP columns and rhs tile.
+"""
+function _snparray_AtX_schedule!(
+    out::AbstractMatrix{T},
+    packed::AbstractMatrix{UInt8},
+    rhs::AbstractMatrix{T},
+    values::AbstractMatrix{T},
+    rows_filled::Int,
+    cols::UnitRange{Int},
+    workspace::Vector{T},
+) where T <: AbstractFloat
     n = length(cols)
     k = size(out, 2)
-    T = eltype(out)
     out_offset = first(cols) - 1
     row_step, column_step, rhs_step =
         _tile_sizes(T, rows_filled, n, k, :transpose; vector=false)
     lanes = _rhs_width(T, k)
     width = Val(lanes)
-    @assert row_step % DECODE_WIDTH == 0 "row_step must be a multiple of DECODE_WIDTH"
+    @assert(
+        row_step % DECODE_WIDTH == 0,
+        "row_step must be a multiple of DECODE_WIDTH",
+    )
     panel_length = 2lanes * row_step
     tasks = cld(n, column_step) * cld(k, rhs_step)
     _resize_workspace!(workspace, tasks * panel_length)
@@ -229,7 +317,7 @@ function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled, cols,
                 column_last = min(column_first + column_step - 1, last(cols))
                 panel_offset = task_index * panel_length
                 task_index += 1
-                Threads.@spawn _snparray_AtX_kernel!(
+                Threads.@spawn _snparray_AtX_task!(
                     out, packed, rhs, values, workspace, $panel_offset,
                     $row_step, rows_filled, $column_first, $column_last,
                     $rhs_first, $rhs_last, $out_offset, $width,

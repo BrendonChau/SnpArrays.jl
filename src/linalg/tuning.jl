@@ -1,4 +1,11 @@
 """
+    SIMD_FLOAT
+
+Element types the SIMD kernels accept: `Float32` and `Float64`.
+"""
+const SIMD_FLOAT = Union{Float32, Float64}
+
+"""
     VECTOR_BYTES
 
 SIMD register width in bytes used by the register-tiled kernels: 64 on
@@ -64,6 +71,59 @@ flat part of the measured response curve on a Xeon 6736P.
 const PACKED_LINES_BUDGET = 32_768
 
 """
+    LOOKUP_ROW_TILE
+
+Samples per inner tile of the lookup-table `A*X` kernel; the tile's
+row-major partial sums (`LOOKUP_ROW_TILE` times the rhs slice width) stay
+L1-resident while every 4-SNP block of a group is gathered. Initial value
+from `kq_pass.c`.
+"""
+const LOOKUP_ROW_TILE = 512
+
+"""
+    LOOKUP_CHUNK_SNPS
+
+SNPs per chunk of the lookup-table `A*X` kernel (a multiple of 4). One
+chunk's 256-row tables for all `k` rhs columns are built once, shared by
+every gather task, and cost `LOOKUP_CHUNK_SNPS / 4 * 256 * k_padded *
+sizeof(T)` bytes. Initial value from `kq_pass.c`.
+"""
+const LOOKUP_CHUNK_SNPS = 1024
+
+"""
+    LOOKUP_GROUP_BUDGET
+
+Bytes of lookup tables swept per inner sample tile, so a group of 4-SNP
+blocks stays L2-resident across the tile. Initial value from `kq_pass.c`.
+"""
+const LOOKUP_GROUP_BUDGET = 1 << 20
+
+"""
+    LOOKUP_MIN_ROWS
+
+Fewest samples for which `A*X` uses the lookup-table kernel; below it the
+`256 * k` table build per 4-SNP block is not amortised.
+"""
+const LOOKUP_MIN_ROWS = 2048
+
+"""
+    LOOKUP_MIN_RHS
+
+Fewest rhs columns for which `A*X` uses the lookup-table kernel.
+"""
+const LOOKUP_MIN_RHS = 4
+
+"""
+    _uses_lookup_kernel(m::Int, k::Int) -> Bool
+
+Return whether `A*X` with `m` samples and `k` rhs columns runs the
+lookup-table kernel rather than the register-tiled kernel.
+"""
+function _uses_lookup_kernel(m::Int, k::Int)
+    return m >= LOOKUP_MIN_ROWS && k >= LOOKUP_MIN_RHS
+end
+
+"""
     _vector_width(::Type{T}) -> Int
 
 Return the number of `T` lanes in a `Vec{W,T}` register of width
@@ -88,7 +148,7 @@ function _rhs_width(::Type{T}, k::Int) where T
 end
 
 """
-    _micro_tile(::Type{T}) -> (MR, NR)
+    _register_tile_shape(::Type{T}) -> (MR, NR)
 
 Return the register-tile shape `(MR, NR)` for element type `T`: `NR =
 2 * _vector_width(T)` rhs lanes and `MR` accumulator rows. Register
@@ -97,7 +157,7 @@ broadcast = 15 ymm registers); AVX2 Float64 gives `MR=6, NR=8` (15 ymm);
 AVX-512 gives `MR=8` (19 zmm); NEON packs `W=8` Float32 lanes as two q
 registers, using 30 of 32 registers.
 """
-function _micro_tile(::Type{T}) where T
+function _register_tile_shape(::Type{T}) where T
     mr = VECTOR_BYTES[] == 64 ? 8 : 6
     return mr, 2 * _vector_width(T)
 end
@@ -152,7 +212,7 @@ function _tile_sizes(
         "direction must be :forward or :transpose, got $direction",
     ))
     round_down16(x) = max(DECODE_WIDTH, (x ÷ DECODE_WIDTH) * DECODE_WIDTH)
-    _, nr = _micro_tile(T)
+    _, nr = _register_tile_shape(T)
     k_block = min(k, 256)
     k_padded = cld(max(k_block, 1), nr) * nr
     if direction == :forward

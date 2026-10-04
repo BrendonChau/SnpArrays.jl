@@ -42,7 +42,7 @@ end
 
 Multiply `sla` by a vector or matrix and overwrite `out`. A matrix `rhs`
 with at least `LOOKUP_MIN_RHS` columns on at least `LOOKUP_MIN_ROWS`
-samples uses the lookup-table kernel (`_snparray_AX_lookup_tile!`); other
+samples uses the lookup-table kernel (`_snparray_AX_lookup_schedule!`); other
 shapes use the register-tiled kernel. The five-argument form computes
 `out = α * sla * rhs + β * out`.
 Concurrent matrix products on one `SnpLinAlg`, forward or transposed, run
@@ -70,7 +70,7 @@ function mul!(
         "right-hand side has length $(length(rhs)); expected $(size(sla, 2))",
     ))
     _begin_scaled_product!(out, α, β) || return out
-    _snparray_ax_tile!(out, sla.s.data, rhs, sla.values, sla.s.m)
+    _snparray_ax_schedule!(out, sla.s.data, rhs, sla.values, sla.s.m)
     return _finish_scaled_product!(out, α)
 end
 
@@ -96,8 +96,8 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
     _begin_scaled_product!(out, α, β) || return out
-    @lock sla.lock _snparray_AX_tile!(out, sla.s.data, rhs, sla.values,
-                                      sla.s.m, sla.panel, sla.blk)
+    @lock sla.lock _snparray_AX_schedule!(out, sla.s.data, rhs, sla.values,
+                                          sla.s.m, sla.panel, sla.blk)
     return _finish_scaled_product!(out, α)
 end
 
@@ -144,7 +144,7 @@ function mul!(
     # The dense genotype arrays with `cols` as an index offset, never a
     # view: indexing a `SubArray` per element costs about 2x in the
     # register-tiled kernel.
-    _snparray_atx_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, cols)
+    _snparray_atx_schedule!(out, sla.s.data, rhs, sla.values, sla.s.m, cols)
     return out
 end
 
@@ -164,8 +164,8 @@ function mul!(
         "right-hand side has length $(length(rhs)); expected $(size(sla, 1))",
     ))
     _begin_scaled_product!(out, α, β) || return out
-    _snparray_atx_tile!(out, sla.s.data, rhs, sla.values, sla.s.m,
-                        1:size(sla, 2))
+    _snparray_atx_schedule!(out, sla.s.data, rhs, sla.values, sla.s.m,
+                            1:size(sla, 2))
     return _finish_scaled_product!(out, α)
 end
 
@@ -200,8 +200,8 @@ function mul!(
     # The dense genotype arrays with `cols` as an index offset, never a
     # view: indexing a `SubArray` per element costs about 2x in the
     # register-tiled kernel.
-    @lock sla.lock _snparray_AtX_tile!(out, sla.s.data, rhs, sla.values,
-                                       sla.s.m, cols, sla.panel)
+    @lock sla.lock _snparray_AtX_schedule!(out, sla.s.data, rhs, sla.values,
+                                           sla.s.m, cols, sla.panel)
     return out
 end
 
@@ -221,7 +221,7 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
     _begin_scaled_product!(out, α, β) || return out
-    @lock sla.lock _snparray_AtX_tile!(out, sla.s.data, rhs, sla.values,
-                                       sla.s.m, 1:size(sla, 2), sla.panel)
+    @lock sla.lock _snparray_AtX_schedule!(out, sla.s.data, rhs, sla.values,
+                                           sla.s.m, 1:size(sla, 2), sla.panel)
     return _finish_scaled_product!(out, α)
 end
