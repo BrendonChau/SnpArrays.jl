@@ -1,8 +1,12 @@
-# Time SnpLinAlg A*X and Aᵀ*X with K right-hand sides on a PLINK bed file and
-# append one CSV row per type and product to `csv`.
+# Benchmark the SnpLinAlg matrix products A*X and Aᵀ*X with k right-hand sides
+# on a PLINK bed file.
 #
 #     julia -t N --project=. benchmark/matmul.jl \
-#       [bed] [k] [repeats] [csv] [label]
+#       [bed] [k] [repeats] [results_dir]
+#
+# The report is also written to a timestamped markdown file in `results_dir`.
+# Defaults: bed = the synthetic chromosome 21 genotypes below, k = 128,
+# repeats = 3, results_dir = `results/` next to this script.
 using Dates
 using LinearAlgebra
 using Printf
@@ -13,18 +17,81 @@ const BED = length(ARGS) >= 1 ? ARGS[1] :
     "/u/scratch/b/bhchau/cudaext_check/synthetic_v1_chr-21.bed"
 const K = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 128
 const REPEATS = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 3
-const CSV = length(ARGS) >= 4 ? ARGS[4] :
-    joinpath(@__DIR__, "results", "matmul.csv")
-const LABEL = length(ARGS) >= 5 ? ARGS[5] : ""
-const HEADER = "timestamp,label,cpu,threads,bed,m,n,k,type,product,repeats," *
-               "min_ms,median_ms,gfma_per_s,sum_abs2"
+const RESULTS_DIR = length(ARGS) >= 4 ? ARGS[4] : joinpath(@__DIR__, "results")
 
 """
-    time_call(f!, args...; repeats = 5) -> (minimum, median)
+    has_fork_internals() -> Bool
+
+Return whether the loaded SnpArrays has the register-tiled schedulers.
+"""
+has_fork_internals() = isdefined(SnpArrays, :_snparray_AX_spawn_tasks!)
+
+"""
+    emit(io, line)
+
+Print `line` to `stdout` and to `io`, then flush `io`.
+"""
+function emit(io::IO, line::AbstractString)
+    println(line)
+    println(io, line)
+    flush(io)
+    return nothing
+end
+
+"""
+    report_path(dir) -> String
+
+Create `dir` and return the timestamped report path in it; an existing file
+at that path is an error.
+"""
+function report_path(dir::AbstractString)
+    kind = has_fork_internals() ? "fork" : "upstream"
+    stamp = Dates.format(now(), "yyyymmdd-HHMMSS")
+    path = joinpath(dir, "matmul_$(Sys.CPU_NAME)_$(kind)_$(stamp).md")
+    ispath(path) && error("$(path) exists; wait a second or remove it")
+    mkpath(dir)
+    return path
+end
+
+"""
+    print_fact(io, name, value)
+
+Print one row of the `| Fact | Value |` table.
+"""
+function print_fact(io::IO, name::AbstractString, value)
+    emit(io, "| $(name) | `$(value)` |")
+    return nothing
+end
+
+"""
+    print_header(io, m, n)
+
+Print the environment facts as a markdown table.
+"""
+function print_header(io::IO, m::Int, n::Int)
+    emit(io, "| Fact | Value |")
+    emit(io, "| --- | --- |")
+    print_fact(io, "SnpArrays", has_fork_internals() ? "fork" : "upstream")
+    print_fact(io, "threads", Threads.nthreads())
+    print_fact(io, "Sys.CPU_NAME", Sys.CPU_NAME)
+    print_fact(io, "Sys.ARCH", Sys.ARCH)
+    print_fact(io, "VERSION", VERSION)
+    print_fact(io, "pkgdir", pkgdir(SnpArrays))
+    print_fact(io, "bed", BED)
+    print_fact(io, "m, n", "m = $(m), n = $(n)")
+    print_fact(io, "k", K)
+    print_fact(io, "repeats", REPEATS)
+    isdefined(SnpArrays, :VECTOR_BYTES) &&
+        print_fact(io, "VECTOR_BYTES", SnpArrays.VECTOR_BYTES[])
+    return nothing
+end
+
+"""
+    time_call(f!, args...; repeats) -> (minimum, median)
 
 Time `f!(args...)` in seconds, after one warm-up call.
 """
-function time_call(f!::F, args...; repeats::Int = 5) where F
+function time_call(f!::F, args...; repeats::Int) where F
     f!(args...)
     times = [@elapsed f!(args...) for _ in 1:repeats]
     sort!(times)
@@ -32,81 +99,101 @@ function time_call(f!::F, args...; repeats::Int = 5) where F
 end
 
 """
-    report(io, stamp, ::Type{T}, product, dims, times, out)
+    print_row(io, ::Type{T}, product, variant, times, fmas)
 
-Print one result line and append its CSV row to `io`, then flush `io`.
+Print one row of the timing table; `times` is `(minimum, median)` in seconds.
 """
-function report(
+function print_row(
     io::IO,
-    stamp::AbstractString,
     ::Type{T},
     product::AbstractString,
-    dims::NTuple{2, Int},
+    variant::AbstractString,
     times::NTuple{2, Float64},
-    out::AbstractMatrix{T},
+    fmas::Float64,
 ) where T
-    m, n = dims
-    gfma = m * n * K / times[1] / 1e9
-    checksum = @sprintf("%.17g", sum(abs2, out))
-    @printf("%-8s %-5s min %10.3f ms  median %10.3f ms  %8.2f GFMA/s  %s\n",
-            T, product, 1000 * times[1], 1000 * times[2], gfma, checksum)
-    println(io, join((stamp, LABEL, Sys.CPU_NAME, Threads.nthreads(),
-                      basename(BED), m, n, K, T, product, REPEATS,
-                      @sprintf("%.6f", 1000 * times[1]),
-                      @sprintf("%.6f", 1000 * times[2]),
-                      @sprintf("%.4f", gfma), checksum), ","))
-    flush(io)
+    emit(io, @sprintf(
+        "| %s | %s | %d | %s | %.3f | %.3f | %.2f |",
+        T, product, K, variant, 1000 * times[1], 1000 * times[2],
+        fmas / times[1] / 1e9,
+    ))
     return nothing
 end
 
-"""
-    bench_type(io, stamp, G, ::Type{T})
+function matrix_variant(m::Int, k::Int)
+    isdefined(SnpArrays, :_uses_lookup_kernel) || return "mul!"
+    return SnpArrays._uses_lookup_kernel(m, k) ? "mul! (lookup)" :
+           "mul! (register-tiled)"
+end
 
-Time A*X and Aᵀ*X for the standardized `SnpLinAlg{T}` of `G`.
 """
-function bench_type(
-    io::IO,
-    stamp::AbstractString,
-    G::SnpArray,
+    checksum_row(::Type{T}, product, out) -> String
+
+Return the checksum table row holding `sum(abs2, out)`.
+"""
+function checksum_row(
     ::Type{T},
+    product::AbstractString,
+    out::Matrix{T},
 ) where T
+    return @sprintf("| %s | `%s` | %.17g |", T, product, sum(abs2, out))
+end
+
+"""
+    run_type(io, ::Type{T}, G) -> Vector{String}
+
+Print the timing rows of both products for element type `T` and return their
+checksum rows.
+"""
+function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
     m, n = size(G)
     operator = SnpLinAlg{T}(G; center = true, scale = true, impute = true)
     X = randn(Xoshiro(1), T, n, K)
     Y = randn(Xoshiro(2), T, m, K)
     AX = Matrix{T}(undef, m, K)
     AtX = Matrix{T}(undef, n, K)
-    times = time_call(mul!, AX, operator, X; repeats = REPEATS)
-    report(io, stamp, T, "A*X", (m, n), times, AX)
-    times = time_call(mul!, AtX, transpose(operator), Y; repeats = REPEATS)
-    report(io, stamp, T, "Aᵀ*X", (m, n), times, AtX)
-    return nothing
+    fmas = Float64(m) * n * K
+    print_row(io, T, "A*X", matrix_variant(m, K),
+              time_call(mul!, AX, operator, X; repeats = REPEATS), fmas)
+    print_row(io, T, "Aᵀ*X",
+              has_fork_internals() ? "mul! (register-tiled)" : "mul!",
+              time_call(mul!, AtX, transpose(operator), Y; repeats = REPEATS),
+              fmas)
+    return [checksum_row(T, "A*X", AX), checksum_row(T, "Aᵀ*X", AtX)]
 end
 
-"""
-    main()
-
-Benchmark both element types on `BED` and append the rows to `CSV`.
-"""
 function main()
+    path = report_path(RESULTS_DIR)
+    io = open(path, "w")
+    emit(io, "# `matmul.jl` on $(Sys.CPU_NAME)")
+    emit(io, "")
+    emit(io, "## Environment")
+    emit(io, "")
     G = SnpArray(BED)
-    m, n = size(G)
-    println("bed: $BED\nm = $m, n = $n, k = $K, repeats = $REPEATS")
-    println("threads = $(Threads.nthreads()), cpu = $(Sys.CPU_NAME), " *
-            "julia = $VERSION")
-    stamp = Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")
-    mkpath(dirname(CSV))
-    new_file = !isfile(CSV) || filesize(CSV) == 0
-    io = open(CSV, "a")
-    if new_file
-        println(io, HEADER)
-        flush(io)
-    end
+    print_header(io, size(G, 1), size(G, 2))
+    emit(io, "")
+    emit(io, "## Timings")
+    emit(io, "")
+    emit(io, "| Type | Product | k | Variant | min ms | median ms | " *
+             "GFMA/s |")
+    emit(io, "|---|---|---:|---|---:|---:|---:|")
+    checksums = String[]
     for T in (Float32, Float64)
-        bench_type(io, stamp, G, T)
+        append!(checksums, run_type(io, T, G))
     end
+    emit(io, "")
+    emit(io, "## Checksums")
+    emit(io, "")
+    emit(io, "| Type | Product | sum(abs2) |")
+    emit(io, "| --- | --- | ---: |")
+    for row in checksums
+        emit(io, row)
+    end
+    emit(io, "")
+    emit(io, "## Peak RSS")
+    emit(io, "")
+    emit(io, @sprintf("%.0f MiB", Sys.maxrss() / 2^20))
     close(io)
-    println("csv: $CSV")
+    println(path)
     return nothing
 end
 
