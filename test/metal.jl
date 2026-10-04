@@ -192,3 +192,72 @@ end
     end
 end
 
+@testset "streamed_mul! on MtlMatrix" begin
+    rng = Random.Xoshiro(17)
+    dir = mktempdir()
+    # m = 64 fills whole 16-sample words, m = 379 does not; two files test
+    # chunks that stop at file boundaries.
+    beds = map(enumerate(((64, 300), (64, 211)))) do (index, (m, n))
+        path = joinpath(dir, "stream_$index.bed")
+        s = SnpArray(path, m, n)
+        s .= rand(rng, (0x00, 0x01, 0x02, 0x03), m, n)
+        write(replace(path, ".bed" => ".fam"), repeat("f s 0 0 1 -9\n", m))
+        write(replace(path, ".bed" => ".bim"), repeat("1 r 0 1 A G\n", n))
+        path
+    end
+    cases = ((beds, 64), (SnpArrays.datadir("EUR_subset.bed"), 379))
+    for (files, m) in cases
+        stream = SnpLinAlgStream{Float32}(files; width=128, center=true,
+            scale=true)
+        chunks = [copy(chunk.s.data) for (cols, chunk) in stream]
+        s = SnpArray(undef, m, size(stream, 2))
+        s.data .= reduce(hcat, chunks)
+        sla = SnpLinAlg{Float32}(s; center=true, scale=true)
+        rtol = 1e-5
+        for k in (1, 8, 40)
+            X = randn(rng, Float32, size(stream, 2), k)
+            Y = randn(rng, Float32, m, k)
+            out = MtlMatrix{Float32}(undef, m, k)
+            @test relerr(Array(streamed_mul!(out, stream, MtlArray(X))),
+                sla * X) < rtol
+            out = MtlMatrix{Float32}(undef, size(stream, 2), k)
+            @test relerr(Array(streamed_mul!(out, stream, MtlArray(Y);
+                transpose=true)), transpose(sla) * Y) < rtol
+        end
+    end
+    stream = SnpLinAlgStream{Float32}(beds; width=128)
+    @test_throws DimensionMismatch streamed_mul!(Metal.zeros(Float32, 64, 2),
+        stream, Metal.zeros(Float32, 510, 2))
+    @test_throws DimensionMismatch streamed_mul!(Metal.zeros(Float32, 510, 2),
+        stream, Metal.zeros(Float32, 64, 2); transpose=true)
+    @test_throws ArgumentError streamed_mul!(Metal.zeros(Float32, 64, 2),
+        SnpLinAlgStream{Float64}(beds; width=128),
+        Metal.zeros(Float32, 511, 2))
+end
+
+@testset "streamed_grm_mul! on MtlMatrix" begin
+    rng = Random.Xoshiro(19)
+    bed = SnpArrays.datadir("EUR_subset.bed")
+    m, n = size(EUR)
+    stream = SnpLinAlgStream{Float32}(bed; width=500, center=true,
+        scale=true)
+    rtol = 1e-5
+    for k in (1, 8, 40)
+        Q = randn(rng, Float32, m, k)
+        scale = rand(rng, Float32, n)
+        V = zeros(Float32, m, k)
+        U = zeros(Float32, n, k)
+        streamed_grm_mul!(V, U, stream, Q; scale)
+        Vd = MtlMatrix{Float32}(undef, m, k)
+        Ud = MtlMatrix{Float32}(undef, n, k)
+        streamed_grm_mul!(Vd, Ud, stream, MtlArray(Q); scale)
+        @test relerr(Array(Vd), V) < rtol
+        @test relerr(Array(Ud), U) < rtol
+        streamed_grm_mul!(V, stream, Q)
+        @test relerr(Array(streamed_grm_mul!(Vd, stream, MtlArray(Q))),
+            V) < rtol
+    end
+    @test_throws ArgumentError streamed_grm_mul!(
+        Metal.zeros(Float32, m, 2), SnpLinAlgStream{Float64}(bed),
+        Metal.zeros(Float32, m, 2))
+end

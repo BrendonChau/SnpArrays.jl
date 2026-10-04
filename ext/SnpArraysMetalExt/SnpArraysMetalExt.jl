@@ -2,6 +2,7 @@ module SnpArraysMetalExt
 
 import Base: *
 import LinearAlgebra: mul!
+import SnpArrays: streamed_grm_mul!, streamed_mul!
 
 using Metal: @metal, MemoryFlagThreadGroup, MtlArray, MtlMatrix,
     MtlThreadGroupArray, MtlVector, simdgroup_barrier,
@@ -11,10 +12,11 @@ using Metal: @metal, MemoryFlagThreadGroup, MtlArray, MtlMatrix,
     threadgroup_barrier, threadgroup_position_in_grid, threads_per_threadgroup
 using LinearAlgebra: Adjoint, Transpose
 using SnpArrays: ADDITIVE_MODEL, DOMINANT_MODEL, MtlSnpArray, RECESSIVE_MODEL,
-    SnpArray, _packed_words, mean
+    SnpArray, SnpLinAlgStream, _check_streamed_grm_dims, _packed_words, mean
 
 include("kernels.jl")
 include("simd.jl")
 include("linalg.jl")
+include("stream.jl")
 
 end # module
