@@ -172,6 +172,55 @@ function print_header(io::IO, m::Int, n::Int)
 end
 
 """
+    print_steps(io, ::Type{T}, product, k, steps, tile)
+
+Print one row of the tile-size table; `steps` is `(row_step, column_step,
+rhs_step)` and `tile` the register tile.
+"""
+function print_steps(
+    io::IO,
+    ::Type{T},
+    product::AbstractString,
+    k::Int,
+    steps::NTuple{3, Int},
+    tile::AbstractString,
+) where T
+    emit(io, "| $(T) | $(product) | $(k) | $(steps[1]) | $(steps[2]) | " *
+             "$(steps[3]) | $(tile) |")
+    return nothing
+end
+
+"""
+    print_tile_sizes(io, m, n)
+
+Print the cache tile sizes (samples, SNPs, and rhs columns per block) and the
+`MR x 2W` register tile of every product timed below.
+"""
+function print_tile_sizes(io::IO, m::Int, n::Int)
+    emit(io, "")
+    emit(io, "## Tile sizes")
+    emit(io, "")
+    emit(io, "| Type | Product | k | row_step | column_step | rhs_step | " *
+             "register tile |")
+    emit(io, "|---|---|---:|---:|---:|---:|---|")
+    for T in (Float32, Float64)
+        rows = SnpArrays._snparray_ax_row_step(T, m)
+        print_steps(io, T, "A*x", 1, (rows, n, 1), "none")
+        rows, columns = SnpArrays._snparray_atx_steps(T, n)
+        print_steps(io, T, "Aᵀ*y", 1, (rows, columns, 1), "none")
+        tile_rows = SnpArrays._register_tile_shape(T)[1]
+        for k in RHS_COUNTS
+            tile = "$(tile_rows) x $(2 * SnpArrays._rhs_width(T, k))"
+            print_steps(io, T, "A*X", k, SnpArrays._snparray_AX_steps(T, m, k),
+                        tile)
+            print_steps(io, T, "Aᵀ*X", k,
+                        SnpArrays._snparray_AtX_steps(T, n, k), tile)
+        end
+    end
+    return nothing
+end
+
+"""
     time_call(f!, args...; repeats = 5) -> (minimum, median)
 
 Time `f!(args...)` in seconds, after one warm-up call.
@@ -394,6 +443,20 @@ function write_native(
 end
 
 """
+    embed_native(io, path)
+
+Copy the assembly file `path` into `io` as a fenced block; not echoed to
+`stdout`.
+"""
+function embed_native(io::IO, path::AbstractString)
+    println(io, "\n### `", basename(path), "`\n\n```asm")
+    write(io, read(path, String))
+    println(io, "```")
+    flush(io)
+    return nothing
+end
+
+"""
     write_generated_code(io, prefix, G)
 
 Write the `Float32` register-tile code at the host default `(MR, U = 2, W)`.
@@ -420,6 +483,10 @@ function write_generated_code(io::IO, prefix::AbstractString, G::SnpArray)
     write_native(io, prefix * "_AtX.s", SnpArrays._snparray_AtX_register_tile!,
                  Tuple{typeof(task), UnitRange{Int}, Int, UnitRange{Int},
                        tile, Val{2}, width})
+    emit(io, "")
+    emit(io, "The listings follow in the report file only.")
+    embed_native(io, prefix * "_AX.s")
+    embed_native(io, prefix * "_AtX.s")
     return nothing
 end
 
@@ -432,6 +499,7 @@ function main()
     emit(io, "")
     G = load_genotypes(io, M, N, PREFIX)
     print_header(io, M, N)
+    has_fork_internals() && print_tile_sizes(io, M, N)
     emit(io, "")
     emit(io, "## Timings")
     emit(io, "")
