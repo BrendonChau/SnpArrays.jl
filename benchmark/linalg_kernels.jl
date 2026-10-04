@@ -5,7 +5,8 @@
 #     julia -t N --project=. benchmark/linalg_kernels.jl \
 #       [m] [n] [prefix] [results_dir]
 #
-# The report is also written to a timestamped markdown file in `results_dir`.
+# The report is also written to a timestamped markdown file in `results_dir`,
+# with the register-tile assembly in two `.s` files beside it.
 # Defaults: m = 8192, n = 49152, prefix = "linalg_kernels", results_dir =
 # `results/` next to this script. Run the fork first; it simulates
 # `<prefix>.bed` and `<prefix>.fam`. Then run the registered package on the
@@ -438,30 +439,17 @@ function write_native(
     code_native(asm, f, types; syntax = :intel, debuginfo = :none)
     close(asm)
     fmas = count(Base.Fix1(occursin, r"vfmadd|fmla"), readlines(path))
-    emit(io, "| `$(path)` | $(fmas) |")
+    emit(io, "| `$(basename(path))` | $(fmas) |")
     return nothing
 end
 
 """
-    embed_native(io, path)
+    write_generated_code(io, stem, G)
 
-Copy the assembly file `path` into `io` as a fenced block; not echoed to
-`stdout`.
+Write the `Float32` register-tile code at the host default `(MR, U = 2, W)`
+to `<stem>_AX.s` and `<stem>_AtX.s`.
 """
-function embed_native(io::IO, path::AbstractString)
-    println(io, "\n### `", basename(path), "`\n\n```asm")
-    write(io, read(path, String))
-    println(io, "```")
-    flush(io)
-    return nothing
-end
-
-"""
-    write_generated_code(io, prefix, G)
-
-Write the `Float32` register-tile code at the host default `(MR, U = 2, W)`.
-"""
-function write_generated_code(io::IO, prefix::AbstractString, G::SnpArray)
+function write_generated_code(io::IO, stem::AbstractString, G::SnpArray)
     operator = SnpLinAlg{Float32}(G; center = true, scale = true,
                                   impute = true)
     task = SnpArrays.RegisterTileTask(
@@ -477,16 +465,12 @@ function write_generated_code(io::IO, prefix::AbstractString, G::SnpArray)
     emit(io, "")
     emit(io, "| File | Lines with vfmadd or fmla |")
     emit(io, "| --- | ---: |")
-    write_native(io, prefix * "_AX.s", SnpArrays._snparray_AX_register_tile!,
+    write_native(io, stem * "_AX.s", SnpArrays._snparray_AX_register_tile!,
                  Tuple{typeof(task), Int, UnitRange{Int}, UnitRange{Int},
                        tile, Val{2}, width})
-    write_native(io, prefix * "_AtX.s", SnpArrays._snparray_AtX_register_tile!,
+    write_native(io, stem * "_AtX.s", SnpArrays._snparray_AtX_register_tile!,
                  Tuple{typeof(task), UnitRange{Int}, Int, UnitRange{Int},
                        tile, Val{2}, width})
-    emit(io, "")
-    emit(io, "The listings follow in the report file only.")
-    embed_native(io, prefix * "_AX.s")
-    embed_native(io, prefix * "_AtX.s")
     return nothing
 end
 
@@ -510,7 +494,7 @@ function main()
         run_type(io, T, G)
     end
     print_agreement(io, G)
-    has_fork_internals() && write_generated_code(io, PREFIX, G)
+    has_fork_internals() && write_generated_code(io, splitext(path)[1], G)
     emit(io, "")
     emit(io, "## Peak RSS")
     emit(io, "")
