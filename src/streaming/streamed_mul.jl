@@ -1,13 +1,11 @@
 """
-    streamed_mul!(out, stream::SnpLinAlgStream, X; transpose = false,
-                  slots = 3) -> out
+    streamed_mul!(out, stream::SnpLinAlgStream, X; transpose = false) -> out
 
 Compute `out = A * X`, or `out = transpose(A) * X`, for the genotype matrix
 `A` behind `stream` in one pass over its chunks.
 
 # Keywords
 - `transpose::Bool = false`: multiply by `transpose(A)`
-- `slots::Integer = 3`: ignored
 
 # Throws
 - `DimensionMismatch`: `X` or `out` does not match `size(stream)`
@@ -17,7 +15,6 @@ function streamed_mul!(
     stream::SnpLinAlgStream{T},
     X::AbstractMatrix{T};
     transpose::Bool = false,
-    slots::Integer = 3,
 ) where T <: AbstractFloat
     m, n = size(stream)
     k = size(X, 2)
