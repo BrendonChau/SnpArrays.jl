@@ -1,8 +1,8 @@
 """
     _check_bed_magic!(io, path) -> io
 
-Verify `io`'s three-byte `.bed` header, closing `io` and throwing an
-`ArgumentError` naming `path` if it is wrong.
+Close `io` and throw an `ArgumentError` naming `path` unless `io` starts
+with the three-byte `.bed` header.
 """
 function _check_bed_magic!(io::IO, path::AbstractString)
     if read(io, UInt16) != 0x1b6c
@@ -19,9 +19,8 @@ end
 """
     _open_reader_handles(path, io, readers) -> Vector{IOStream}
 
-Return `io` plus `readers - 1` further read handles on `path` when
-`readers > 1` and `io` is a seekable `IOStream`; otherwise an empty vector,
-which selects the serial chunk read.
+Return `readers` read handles on `path`, the first being `io`, or an empty
+vector when `readers == 1` or `io` is not an `IOStream`.
 """
 function _open_reader_handles(path::AbstractString, io::IO, readers::Int)
     (readers > 1 && io isa IOStream) || return IOStream[]
@@ -36,8 +35,8 @@ end
 """
     _refresh_chunk_statistics!(buffer) -> buffer
 
-Zero `buffer`'s cached counts and refill its statistics from the freshly
-read codes in `buffer.s.data`.
+Recompute `buffer`'s counts, means, and genotype values from the codes in
+`buffer.s.data`.
 """
 function _refresh_chunk_statistics!(
     buffer::SnpLinAlg{T},
@@ -51,8 +50,8 @@ end
 """
     _read_chunk_serial!(io, buffer) -> buffer
 
-Read one chunk of packed genotypes into `buffer.s.data` with a single
-sequential read and refill `buffer`'s statistics.
+Read one chunk of packed genotypes from `io` into `buffer` and refresh its
+statistics.
 """
 function _read_chunk_serial!(
     io::IO,
@@ -65,9 +64,8 @@ end
 """
     _read_column_block!(io, data, file_offset, byte_first, nbytes) -> data
 
-Seek `io` to `file_offset` and read `nbytes` bytes into `data` starting at
-linear index `byte_first`; throws an `ArgumentError` naming the offset if
-fewer than `nbytes` bytes remain.
+Read `nbytes` bytes at byte `file_offset` of `io` into `data` from linear
+index `byte_first`, throwing an `ArgumentError` when fewer remain.
 """
 function _read_column_block!(
     io::IOStream,
@@ -89,9 +87,9 @@ end
 """
     _read_chunk_parallel!(handles, buffer, byte_offset, drows) -> buffer
 
-Read the chunk starting at file byte `byte_offset` into `buffer.s.data`
-using one task per contiguous block of `DECODE_WIDTH`-aligned columns, one
-block per handle, then refill `buffer`'s statistics.
+Read the chunk at file byte `byte_offset` into `buffer`, one block of
+columns per handle, and refresh its statistics. `drows` is the number of
+bytes per SNP column.
 """
 function _read_chunk_parallel!(
     handles::Vector{IOStream},

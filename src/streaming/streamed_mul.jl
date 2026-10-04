@@ -1,14 +1,16 @@
 """
-    streamed_mul!(out, stream::SnpLinAlgStream, X; transpose=false,
-                  slots=3) -> out
+    streamed_mul!(out, stream::SnpLinAlgStream, X; transpose = false,
+                  slots = 3) -> out
 
-Compute `out = A * X`, or `out = transpose(A) * X` with `transpose=true`,
-for the genotype matrix `A` behind `stream` in one pass over its chunks,
-without holding `A` in memory. Each chunk uses the stream's lookup values,
-so the result matches the `SnpLinAlg` products of `stream`'s chunks.
+Compute `out = A * X`, or `out = transpose(A) * X`, for the genotype matrix
+`A` behind `stream` in one pass over its chunks.
 
-`out` and `X` are `AbstractMatrix`es, each chunk's product runs on the
-`SnpLinAlg` kernels, and `slots` is ignored.
+# Keywords
+- `transpose::Bool = false`: multiply by `transpose(A)`
+- `slots::Integer = 3`: ignored
+
+# Throws
+- `DimensionMismatch`: `X` or `out` does not match `size(stream)`
 """
 function streamed_mul!(
     out::AbstractMatrix{T},
@@ -115,19 +117,25 @@ function _streamed_grm_mul!(
 end
 
 """
-    streamed_grm_mul!(V, stream, Q; scale=inv(size(stream, 2)), U=nothing)
-    streamed_grm_mul!(V::AbstractMatrix{Float64},
-                      stream::SnpLinAlgStream{Float32},
-                      Q::AbstractMatrix{Float64};
-                      scale=inv(size(stream, 2)), U=nothing)
+    streamed_grm_mul!(V, stream::SnpLinAlgStream, Q; scale, U = nothing)
+        -> V
 
-Accumulate `V = Σ_c A_c diag(s_c) transpose(A_c) Q` over the chunks `A_c`
-of `stream`, where `s_c` is `scale` restricted to chunk `c`'s columns and
-`scale` is a scalar or length-`size(stream, 2)` vector with the element
-type of `V`. When `U` is an `AbstractMatrix`, also write the unscaled
-`transpose(A) * Q` into it. With a `Float32` stream and `Float64` `V` and
-`Q`, each chunk's product runs in single precision and is accumulated into
-`V` in double precision.
+Compute `V = A * (scale .* (transpose(A) * Q))` for the genotype matrix `A`
+behind `stream` in one pass over its chunks.
+
+`V`, `Q`, and `stream` share one element type, except that a `Float32`
+stream accepts `Float64` `V` and `Q`: each chunk's product then runs in
+single precision and accumulates into `V` in double precision.
+
+# Keywords
+- `scale = inv(size(stream, 2))`: a scalar, or a vector with one weight per
+  SNP, with the element type of `V`
+- `U = nothing`: a matrix that receives the unscaled `transpose(A) * Q`
+
+# Throws
+- `DimensionMismatch`: `V`, `Q`, `U`, or a vector `scale` does not match
+  `size(stream)`
+- `TypeError`: `scale` does not have the element type of `V`
 """
 function streamed_grm_mul!(
     V::AbstractMatrix{T},

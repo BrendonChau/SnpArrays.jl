@@ -1,27 +1,35 @@
-# Mutable per-iteration state: which file and column within it is next to
-# be handed out, the file's open handle (and, for a plain `.bed` file with
-# multiple readers, the parallel-read handles), which buffer of a pair is
-# next to be filled, the byte offset of the prepared chunk, and (with
-# prefetch) the in-flight read/refill task for the chunk after the one
-# about to be delivered.
+"""
+    SnpLinAlgStreamState
+
+Iteration state of a `SnpLinAlgStream`: the read position in the files and
+the chunk scheduled for the next `iterate` call.
+"""
 mutable struct SnpLinAlgStreamState
     file_index::Int
+    # Columns of the current file already scheduled.
     file_col::Int
     io::IO
+    # Buffer of the pair, 1 or 2, that the next scheduled chunk fills.
     which::Int
+    # The scheduled chunk: its columns, buffer, width, and prefetch task.
     next_cols::UnitRange{Int}
     next_which::Int
     next_width::Int
     next_task::Union{Nothing, Task}
     has_next::Bool
+    # Reader handles of the current file; empty selects the serial read.
     handles::Vector{IOStream}
+    # File byte where the scheduled chunk starts.
     byte_offset::Int
 end
 
-# Advance the file/column bookkeeping past one chunk, opening the next
-# file (and closing the previous one, and its extra reader handles) at a
-# file boundary; returns the chunk's global column range, width, io, and
-# starting byte offset, or `nothing` once every file is exhausted.
+"""
+    _next_chunk_location!(stream, state)
+
+Advance `state` past one chunk, opening the next file at a file boundary,
+and return the chunk's `cols`, `chunk_width`, `io`, and `byte_offset`, or
+`nothing` when every file is exhausted.
+"""
 function _next_chunk_location!(
     stream::SnpLinAlgStream{T},
     state::SnpLinAlgStreamState,
@@ -52,8 +60,12 @@ function _next_chunk_location!(
            byte_offset=byte_offset)
 end
 
-# Prepare (and, with prefetch, start reading) the chunk that will be
-# delivered by the next `_take_chunk!` call.
+"""
+    _schedule_next_chunk!(stream, state) -> state
+
+Record the next chunk in `state` and, with `stream.prefetch`, start reading
+it.
+"""
 function _schedule_next_chunk!(
     stream::SnpLinAlgStream{T},
     state::SnpLinAlgStreamState,
@@ -84,8 +96,13 @@ function _schedule_next_chunk!(
     return state
 end
 
-# Read the prepared chunk into `buffer`, in parallel when `handles` is
-# nonempty, else serially from `io`.
+"""
+    _read_scheduled_chunk!(stream, handles, byte_offset, io, buffer)
+        -> buffer
+
+Read the scheduled chunk into `buffer`, in parallel when `handles` is
+nonempty and serially from `io` otherwise.
+"""
 function _read_scheduled_chunk!(
     stream::SnpLinAlgStream{T},
     handles::Vector{IOStream},
@@ -98,10 +115,12 @@ function _read_scheduled_chunk!(
     return _read_chunk_parallel!(handles, buffer, byte_offset, drows)
 end
 
-# Wait for (or perform) the read of the prepared chunk, then kick off the
-# following one before returning the prepared chunk to the caller. This
-# runs before `_schedule_next_chunk!` advances the state, so `state.handles` and
-# `state.byte_offset` still describe the prepared chunk.
+"""
+    _take_chunk!(stream, state)
+
+Finish reading the scheduled chunk, schedule the following one, and return
+`((cols, chunk), state)`, or `nothing` when no chunk remains.
+"""
 function _take_chunk!(
     stream::SnpLinAlgStream{T},
     state::SnpLinAlgStreamState,
@@ -112,6 +131,7 @@ function _take_chunk!(
     width = state.next_width
     task = state.next_task
     buffer = _chunk_buffer_pair(stream, width)[which]
+    # `state` describes this chunk until the next one is scheduled below.
     if task === nothing
         _read_scheduled_chunk!(stream, state.handles, state.byte_offset,
                                state.io, buffer)

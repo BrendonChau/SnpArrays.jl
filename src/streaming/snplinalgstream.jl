@@ -1,25 +1,33 @@
 """
-    SnpLinAlgStream{T}(bedfiles; m=nothing, width=4096, prefetch=true,
-                       readers=_default_reader_count(), model=ADDITIVE_MODEL,
-                       center=false, scale=false, impute=true)
+    SnpLinAlgStream{T}(bedfiles; kwargs...)
 
-Iterate `.bed` files as consecutive column chunks of a `SnpLinAlg`, without
-memory-mapping the whole genotype matrix.
+Iterate `.bed` files as consecutive column chunks, each a `SnpLinAlg{T}`,
+without holding the whole genotype matrix in memory.
+
+Iteration yields `(cols, chunk)`: `cols::UnitRange{Int}` is the chunk's
+column range in the concatenated files, and `chunk` is an
+`m × length(cols)` `SnpLinAlg{T}`. A chunk never spans two files. `chunk`
+is a reused buffer, valid only until the next chunk is requested.
 
 # Arguments
-- `bedfiles`: a `.bed` path, or paths concatenated column-wise
-- `m`: sample count; defaults to the first file's `.fam` line count
-- `width`: chunk width in SNPs
-- `prefetch`: overlaps the next chunk's read with the current chunk's use
-- `readers`: concurrent reader tasks per chunk of a plain `.bed` file;
-  compressed files always use one
-- `model`, `center`, `scale`, `impute`: forwarded to each chunk's `SnpLinAlg`
+- `bedfiles`: a `.bed` path, or a vector of paths concatenated column-wise
 
-`for (cols, chunk) in stream` yields `(cols, chunk)` with
-`cols::UnitRange{Int}` the global column range and `chunk::SnpLinAlg{T}`
-of size `(m, length(cols))`; chunks never straddle a file. `chunk` is a
-reused buffer valid only until the next chunk is requested. A fresh `for`
-restarts from the first column.
+# Keywords
+- `m = nothing`: sample count; `nothing` reads it from the first file's
+  `.fam` line count
+- `width = 4096`: chunk width in SNPs
+- `prefetch = true`: read the next chunk while the current one is in use
+- `readers = _default_reader_count()`: reader tasks per chunk of a plain
+  `.bed` file; a compressed file always uses one
+- `model`, `center`, `scale`, `impute`: as in `SnpLinAlg`
+
+# Examples
+```julia
+stream = SnpLinAlgStream{Float64}("genotypes.bed"; width = 1024)
+for (cols, chunk) in stream
+    mul!(view(out, cols, :), transpose(chunk), X)
+end
+```
 """
 struct SnpLinAlgStream{T}
     files::Vector{String}
@@ -102,9 +110,8 @@ _make_chunk_buffer_pair(
 """
     _default_reader_count() -> Int
 
-Return the default number of concurrent reader tasks per plain `.bed`
-chunk: half the thread count, between 1 and 8, so blocking reads do not
-park the threads the prefetch task overlaps with.
+Return the default number of reader tasks per plain `.bed` chunk: half the
+thread count, clamped to 1 through 8.
 """
 _default_reader_count() = max(1, min(8, Threads.nthreads() ÷ 2))
 
