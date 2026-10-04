@@ -14,7 +14,7 @@ The table contains the observed allelic type at `n` [*single nucleotide polymorp
 
 ## Installation
 
-This package requires Julia v1.4 or later, which can be obtained from
+This package requires Julia v1.10 or later, which can be obtained from
 <https://julialang.org/downloads/> or by building Julia from the sources in the
 <https://github.com/JuliaLang/julia> repository.
 

@@ -13,7 +13,7 @@ Linear algebra operations on the PLINK formatted data now support multi-threadin
 
 ## Installation
 
-This package requires Julia v1.5 or later, which can be obtained from
+This package requires Julia v1.10 or later, which can be obtained from
 https://julialang.org/downloads/ or by building Julia from the sources in the
 https://github.com/JuliaLang/julia repository.
 
