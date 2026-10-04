@@ -1,4 +1,5 @@
-# Generic fallbacks that the SIMD methods of matvec.jl and matmul.jl specialize.
+# Generic fallbacks that the SIMD methods of matvec.jl, matmul_AX.jl, and
+# matmul_AtX.jl specialize.
 
 function _snparray_ax_kernel!(
     out::AbstractVector,
