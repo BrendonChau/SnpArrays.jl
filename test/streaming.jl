@@ -160,7 +160,7 @@ end
                 Q = randn(Xoshiro(k), T, M, k)
                 V = Matrix{T}(undef, M, k)
                 U = Matrix{T}(undef, n, k)
-                @test streamed_grm_mul!(V, stream, Q; U = U) === V
+                @test streamed_grm_mul!(V, U, stream, Q) === V
                 Uref = transpose(sla) * Q
                 Vref = (sla * Uref) ./ n
                 @test isapprox(norm(U - Uref) / norm(Uref), zero(T);
@@ -170,7 +170,7 @@ end
 
                 scale_vec = rand(Xoshiro(5), T, n)
                 V2 = Matrix{T}(undef, M, k)
-                streamed_grm_mul!(V2, stream, Q; scale = scale_vec, U = U)
+                streamed_grm_mul!(V2, U, stream, Q; scale = scale_vec)
                 Vref2 = sla * (Uref .* scale_vec)
                 @test isapprox(norm(V2 - Vref2) / norm(Vref2), zero(T);
                               atol = tolerance, rtol = tolerance)
@@ -180,7 +180,7 @@ end
                 @test_throws DimensionMismatch streamed_grm_mul!(
                     V, stream, Matrix{T}(undef, M + 1, k))
                 @test_throws DimensionMismatch streamed_grm_mul!(
-                    V, stream, Q; U = Matrix{T}(undef, n + 1, k))
+                    V, Matrix{T}(undef, n + 1, k), stream, Q)
                 @test_throws DimensionMismatch streamed_grm_mul!(
                     V, stream, Q; scale = Vector{T}(undef, n + 1))
                 other = T == Float32 ? Float64 : Float32
@@ -201,7 +201,7 @@ end
             Q = randn(Xoshiro(k), Float64, M, k)
             V = Matrix{Float64}(undef, M, k)
             U = Matrix{Float64}(undef, n, k)
-            @test streamed_grm_mul!(V, stream32, Q; U = U) === V
+            @test streamed_grm_mul!(V, U, stream32, Q) === V
             Uref = transpose(sla64) * Q
             Vref = (sla64 * Uref) ./ n
             @test isapprox(norm(U - Uref) / norm(Uref), 0.0;
@@ -211,7 +211,7 @@ end
 
             scale_vec = rand(Xoshiro(5), Float64, n)
             V2 = Matrix{Float64}(undef, M, k)
-            streamed_grm_mul!(V2, stream32, Q; scale = scale_vec, U = U)
+            streamed_grm_mul!(V2, U, stream32, Q; scale = scale_vec)
             Vref2 = sla64 * (Uref .* scale_vec)
             @test isapprox(norm(V2 - Vref2) / norm(Vref2), 0.0;
                           atol = tolerance32, rtol = tolerance32)
@@ -219,7 +219,7 @@ end
             @test_throws DimensionMismatch streamed_grm_mul!(
                 Matrix{Float64}(undef, M + 1, k), stream32, Q)
             @test_throws DimensionMismatch streamed_grm_mul!(
-                V, stream32, Q; U = Matrix{Float64}(undef, n + 1, k))
+                V, Matrix{Float64}(undef, n + 1, k), stream32, Q)
 
             # The mixed path differs from the uniform Float32 path only in
             # accumulation precision; both should agree to the Float32
@@ -313,8 +313,8 @@ end
         # β == 0 overwrites `out` without reading it.
         result = fill(T(NaN), m, 5)
         mul!(result, sla, rhs, 2, 0)
-        @test isapprox(result, 2 * expected0; atol = tolerance * norm(expected0),
-                       rtol = tolerance)
+        @test isapprox(result, 2 * expected0; rtol = tolerance,
+                       atol = tolerance * norm(expected0))
     end
 end
 
