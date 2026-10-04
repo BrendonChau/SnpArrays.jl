@@ -25,10 +25,10 @@ const WMMA_BLOCKS_PER_SM = 16
 """
     _wmma_rhs_width(k) -> Int
 
-Rhs columns per block for `k` columns: the power of two from 32 to 256
-that covers `k`, capped at 256.
+Rhs columns per block for `k` columns: the power of two from 32 to 128
+that covers `k`, capped at 128. Wider blocks are slower per column.
 """
-_wmma_rhs_width(k::Integer) = clamp(nextpow(2, k), 32, 256)
+_wmma_rhs_width(k::Integer) = clamp(nextpow(2, k), 32, 128)
 
 """
     _wmma_block_rows(BK) -> Int
