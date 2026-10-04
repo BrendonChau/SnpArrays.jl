@@ -188,6 +188,12 @@ end
                     V, stream, Q; scale = one(other))
                 @test_throws TypeError streamed_grm_mul!(
                     V, stream, Q; scale = ones(other, n))
+                @inferred streamed_grm_mul!(V, U, stream, Q)
+            end
+            if T == Float64
+                @test_throws ArgumentError streamed_grm_mul!(
+                    Matrix{Float32}(undef, M, 1), stream,
+                    Matrix{Float32}(undef, M, 1))
             end
         end
 
@@ -220,6 +226,7 @@ end
                 Matrix{Float64}(undef, M + 1, k), stream32, Q)
             @test_throws DimensionMismatch streamed_grm_mul!(
                 V, Matrix{Float64}(undef, n + 1, k), stream32, Q)
+            @inferred streamed_grm_mul!(V, U, stream32, Q)
 
             # The mixed path differs from the uniform Float32 path only in
             # accumulation precision; both should agree to the Float32

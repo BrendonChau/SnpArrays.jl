@@ -25,143 +25,8 @@ function streamed_mul!(
     size(out) == (rows, k) || throw(DimensionMismatch(
         "output has size $(size(out)); expected $((rows, k))",
     ))
-    fill!(out, zero(T))
-    for (cols, chunk) in stream
-        if transpose
-            mul!(view(out, cols, :), Base.transpose(chunk), X)
-        else
-            mul!(out, chunk, view(X, cols, :), one(T), one(T))
-        end
-    end
-    return out
-end
-
-"""
-    _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
-
-Throw a `DimensionMismatch` naming the offending argument unless `V` is
-`m × k`, `Q` has `m` rows, `U` (when given) is `n × k`, and a vector
-`scale` has length `n`.
-"""
-function _check_streamed_grm_dims(
-    V::AbstractMatrix,
-    Q::AbstractMatrix,
-    U::Union{Nothing, AbstractMatrix},
-    scale::Union{AbstractFloat, AbstractVector{<:AbstractFloat}},
-    m::Int,
-    n::Int,
-    k::Int,
-)
-    size(V) == (m, k) || throw(DimensionMismatch(
-        "V has size $(size(V)); expected $((m, k))",
-    ))
-    size(Q, 1) == m || throw(DimensionMismatch(
-        "Q has $(size(Q, 1)) rows; expected $m",
-    ))
-    scale isa AbstractVector && length(scale) != n && throw(DimensionMismatch(
-        "scale has length $(length(scale)); expected $n",
-    ))
-    if U !== nothing
-        size(U) == (n, k) || throw(DimensionMismatch(
-            "U has size $(size(U)); expected $((n, k))",
-        ))
-    end
-    return nothing
-end
-
-"""
-    _chunk_scale(scale, cols)
-
-Return `scale` for the SNP columns `cols`: a scalar applies to every
-column, and a per-SNP vector is restricted to `cols`.
-"""
-_chunk_scale(scale::AbstractFloat, cols::UnitRange{Int}) = scale
-_chunk_scale(scale::AbstractVector{<:AbstractFloat}, cols::UnitRange{Int}) =
-    view(scale, cols)
-
-"""
-    _store_projection!(U, cols, chunk_output)
-
-Copy a chunk's `transpose(A_c) * Q` into rows `cols` of `U`; a `nothing`
-`U` stores nothing.
-"""
-_store_projection!(::Nothing, cols::UnitRange{Int}, chunk_output::Matrix) =
-    nothing
-_store_projection!(
-    U::AbstractMatrix,
-    cols::UnitRange{Int},
-    chunk_output::Matrix,
-) = copyto!(view(U, cols, :), chunk_output)
-
-"""
-    _accumulate_grm_chunks!(V, U, stream, Q_kernel, scale_kernel, V_scratch)
-        -> V
-
-Run the per-chunk products in `Q_kernel`'s type and accumulate into the
-already zeroed `V`, through `V_scratch` when given.
-"""
-function _accumulate_grm_chunks!(
-    V::AbstractMatrix{TV},
-    U::Union{Nothing, AbstractMatrix{TV}},
-    stream::SnpLinAlgStream{TS},
-    Q_kernel::AbstractMatrix{TS},
-    scale_kernel::Union{TS, AbstractVector{TS}},
-    V_scratch::Union{Nothing, Matrix{TS}},
-) where {TV <: AbstractFloat, TS <: AbstractFloat}
-    k = size(Q_kernel, 2)
-    buffers = Dict{Int, Matrix{TS}}()
-    for (cols, chunk) in stream
-        width = length(cols)
-        chunk_output = get!(buffers, width) do
-            Matrix{TS}(undef, width, k)
-        end
-        mul!(chunk_output, transpose(chunk), Q_kernel)
-        _store_projection!(U, cols, chunk_output)
-        chunk_output .*= _chunk_scale(scale_kernel, cols)
-        if V_scratch === nothing
-            mul!(V, chunk, chunk_output, 1, 1)
-        else
-            mul!(V_scratch, chunk, chunk_output)
-            V .+= V_scratch
-        end
-    end
-    return V
-end
-
-"""
-    _streamed_grm_mul!(V, U, stream, Q, scale) -> V
-
-Check the dimensions, zero `V`, and accumulate the chunk products, in
-single precision for a `Float32` stream with `Float64` `V` and `Q`.
-"""
-function _streamed_grm_mul!(
-    V::AbstractMatrix{T},
-    U::Union{Nothing, AbstractMatrix{T}},
-    stream::SnpLinAlgStream{T},
-    Q::AbstractMatrix{T},
-    scale::Union{T, AbstractVector{T}},
-) where T <: AbstractFloat
-    m, n = size(stream)
-    _check_streamed_grm_dims(V, Q, U, scale, m, n, size(Q, 2))
-    fill!(V, zero(T))
-    return _accumulate_grm_chunks!(V, U, stream, Q, scale, nothing)
-end
-
-function _streamed_grm_mul!(
-    V::AbstractMatrix{Float64},
-    U::Union{Nothing, AbstractMatrix{Float64}},
-    stream::SnpLinAlgStream{Float32},
-    Q::AbstractMatrix{Float64},
-    scale::Union{Float64, AbstractVector{Float64}},
-)
-    m, n = size(stream)
-    k = size(Q, 2)
-    _check_streamed_grm_dims(V, Q, U, scale, m, n, k)
-    fill!(V, zero(Float64))
-    Q32 = Matrix{Float32}(Q)
-    V_scratch = Matrix{Float32}(undef, m, k)
-    return _accumulate_grm_chunks!(V, U, stream, Q32, Float32.(scale),
-                                   V_scratch)
+    return transpose ? _streamed_mul_transposed!(out, stream, X) :
+           _streamed_mul_forward!(out, stream, X)
 end
 
 """
@@ -181,44 +46,127 @@ in single precision and accumulates into `V` in double precision.
   SNP, with the element type of `V`
 
 # Throws
+- `ArgumentError`: the element types of `V` and `stream` are not a supported
+  pair
 - `DimensionMismatch`: `V`, `U`, `Q`, or a vector `scale` does not match
   `size(stream)`
 - `TypeError`: `scale` does not have the element type of `V`
 """
 function streamed_grm_mul!(
-    V::AbstractMatrix{T},
-    stream::SnpLinAlgStream{T},
-    Q::AbstractMatrix{T};
-    scale::Union{T, AbstractVector{T}} = inv(T(size(stream, 2))),
-) where T <: AbstractFloat
+    V::AbstractMatrix{TV},
+    stream::SnpLinAlgStream{TS},
+    Q::AbstractMatrix{TV};
+    scale::Union{TV, AbstractVector{TV}} = inv(TV(size(stream, 2))),
+) where {TV <: AbstractFloat, TS <: AbstractFloat}
     return _streamed_grm_mul!(V, nothing, stream, Q, scale)
 end
 
 function streamed_grm_mul!(
-    V::AbstractMatrix{T},
-    U::AbstractMatrix{T},
+    V::AbstractMatrix{TV},
+    U::AbstractMatrix{TV},
+    stream::SnpLinAlgStream{TS},
+    Q::AbstractMatrix{TV};
+    scale::Union{TV, AbstractVector{TV}} = inv(TV(size(stream, 2))),
+) where {TV <: AbstractFloat, TS <: AbstractFloat}
+    return _streamed_grm_mul!(V, U, stream, Q, scale)
+end
+
+"""
+    _streamed_grm_mul!(V, U, stream, Q, scale) -> V
+
+Check the arguments, zero `V`, and add each chunk's
+`A_c * (s_c .* (A_cᵀ * Q))` to it, in single precision for a `Float32` stream
+with `Float64` `V` and `Q`.
+"""
+function _streamed_grm_mul!(
+    V::AbstractMatrix{TV},
+    U::Union{Nothing, AbstractMatrix{TV}},
+    stream::SnpLinAlgStream{TS},
+    Q::AbstractMatrix{TV},
+    scale::Union{TV, AbstractVector{TV}},
+) where {TV <: AbstractFloat, TS <: AbstractFloat}
+    (TV === TS || (TV === Float64 && TS === Float32)) || throw(ArgumentError(
+        "V has element type $TV but the stream has element type $TS; " *
+        "expected equal types, or Float64 with a Float32 stream",
+    ))
+    m, n = size(stream)
+    k = size(Q, 2)
+    size(V) == (m, k) || throw(DimensionMismatch(
+        "V has size $(size(V)); expected $((m, k))",
+    ))
+    size(Q, 1) == m || throw(DimensionMismatch(
+        "Q has $(size(Q, 1)) rows; expected $m",
+    ))
+    U === nothing || size(U) == (n, k) || throw(DimensionMismatch(
+        "U has size $(size(U)); expected $((n, k))",
+    ))
+    scale isa TV || length(scale) == n || throw(DimensionMismatch(
+        "scale has length $(length(scale)); expected $n",
+    ))
+
+    mixed = TV !== TS
+    Q_stream = mixed ? Matrix{TS}(Q) : Q
+    weights = mixed ? TS.(scale) : scale
+    product = mixed ? Matrix{TS}(undef, m, k) : nothing
+    full = Matrix{TS}(undef, stream.width, k)
+
+    fill!(V, zero(TV))
+    for (cols, chunk) in stream
+        # A file's short last chunk gets an exact-size matrix.
+        AtQ = length(cols) == stream.width ? full :
+              Matrix{TS}(undef, length(cols), k)
+        mul!(AtQ, transpose(chunk), Q_stream)
+        U === nothing || copyto!(view(U, cols, :), AtQ)
+        AtQ .*= _chunk_scale(weights, cols)
+        if product === nothing
+            mul!(V, chunk, AtQ, one(TS), one(TS))
+        else
+            mul!(product, chunk, AtQ)
+            V .+= product
+        end
+    end
+    return V
+end
+
+"""
+    _chunk_scale(scale, cols)
+
+Return `scale` for the SNP columns `cols`: a scalar for every column, or the
+matching slice of a per-SNP vector.
+"""
+_chunk_scale(scale::AbstractFloat, cols::UnitRange{Int}) = scale
+_chunk_scale(scale::AbstractVector{<:AbstractFloat}, cols::UnitRange{Int}) =
+    view(scale, cols)
+
+"""
+    _streamed_mul_forward!(out, stream, X) -> out
+
+Set `out = A * X` by accumulating each chunk's `A_c * X[cols, :]`.
+"""
+function _streamed_mul_forward!(
+    out::AbstractMatrix{T},
     stream::SnpLinAlgStream{T},
-    Q::AbstractMatrix{T};
-    scale::Union{T, AbstractVector{T}} = inv(T(size(stream, 2))),
+    X::AbstractMatrix{T},
 ) where T <: AbstractFloat
-    return _streamed_grm_mul!(V, U, stream, Q, scale)
+    fill!(out, zero(T))
+    for (cols, chunk) in stream
+        mul!(out, chunk, view(X, cols, :), one(T), one(T))
+    end
+    return out
 end
 
-function streamed_grm_mul!(
-    V::AbstractMatrix{Float64},
-    stream::SnpLinAlgStream{Float32},
-    Q::AbstractMatrix{Float64};
-    scale::Union{Float64, AbstractVector{Float64}} = inv(size(stream, 2)),
-)
-    return _streamed_grm_mul!(V, nothing, stream, Q, scale)
-end
+"""
+    _streamed_mul_transposed!(out, stream, X) -> out
 
-function streamed_grm_mul!(
-    V::AbstractMatrix{Float64},
-    U::AbstractMatrix{Float64},
-    stream::SnpLinAlgStream{Float32},
-    Q::AbstractMatrix{Float64};
-    scale::Union{Float64, AbstractVector{Float64}} = inv(size(stream, 2)),
-)
-    return _streamed_grm_mul!(V, U, stream, Q, scale)
+Set `out = transpose(A) * X`, one chunk per block of rows of `out`.
+"""
+function _streamed_mul_transposed!(
+    out::AbstractMatrix{T},
+    stream::SnpLinAlgStream{T},
+    X::AbstractMatrix{T},
+) where T <: AbstractFloat
+    for (cols, chunk) in stream
+        mul!(view(out, cols, :), transpose(chunk), X)
+    end
+    return out
 end
