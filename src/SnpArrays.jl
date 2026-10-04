@@ -23,7 +23,7 @@ export counts, grm, grm_admixture, maf, mean, mean!, minorallele
 export missingpos, missingrate, missingrate!, std, var, var!, vcf2plink
 export kinship_pruning
 export ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL
-export CuSnpArray
+export CuSnpArray, MtlSnpArray
 import VariantCallFormat: findgenokey, VCF, header
 
 const ADDITIVE_MODEL = Val(1)
@@ -62,6 +62,7 @@ include("vcf2plink.jl")
 include("admixture.jl")
 include("simulation.jl")
 include("cuda_types.jl")
+include("metal_types.jl")
 
 datadir(parts...) = joinpath(@__DIR__, "..", "data", parts...)
 

@@ -559,6 +559,10 @@ if get(ENV,"JULIA_SNPARRAYS_TEST_CUDA","") == "true"
     include("cuda.jl")
 end
 
+if get(ENV, "JULIA_SNPARRAYS_TEST_METAL", "") == "true"
+    include("metal.jl")
+end
+
 @testset "SnpLinAlg-vector multiplication meanimpute" begin
 reltol = 5e-4
 for t in [Float32, Float64]
