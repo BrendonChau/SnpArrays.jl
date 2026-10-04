@@ -1,4 +1,37 @@
 """
+    ScheduledChunk{T}
+
+The chunk the next `iterate` call returns: its columns, its buffer, the file
+byte where it starts, and its prefetch task, `nothing` for a read on demand.
+"""
+struct ScheduledChunk{T}
+    cols::UnitRange{Int}
+    buffer::SnpLinAlg{T}
+    byte_offset::Int
+    task::Union{Nothing, Task}
+end
+
+"""
+    SnpLinAlgStreamState{T}
+
+Iteration state of a `SnpLinAlgStream{T}`: the read position in the files
+and the chunk scheduled for the next `iterate` call.
+"""
+mutable struct SnpLinAlgStreamState{T}
+    file_index::Int
+    # Columns of the current file already scheduled.
+    file_col::Int
+    # Abstract: plain and compressed files give different stream types.
+    io::IO
+    # Reader handles of the current file, the first being `io`; empty
+    # selects the serial read.
+    handles::Vector{IOStream}
+    # Buffer of the pair, 1 or 2, that the next scheduled chunk fills.
+    buffer_index::Int
+    scheduled::Union{Nothing, ScheduledChunk{T}}
+end
+
+"""
     SnpLinAlgStream{T}(bedfiles; kwargs...)
 
 Iterate `.bed` files as consecutive column chunks, each a `SnpLinAlg{T}`,
@@ -7,7 +40,8 @@ without holding the whole genotype matrix in memory.
 Iteration yields `(cols, chunk)`: `cols::UnitRange{Int}` is the chunk's
 column range in the concatenated files, and `chunk` is an
 `m × length(cols)` `SnpLinAlg{T}`. A chunk never spans two files. `chunk`
-is a reused buffer, valid only until the next chunk is requested.
+is a reused buffer, valid only until the next chunk is requested. Only one
+iteration of a stream may be in progress at a time.
 
 # Arguments
 - `bedfiles`: a `.bed` path, or a vector of paths concatenated column-wise
@@ -43,7 +77,17 @@ struct SnpLinAlgStream{T}
     impute::Bool
     full_buffers::NTuple{2, SnpLinAlg{T}}
     short_buffers::Dict{Int, NTuple{2, SnpLinAlg{T}}}
+    # State of the sweep in progress; `nothing` between sweeps.
+    active::Base.RefValue{Union{Nothing, SnpLinAlgStreamState{T}}}
 end
+
+"""
+    _bytes_per_column(m) -> Int
+
+Return the number of bytes one SNP column of `m` samples takes in a `.bed`
+file.
+"""
+_bytes_per_column(m::Int) = (m + 3) >> 2
 
 """
     _fam_row_count(bednm) -> Int
@@ -138,7 +182,7 @@ function SnpLinAlgStream{T}(
     readers >= 1 ||
         throw(ArgumentError("readers must be at least 1, got $readers"))
     row_count = m === nothing ? _fam_row_count(first(files)) : Int(m)
-    drows = (row_count + 3) >> 2
+    drows = _bytes_per_column(row_count)
     ns = Vector{Int}(undef, length(files))
     for (index, path) in enumerate(files)
         n = _bim_column_count(path)
@@ -158,10 +202,11 @@ function SnpLinAlgStream{T}(
     end
     full_buffers = _make_chunk_buffer_pair(T, row_count, Int(width), model,
                                            center, scale, impute)
+    active = Ref{Union{Nothing, SnpLinAlgStreamState{T}}}(nothing)
     return SnpLinAlgStream{T}(files, row_count, ns, offsets, Int(width),
                               prefetch, Int(readers), model, center, scale,
                               impute, full_buffers,
-                              Dict{Int, NTuple{2, SnpLinAlg{T}}}())
+                              Dict{Int, NTuple{2, SnpLinAlg{T}}}(), active)
 end
 
 Base.size(stream::SnpLinAlgStream) = (stream.m, sum(stream.ns))

@@ -100,10 +100,10 @@ function _read_chunk_parallel!(
     data = buffer.s.data
     width = size(data, 2)
     step = cld(cld(width, length(handles)), DECODE_WIDTH) * DECODE_WIDTH
-    @sync for (index, first) in enumerate(1:step:width)
-        last = min(first + step - 1, width)
-        nbytes = drows * (last - first + 1)
-        skip = drows * (first - 1)
+    @sync for (index, col_first) in enumerate(1:step:width)
+        col_last = min(col_first + step - 1, width)
+        nbytes = drows * (col_last - col_first + 1)
+        skip = drows * (col_first - 1)
         io = handles[index]
         Threads.@spawn _read_column_block!(io, data, byte_offset + skip,
                                            skip + 1, nbytes)

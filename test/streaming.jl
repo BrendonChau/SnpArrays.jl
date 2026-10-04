@@ -452,6 +452,37 @@ function collect_chunks(stream)
     return result
 end
 
+@testset "sweep after an abandoned sweep" begin
+    path = SnpArrays.datadir("EUR_subset.bed")
+    variants = (
+        (prefetch = true,),
+        (prefetch = false,),
+        (prefetch = true, readers = 4),
+        (prefetch = false, readers = 4),
+    )
+    for variant in variants
+        kwargs = (width = 1000, center = true, scale = true, impute = true,
+                  variant...)
+        reference = collect_chunks(SnpLinAlgStream{Float64}(path; kwargs...))
+        stream = SnpLinAlgStream{Float64}(path; kwargs...)
+        taken = 0
+        for (cols, chunk) in stream
+            taken += 1
+            taken == 2 && break
+        end
+        @test taken == 2
+        result = collect_chunks(stream)
+        @test length(result) == length(reference)
+        for (a, b) in zip(result, reference)
+            @test a.cols == b.cols
+            @test a.data == b.data
+            @test a.values == b.values
+            @test a.counts == b.counts
+        end
+        @test stream.active[] === nothing
+    end
+end
+
 @testset "parallel and serial chunk reads agree" begin
     m, n = size(eur_full)
     reps = 4
