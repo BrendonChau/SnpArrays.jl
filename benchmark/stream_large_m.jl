@@ -84,7 +84,7 @@ function print_header(target::BenchTarget, k::Int, width::Int, passes::Int,
     println("Sys.CPU_NAME = ", Sys.CPU_NAME)
     println("VERSION = ", VERSION)
     println("VECTOR_BYTES = ", SnpArrays.VECTOR_BYTES[])
-    println("default readers = ", SnpArrays._default_readers())
+    println("default readers = ", SnpArrays._default_reader_count())
     println("m = ", target.m)
     println("n = ", target.n)
     println("k = ", k)
@@ -158,7 +158,7 @@ function run_rounds(target::BenchTarget, k::Int, width::Int, passes::Int,
     U_sd = Matrix{T}(undef, n, k)
     stream1 = SnpLinAlgStream{T}(target.path; m=m, width=width, readers=1,
                                  center=true, scale=true, impute=true)
-    default_readers = SnpArrays._default_readers()
+    default_readers = SnpArrays._default_reader_count()
     stream_default = SnpLinAlgStream{T}(target.path; m=m, width=width,
                                         readers=default_readers, center=true,
                                         scale=true, impute=true)
@@ -269,7 +269,7 @@ function run_forward_rounds(target::BenchTarget, k::Int, width::Int,
     V_map = Matrix{T}(undef, m, k)
     V_s1 = Matrix{T}(undef, m, k)
     V_sd = Matrix{T}(undef, m, k)
-    default_readers = SnpArrays._default_readers()
+    default_readers = SnpArrays._default_reader_count()
     stream1 = SnpLinAlgStream{T}(target.path; m=m, width=width, readers=1,
                                  center=true, scale=true, impute=true)
     stream_default = SnpLinAlgStream{T}(target.path; m=m, width=width,
@@ -340,7 +340,7 @@ repeated timed calls always re-read the same chunk.
 """
 function read_chunk_seek!(io::IO, buffer::SnpLinAlg)
     seek(io, 3)
-    return SnpArrays._read_chunk!(io, buffer)
+    return SnpArrays._read_chunk_serial!(io, buffer)
 end
 
 """
@@ -355,9 +355,9 @@ function run_chunk_stages(target::BenchTarget, k::Int, width::Int,
     println()
     m = target.m
     drows = (m + 3) >> 2
-    readers = SnpArrays._default_readers()
+    readers = SnpArrays._default_reader_count()
     Y = randn(Xoshiro(1), T, m, k)
-    buffer = SnpArrays._make_buffer(T, m, width, SnpArrays.ADDITIVE_MODEL,
+    buffer = SnpArrays._make_chunk_buffer(T, m, width, SnpArrays.ADDITIVE_MODEL,
                                     true, true, true)
     counts = zeros(Int, 4, width)
     piece = Matrix{T}(undef, width, k)
