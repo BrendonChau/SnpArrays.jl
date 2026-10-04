@@ -182,15 +182,15 @@ function mul!(
         fill!(out, zero(T))
         return out
     end
-    return _decode_mul!(out, s, v)
+    return _direct_mul!(out, s, v)
 end
 
 """
-    _decode_mul!(out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T})
+    _direct_mul!(out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T})
 
-`out = s * v` with the decode kernel `_ax_direct_kernel!`.
+`out = s * v` with `_ax_direct_kernel!`.
 """
-function _decode_mul!(
+function _direct_mul!(
     out::CuVector{T}, s::CuSnpArray{T}, v::CuVector{T},
 ) where {T <: AbstractFloat}
     m, n = size(s)
@@ -315,20 +315,20 @@ function mul!(
         return out
     end
     _uses_wmma(s, k) && return _wmma_mul!(out, s, X)
-    return _decode_mul!(out, s, X)
+    return _tiled_mul!(out, s, X)
 end
 
 """
-    _decode_mul!(out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T})
+    _tiled_mul!(out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T})
 
-`out = s * X` with the decode kernels.
+`out = s * X` with `_aX_tiled_kernel!`.
 """
-function _decode_mul!(
+function _tiled_mul!(
     out::CuMatrix{T}, s::CuSnpArray{T}, X::CuMatrix{T},
 ) where {T <: AbstractFloat}
     m, n = size(s)
     k = size(X, 2)
-    k == 1 && return (_decode_mul!(vec(out), s, vec(X)); out)
+    k == 1 && return (_direct_mul!(vec(out), s, vec(X)); out)
     (BM, BN, BK, TM, TK) = AX_TILES[_tile_band(k)]
     row_blocks = cld(m, BM)
     rhs_blocks = cld(k, BK)

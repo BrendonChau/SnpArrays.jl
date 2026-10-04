@@ -139,7 +139,7 @@ function main()
     bench_impl!(
         "CuSnpArray (new)", cu_snp, m, n, x -> CuArray(x), gpu_time, rng,
     )
-    # The decode kernels, which Float32 `A*X` leaves for tensor cores at
+    # The tiled kernels, which Float32 `A*X` leaves for tensor cores at
     # k >= 16.
     ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
     for k in KS
@@ -147,8 +147,8 @@ function main()
         out = k == 1 ? CuArray(zeros(Float32, m)) :
             CuArray(zeros(Float32, m, k))
         record_row!(
-            "CuSnpArray decode", "A*X", k, m, n,
-            gpu_time(() -> ext._decode_mul!(out, cu_snp, X)),
+            "CuSnpArray tiled", "A*X", k, m, n,
+            gpu_time(() -> ext._tiled_mul!(out, cu_snp, X)),
         )
     end
     cu_snp = nothing

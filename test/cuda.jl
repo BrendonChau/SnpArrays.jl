@@ -161,7 +161,7 @@ end
         transpose(A), CUDA.zeros(Float32, m, 4))
 end
 
-@testset "CuSnpArray decode and tensor-core A*X agree" begin
+@testset "CuSnpArray tiled and tensor-core A*X agree" begin
     ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
     rng = Random.Xoshiro(13)
     # m not a multiple of 16, n not a multiple of 4, and n large enough
@@ -177,7 +177,7 @@ end
             X = randn(rng, T, n, k)
             out = CuMatrix{T}(undef, m, k)
             @test relerr(Array(mul!(out, A, CuArray(X))), dense * X) < rtol
-            ext._decode_mul!(out, A, CuArray(X))
+            ext._tiled_mul!(out, A, CuArray(X))
             @test relerr(Array(out), dense * X) < rtol
         end
     end
