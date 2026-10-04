@@ -163,86 +163,111 @@ function _register_tile_shape(::Type{T}) where T
 end
 
 """
-    _tile_sizes(::Type{T}, m::Int, n::Int, k::Int, direction::Symbol;
-        vector::Bool = (k == 1)) -> (row_step, column_step, rhs_step)
+    _round_down_decode(x::Int) -> Int
 
-Return the task-scheduling tile sizes for a `SnpLinAlg` product with `m`
-samples, `n` SNPs, and `k` right-hand-side columns. `direction` is
-`:forward` for `A*X` or `:transpose` for `transpose(A)*X`. `row_step` is
-always a multiple of `DECODE_WIDTH` and at least `DECODE_WIDTH`;
-`column_step` and `rhs_step` are always at least 1. `m == 0` or `n == 0`
-does not error. `vector` selects the rules for the `k = 1` vector
-kernels (`A*x`, `transpose(A)*x`); a matrix product with one rhs column
-still runs the register-tiled kernel, so it keeps the matrix rules by
-passing `vector=false`.
-
-For `:forward, vector` (`A*x`), `row_step` keeps the output block within
-`L1_OUT_BUDGET` across the SNP column loop and `column_step` covers every
-SNP (the vector kernel needs no inner column blocking).
-
-For `:forward, !vector` (`A*X`), `rhs_step` is `k` capped at 256 (the
-register tile handles all rhs blocking below 256); `column_step` sizes
-the transposed rhs slab of one column block to `L2_PANEL_BUDGET` and the
-packed cache lines it touches to `PACKED_LINES_BUDGET`;
-`row_step` sizes the packed genotype block, re-read once per rhs tile, to
-`4 * L2_PANEL_BUDGET / column_step` bytes (the `A*X` accumulators live in
-registers, so `row_step` is not bound by `L1_OUT_BUDGET`).
-
-For `:transpose, vector` (`transpose(A)*x`), `column_step` is
-task-partitioned over SNPs and `row_step` keeps the rhs slice within
-`L1_OUT_BUDGET` across the column loop.
-
-For `:transpose, !vector` (`transpose(A)*X`), `rhs_step` is `k` capped at
-256; `row_step` sizes the transposed rhs slab over samples to
-`L2_PANEL_BUDGET`; `column_step` is task-partitioned over SNPs.
-
-Across 106 swept configurations on a Xeon 6736P these values were within
-1.15x of the best in every operation and element type; see
-`benchmark/results/x86_avx512_n1183.md`.
+Return `x` rounded down to a multiple of `DECODE_WIDTH` and floored at
+`DECODE_WIDTH`.
 """
-function _tile_sizes(
+function _round_down_decode(x::Int)
+    return max(DECODE_WIDTH, (x ÷ DECODE_WIDTH) * DECODE_WIDTH)
+end
+
+"""
+    _panel_step(::Type{T}, k::Int) -> Int
+
+Return the number of samples or SNPs whose transposed rhs slab, `k` capped at
+256 and padded to a whole register tile, fits `L2_PANEL_BUDGET`, rounded down
+to a multiple of `DECODE_WIDTH`. The caller clamps it to its own bounds.
+"""
+function _panel_step(::Type{T}, k::Int) where T <: AbstractFloat
+    _, nr = _register_tile_shape(T)
+    k_padded = cld(max(min(k, 256), 1), nr) * nr
+    return _round_down_decode(L2_PANEL_BUDGET ÷ (k_padded * sizeof(T)))
+end
+
+"""
+    _rhs_step(k::Int) -> Int
+
+Return the rhs columns per task, `k` capped at 256 (the register tile handles
+all rhs blocking below 256) and at least 1.
+"""
+_rhs_step(k::Int) = max(min(k, 256), 1)
+
+"""
+    _snparray_ax_row_step(::Type{T}, m::Int) -> row_step
+
+Return the samples per task of `A*x` for `m` samples. `row_step` is a
+multiple of `DECODE_WIDTH`, at least `DECODE_WIDTH`, and keeps the output
+block within `L1_OUT_BUDGET` across the SNP column loop; the vector kernel
+needs no inner column blocking, so each task sweeps every SNP. `m == 0` does
+not error.
+"""
+function _snparray_ax_row_step(::Type{T}, m::Int) where T <: AbstractFloat
+    return _round_down_decode(_task_axis_step(m, L1_OUT_BUDGET ÷ sizeof(T)))
+end
+
+"""
+    _snparray_atx_steps(::Type{T}, n::Int) -> (row_step, column_step)
+
+Return the task tile sizes of `transpose(A)*x` for `n` SNPs. `column_step`
+is task-partitioned over SNPs and at least 1; `row_step` is a multiple of
+`DECODE_WIDTH`, at least `DECODE_WIDTH`, and keeps the rhs slice within
+`L1_OUT_BUDGET` across the column loop. `n == 0` does not error.
+"""
+function _snparray_atx_steps(::Type{T}, n::Int) where T <: AbstractFloat
+    row_step = _round_down_decode(L1_OUT_BUDGET ÷ sizeof(T))
+    column_step = max(_task_axis_step(n, 2048), 1)
+    return row_step, column_step
+end
+
+"""
+    _snparray_AX_steps(::Type{T}, m::Int, k::Int)
+        -> (row_step, column_step, rhs_step)
+
+Return the task tile sizes of `A*X` for `m` samples and `k` rhs columns.
+`rhs_step` is `k` capped at 256; `column_step` sizes the transposed rhs slab
+of one column block to `L2_PANEL_BUDGET` and the packed cache lines it
+touches to `PACKED_LINES_BUDGET`; `row_step` sizes the packed genotype block,
+re-read once per rhs tile, to `4 * L2_PANEL_BUDGET / column_step` bytes (the
+`A*X` accumulators live in registers, so `row_step` is not bound by
+`L1_OUT_BUDGET`). `row_step` is a multiple of `DECODE_WIDTH` and at least
+`DECODE_WIDTH`; `column_step` and `rhs_step` are at least 1. `m == 0` does
+not error. A matrix product with one rhs column still runs the register-tiled
+kernel, so it uses this rule at `k = 1`.
+"""
+function _snparray_AX_steps(
     ::Type{T},
     m::Int,
+    k::Int,
+) where T <: AbstractFloat
+    column_step = clamp(_panel_step(T, k), 64, PACKED_LINES_BUDGET ÷ 64)
+    row_step = _round_down_decode(
+        _task_axis_step(m, 4 * L2_PANEL_BUDGET ÷ column_step),
+    )
+    return row_step, max(column_step, 1), _rhs_step(k)
+end
+
+"""
+    _snparray_AtX_steps(::Type{T}, n::Int, k::Int)
+        -> (row_step, column_step, rhs_step)
+
+Return the task tile sizes of `transpose(A)*X` for `n` SNPs and `k` rhs
+columns. `rhs_step` is `k` capped at 256; `row_step` sizes the transposed rhs
+slab over samples to `L2_PANEL_BUDGET`; `column_step` is task-partitioned
+over SNPs. `row_step` is a multiple of `DECODE_WIDTH` and at least
+`DECODE_WIDTH`; `column_step` and `rhs_step` are at least 1. `n == 0` does
+not error.
+
+Across 106 swept configurations on a Xeon 6736P the step functions of the
+four products were within 1.15x of the best in every operation and element
+type; see `benchmark/results/x86_avx512_n1183.md`.
+"""
+function _snparray_AtX_steps(
+    ::Type{T},
     n::Int,
     k::Int,
-    direction::Symbol;
-    vector::Bool = (k == 1),
 ) where T <: AbstractFloat
-    direction in (:forward, :transpose) || throw(ArgumentError(
-        "direction must be :forward or :transpose, got $direction",
-    ))
-    round_down16(x) = max(DECODE_WIDTH, (x ÷ DECODE_WIDTH) * DECODE_WIDTH)
-    _, nr = _register_tile_shape(T)
-    k_block = min(k, 256)
-    k_padded = cld(max(k_block, 1), nr) * nr
-    if direction == :forward
-        if vector
-            row_step = _task_axis_step(m, L1_OUT_BUDGET ÷ sizeof(T))
-            column_step = max(n, 1)
-            rhs_step = 1
-        else
-            rhs_step = k <= 256 ? k : 256
-            column_step = clamp(
-                round_down16(L2_PANEL_BUDGET ÷ (k_padded * sizeof(T))),
-                64, PACKED_LINES_BUDGET ÷ 64,
-            )
-            row_step =
-                _task_axis_step(m, 4 * L2_PANEL_BUDGET ÷ column_step)
-        end
-    else
-        if vector
-            column_step = _task_axis_step(n, 2048)
-            row_step = L1_OUT_BUDGET ÷ sizeof(T)
-            rhs_step = 1
-        else
-            rhs_step = k <= 256 ? k : 256
-            row_step = clamp(
-                round_down16(L2_PANEL_BUDGET ÷ (k_padded * sizeof(T))),
-                64, 4096,
-            )
-            column_step = _task_axis_step(n, 2048)
-        end
-    end
-    row_step = max(DECODE_WIDTH, (row_step ÷ DECODE_WIDTH) * DECODE_WIDTH)
-    return row_step, max(column_step, 1), max(rhs_step, 1)
+    row_step = clamp(_panel_step(T, k), 64, 4096)
+    column_step = max(_task_axis_step(n, 2048), 1)
+    return row_step, column_step, _rhs_step(k)
 end

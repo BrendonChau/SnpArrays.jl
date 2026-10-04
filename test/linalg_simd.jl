@@ -1,3 +1,20 @@
+# Task step of the product the operator runs for `k` rhs columns: the vector
+# kernels at `k == 1` through `*` with a vector, the register-tiled ones else.
+function simd_test_forward_row_step(::Type{T}, m::Int, k::Int) where T
+    return k == 1 ? SnpArrays._snparray_ax_row_step(T, m) :
+                    SnpArrays._snparray_AX_steps(T, m, k)[1]
+end
+
+function simd_test_transpose_row_step(::Type{T}, n::Int, k::Int) where T
+    return k == 1 ? SnpArrays._snparray_atx_steps(T, n)[1] :
+                    SnpArrays._snparray_AtX_steps(T, n, k)[1]
+end
+
+function simd_test_transpose_column_step(::Type{T}, n::Int, k::Int) where T
+    return k == 1 ? SnpArrays._snparray_atx_steps(T, n)[2] :
+                    SnpArrays._snparray_AtX_steps(T, n, k)[2]
+end
+
 function simd_test_fixture(
     rows::Int,
     columns::Int;
@@ -274,7 +291,7 @@ end
     for T in (Float32, Float64)
         # A*x / A*X: samples axis (row_step), small SNP count.
         for k in (1, 8)
-            step = SnpArrays._tile_sizes(T, probe_m, 37, k, :forward)[1]
+            step = simd_test_forward_row_step(T, probe_m, k)
             for m in (step - 1, step + 1, 2step + 1)
                 packed, dense = simd_test_fixture(m, 37; allow_missing=false)
                 reference = simd_test_reference(
@@ -283,7 +300,7 @@ end
                 operator = SnpLinAlg{T}(packed)
                 rhs = simd_test_rhs(T, 37, k)
                 expected = reference * rhs
-                actual = SnpArrays._tile_sizes(T, m, 37, k, :forward)[1]
+                actual = simd_test_forward_row_step(T, m, k)
                 @test actual <= step
                 m > step && @test m > actual
                 result = k == 1 ? operator * vec(rhs) : operator * rhs
@@ -293,10 +310,9 @@ end
         end
 
         # A*X inner column axis (column_step), samples = 257.
-        let column_step =
-                SnpArrays._tile_sizes(T, 257, probe_n, 8, :forward)[2]
+        let column_step = SnpArrays._snparray_AX_steps(T, 257, 8)[2]
             n = column_step + 1
-            actual = SnpArrays._tile_sizes(T, 257, n, 8, :forward)[2]
+            actual = SnpArrays._snparray_AX_steps(T, 257, 8)[2]
             @test actual <= column_step
             @test n > actual
             packed, dense = simd_test_fixture(257, n; allow_missing=false)
@@ -311,7 +327,7 @@ end
 
         # transpose(A)*x / transpose(A)*X: SNP axis (column_step), m = 37.
         for k in (1, 8)
-            step = SnpArrays._tile_sizes(T, 37, probe_n, k, :transpose)[2]
+            step = simd_test_transpose_column_step(T, probe_n, k)
             for n in (step - 1, step + 1, 2step + 1)
                 packed, dense = simd_test_fixture(37, n; allow_missing=false)
                 reference = simd_test_reference(
@@ -320,7 +336,7 @@ end
                 operator = SnpLinAlg{T}(packed)
                 rhs = simd_test_rhs(T, 37, k)
                 expected = transpose(reference) * rhs
-                actual = SnpArrays._tile_sizes(T, 37, n, k, :transpose)[2]
+                actual = simd_test_transpose_column_step(T, n, k)
                 @test actual <= step
                 n > step && @test n > actual
                 result = k == 1 ?
@@ -333,7 +349,7 @@ end
         # transpose(A)*x / transpose(A)*X: sample-block axis (row_step),
         # SNPs = 37.
         for k in (1, 8)
-            step = SnpArrays._tile_sizes(T, probe_m, 37, k, :transpose)[1]
+            step = simd_test_transpose_row_step(T, 37, k)
             for m in (step - 1, step + 1, 2step + 1)
                 packed, dense = simd_test_fixture(m, 37; allow_missing=false)
                 reference = simd_test_reference(
@@ -342,7 +358,7 @@ end
                 operator = SnpLinAlg{T}(packed)
                 rhs = simd_test_rhs(T, m, k)
                 expected = transpose(reference) * rhs
-                actual = SnpArrays._tile_sizes(T, m, 37, k, :transpose)[1]
+                actual = simd_test_transpose_row_step(T, 37, k)
                 @test actual <= step
                 m > step && @test m > actual
                 result = k == 1 ?
@@ -368,15 +384,12 @@ end
 
         # A one-column matrix rhs keeps the k > 1 (matrix) rules, since it
         # still runs the register-tiled kernel rather than the vector one.
-        @test SnpArrays._tile_sizes(T, 4097, 54051, 1, :forward;
-                                     vector=false)[2] ==
-              SnpArrays._tile_sizes(T, 4097, 54051, 2, :forward)[2]
-        @test SnpArrays._tile_sizes(T, 4097, 54051, 1, :transpose;
-                                     vector=false)[1] ==
-              SnpArrays._tile_sizes(T, 4097, 54051, 2, :transpose)[1]
+        @test SnpArrays._snparray_AX_steps(T, 4097, 1)[2] ==
+              SnpArrays._snparray_AX_steps(T, 4097, 2)[2]
+        @test SnpArrays._snparray_AtX_steps(T, 54051, 1)[1] ==
+              SnpArrays._snparray_AtX_steps(T, 54051, 2)[1]
 
-        let step = SnpArrays._tile_sizes(T, 4097, 37, 1, :forward;
-                                          vector=false)[1]
+        let step = SnpArrays._snparray_AX_steps(T, 4097, 1)[1]
             packed, dense = simd_test_fixture(step + 1, 37;
                                                allow_missing=false)
             reference = simd_test_reference(
@@ -388,8 +401,7 @@ end
                            atol=64eps(T), rtol=64eps(T), nans=true)
         end
 
-        let step = SnpArrays._tile_sizes(T, 4097, 37, 1, :transpose;
-                                          vector=false)[1]
+        let step = SnpArrays._snparray_AtX_steps(T, 37, 1)[1]
             packed, dense = simd_test_fixture(step + 1, 37;
                                                allow_missing=false)
             reference = simd_test_reference(
@@ -402,17 +414,26 @@ end
                            atol=64eps(T), rtol=64eps(T), nans=true)
         end
 
-        # every _tile_sizes result satisfies the basic invariants
+        # every step function result satisfies the basic invariants
         for direction in (:forward, :transpose),
             k in (1, 8, 128, 257),
             m in (0, 1, 17, 4097),
             n in (0, 1, 9, 2049)
 
-            row_step, column_step, rhs_step =
-                SnpArrays._tile_sizes(T, m, n, k, direction)
-            @test row_step % 16 == 0
-            @test column_step >= 1
-            @test rhs_step >= 1
+            if k == 1 && direction == :forward
+                @test SnpArrays._snparray_ax_row_step(T, m) % 16 == 0
+            elseif k == 1
+                row_step, column_step = SnpArrays._snparray_atx_steps(T, n)
+                @test row_step % 16 == 0
+                @test column_step >= 1
+            else
+                row_step, column_step, rhs_step = direction == :forward ?
+                    SnpArrays._snparray_AX_steps(T, m, k) :
+                    SnpArrays._snparray_AtX_steps(T, n, k)
+                @test row_step % 16 == 0
+                @test column_step >= 1
+                @test rhs_step >= 1
+            end
         end
     end
 end

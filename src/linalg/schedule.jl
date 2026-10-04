@@ -12,8 +12,7 @@ function _snparray_ax_schedule!(
     rows_filled::Int,
 ) where T <: AbstractFloat
     n = size(packed, 2)
-    row_step, column_step, _ =
-        _tile_sizes(T, rows_filled, n, 1, :forward; vector=true)
+    row_step = _snparray_ax_row_step(T, rows_filled)
     @assert(
         row_step % DECODE_WIDTH == 0,
         "row_step must be a multiple of DECODE_WIDTH",
@@ -22,15 +21,9 @@ function _snparray_ax_schedule!(
         for row_first in 1:row_step:rows_filled
             row_last = min(row_first + row_step - 1, rows_filled)
             @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
-            Threads.@spawn begin
-                for column_first in 1:column_step:n
-                    column_last = min(column_first + column_step - 1, n)
-                    _snparray_ax_kernel!(
-                        out, packed, rhs, values, $row_first, $row_last,
-                        column_first, column_last,
-                    )
-                end
-            end
+            Threads.@spawn _snparray_ax_kernel!(
+                out, packed, rhs, values, $row_first, $row_last, 1, n,
+            )
         end
     end
     return out
@@ -88,7 +81,7 @@ function _snparray_AX_schedule!(
                                              rows_filled, workspace, blk)
     end
     row_step, column_step, rhs_step =
-        _tile_sizes(T, rows_filled, n, k, :forward; vector=false)
+        _snparray_AX_steps(T, rows_filled, k)
     lanes = _rhs_width(T, k)
     width = Val(lanes)
     @assert(
@@ -252,8 +245,7 @@ function _snparray_atx_schedule!(
 ) where T <: AbstractFloat
     n = length(cols)
     out_offset = first(cols) - 1
-    row_step, column_step, _ =
-        _tile_sizes(T, rows_filled, n, 1, :transpose; vector=true)
+    row_step, column_step = _snparray_atx_steps(T, n)
     @assert(
         row_step % DECODE_WIDTH == 0,
         "row_step must be a multiple of DECODE_WIDTH",
@@ -299,7 +291,7 @@ function _snparray_AtX_schedule!(
     k = size(out, 2)
     out_offset = first(cols) - 1
     row_step, column_step, rhs_step =
-        _tile_sizes(T, rows_filled, n, k, :transpose; vector=false)
+        _snparray_AtX_steps(T, n, k)
     lanes = _rhs_width(T, k)
     width = Val(lanes)
     @assert(
