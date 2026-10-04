@@ -289,11 +289,65 @@ end
                       norm(expected_vector0), zero(T); atol = tolerance,
                       rtol = tolerance)
 
-        @test_throws ArgumentError mul!(result, sla, rhs, 2, 1)
-        @test_throws ArgumentError mul!(result, sla, rhs, 1, 0.5)
-        @test_throws ArgumentError mul!(result_vector, sla, rhs_vector, 2, 1)
-        @test_throws ArgumentError mul!(result_vector, sla, rhs_vector, 1,
-                                        0.5)
+        for (α, β) in ((2, 1), (1, 0.5), (-1.5, 0.25), (3, 0), (0, 2),
+                       (0, 0))
+            expected = α * (sla * rhs) + β * out
+            result = copy(out)
+            @test mul!(result, sla, rhs, α, β) === result
+            @test isapprox(result, expected; atol = tolerance * norm(expected0),
+                           rtol = tolerance)
+
+            expected_vector = α * (sla * rhs_vector) + β * out_vector
+            result_vector = copy(out_vector)
+            @test mul!(result_vector, sla, rhs_vector, α, β) === result_vector
+            @test isapprox(result_vector, expected_vector;
+                           atol = tolerance * norm(expected_vector0),
+                           rtol = tolerance)
+        end
+
+        # β == 0 overwrites `out` without reading it.
+        result = fill(T(NaN), m, 5)
+        mul!(result, sla, rhs, 2, 0)
+        @test isapprox(result, 2 * expected0; atol = tolerance * norm(expected0),
+                       rtol = tolerance)
+    end
+end
+
+@testset "five-argument transpose mul!" begin
+    m, n = size(eur_full)
+    for T in (Float32, Float64)
+        sla = SnpLinAlg{T}(eur_full; center = true, scale = true,
+                           impute = true)
+        tolerance = 32 * sqrt(T(max(m, n))) * eps(T)
+
+        rhs = randn(Xoshiro(2), T, m, 5)
+        out = randn(Xoshiro(3), T, n, 5)
+        product = transpose(sla) * rhs
+        rhs_vector = randn(Xoshiro(2), T, m)
+        out_vector = randn(Xoshiro(3), T, n)
+        product_vector = transpose(sla) * rhs_vector
+
+        for (α, β) in ((1, 0), (1, 1), (2, 1), (-1.5, 0.25), (0, 2), (0, 0)),
+            wrapper in (transpose, adjoint)
+            expected = α * product + β * out
+            result = copy(out)
+            @test mul!(result, wrapper(sla), rhs, α, β) === result
+            @test isapprox(result, expected; atol = tolerance * norm(product),
+                           rtol = tolerance)
+
+            expected_vector = α * product_vector + β * out_vector
+            result_vector = copy(out_vector)
+            @test mul!(result_vector, wrapper(sla), rhs_vector, α, β) ===
+                  result_vector
+            @test isapprox(result_vector, expected_vector;
+                           atol = tolerance * norm(product_vector),
+                           rtol = tolerance)
+        end
+
+        # The five-argument form runs the kernel, not the generic fallback.
+        result = copy(out)
+        mul!(result, transpose(sla), rhs, 1, 0)
+        @test result == product
     end
 end
 
