@@ -599,11 +599,6 @@ function _snparray_AtX_tile!(out, packed, rhs, values, rows_filled, cols,
     return out
 end
 
-@inline function _packed_code(packed, row::Int, column::Int)
-    byte = @inbounds packed[((row - 1) >>> 2) + 1, column]
-    return Int((byte >> (2((row - 1) & 3))) & 0x03) + 1
-end
-
 function _snparray_ax_kernel!(out, packed, rhs, values, row_first, row_last,
                               column_first, column_last)
     return _snparray_ax_scalar!(out, packed, rhs, values, row_first, row_last,
@@ -615,8 +610,8 @@ function _snparray_ax_scalar!(out, packed, rhs, values, row_first, row_last,
     @inbounds for column in column_first:column_last
         rhs_value = rhs[column]
         for row in row_first:row_last
-            out[row] += values[_packed_code(packed, row, column), column] *
-                        rhs_value
+            idx = _unsafe_getindex(packed, row, column) + 1
+            out[row] += values[idx, column] * rhs_value
         end
     end
     return out
@@ -635,8 +630,8 @@ function _snparray_AX_scalar!(out, packed, rhs, values, row_first, row_last,
         for column in column_first:column_last
             rhs_value = rhs[column, rhs_column]
             for row in row_first:row_last
-                out[row, rhs_column] +=
-                    values[_packed_code(packed, row, column), column] * rhs_value
+                idx = _unsafe_getindex(packed, row, column) + 1
+                out[row, rhs_column] += values[idx, column] * rhs_value
             end
         end
     end
@@ -654,7 +649,8 @@ function _snparray_atx_scalar!(out, packed, rhs, values, row_first, row_last,
     @inbounds for column in column_first:column_last
         total = out[column - out_offset]
         for row in row_first:row_last
-            total += values[_packed_code(packed, row, column), column] * rhs[row]
+            idx = _unsafe_getindex(packed, row, column) + 1
+            total += values[idx, column] * rhs[row]
         end
         out[column - out_offset] = total
     end
@@ -677,8 +673,8 @@ function _snparray_AtX_scalar!(out, packed, rhs, values, row_first, row_last,
         for column in column_first:column_last
             total = out[column - out_offset, rhs_column]
             for row in row_first:row_last
-                total += values[_packed_code(packed, row, column), column] *
-                         rhs[row, rhs_column]
+                idx = _unsafe_getindex(packed, row, column) + 1
+                total += values[idx, column] * rhs[row, rhs_column]
             end
             out[column - out_offset, rhs_column] = total
         end

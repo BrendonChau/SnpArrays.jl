@@ -275,8 +275,8 @@ function _snparray_ax_kernel!(
             row += 16
         end
         while row <= row_last
-            out[row] += values[_packed_code(packed, row, column), column] *
-                        rhs_value
+            idx = _unsafe_getindex(packed, row, column) + 1
+            out[row] += values[idx, column] * rhs_value
             row += 1
         end
     end
@@ -376,7 +376,7 @@ Fuse the genotypes of samples `row:row + MR - 1` at SNP `column` into the
 ) where {T <: SIMD_FLOAT, MR, U, W}
     return ntuple(Val(MR)) do i
         genotype = Vec{W, T}(@inbounds values[
-            _packed_code(packed, row + i - 1, column), column,
+            _unsafe_getindex(packed, row + i - 1, column) + 1, column,
         ])
         _multiply_add_blocks(accumulators[i], genotype, rhs_vectors)
     end
@@ -604,8 +604,8 @@ function _snparray_atx_kernel!(
         end
         total += sum(vector_total)
         while row <= row_last
-            total +=
-                values[_packed_code(packed, row, column), column] * rhs[row]
+            idx = _unsafe_getindex(packed, row, column) + 1
+            total += values[idx, column] * rhs[row]
             row += 1
         end
         out[column - out_offset] = total
@@ -669,7 +669,7 @@ Fuse the genotypes of sample `row` at the `MR` SNP columns starting at
 ) where {T <: SIMD_FLOAT, MR, U, W}
     return ntuple(Val(MR)) do c
         genotype = Vec{W, T}(@inbounds values[
-            _packed_code(packed, row, column + c - 1), column + c - 1,
+            _unsafe_getindex(packed, row, column + c - 1) + 1, column + c - 1,
         ])
         _multiply_add_blocks(accumulators[c], genotype, rhs_vectors)
     end

@@ -252,10 +252,25 @@ function Base.getindex(s::SnpArray, i::Int)  # Linear indexing
     s[r + 1, d + 1]
 end
 
+"""
+    _unsafe_getindex(data, row, column) -> UInt8
+
+Return the 2-bit genotype code (0 to 3) of sample `row` at SNP `column` from
+the packed bytes `data`, which hold four samples per byte. The caller checks
+bounds.
+"""
+@inline function _unsafe_getindex(
+    data::AbstractMatrix{UInt8},
+    row::Integer,
+    column::Integer,
+)
+    byte = @inbounds data[((row - 1) >>> 2) + 1, column]
+    return (byte >> (2((row - 1) & 3))) & 0x03
+end
+
 @inline function Base.getindex(s::SnpArray, i::Integer, j::Integer)
     @boundscheck checkbounds(s, i, j)
-    ip3 = i + 3
-    (s.data[ip3 >> 2, j] >> ((ip3 & 0x03) << 1)) & 0x03
+    return _unsafe_getindex(s.data, i, j)
 end
 
 function Base.setindex!(s::SnpArray, x::UInt8, i::Int)  # Linear indexing
