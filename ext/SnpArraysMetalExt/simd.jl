@@ -5,14 +5,19 @@ WM` samples x `BK = 8 * TN * WN` rhs columns per threadgroup.
 const AX_SIMD_TILE = (16, 4, 2, 4, 4)
 
 """
-`transpose(A)*X` simdgroup tile `(BM, WM, WN, TM, TN)` for `k > 32`:
+`transpose(A)*X` simdgroup tile `(BM, WM, WN, TM, TN)` for `k > 8`:
 `BN = 8 * TM * WM` SNP columns x `BK = 8 * TN * WN` rhs columns per
 threadgroup.
 """
-const ATX_SIMD_TILE = (32, 2, 4, 4, 4)
+const ATX_SIMD_TILE = (32, 4, 2, 4, 4)
 
 """Fewest rhs columns for which `A*X` uses the simdgroup kernel."""
 const SIMD_MIN_RHS = 33
+
+"""
+Fewest rhs columns for which `transpose(A)*X` uses the simdgroup kernel.
+"""
+const SIMD_T_MIN_RHS = 9
 
 """
     _simd_afrags(tile, row_origin, ks, Val(TM))
@@ -298,29 +303,40 @@ end
 """
     _uses_simd(s::MtlSnpArray, k) -> Bool
 
-Return whether `s * X` or `transpose(s) * X` with `k` rhs columns runs the
-simdgroup-matrix kernel (Float32 and `k >= SIMD_MIN_RHS`).
+Return whether `s * X` with `k` rhs columns runs the simdgroup-matrix kernel
+(Float32 and `k >= SIMD_MIN_RHS`).
 """
 _uses_simd(::MtlSnpArray, ::Integer) = false
 _uses_simd(::MtlSnpArray{Float32}, k::Integer) = k >= SIMD_MIN_RHS
 
 """
-    _simd_mul!(out::MtlMatrix{Float32}, s::MtlSnpArray{Float32},
-               X::MtlMatrix{Float32}) -> out
+    _uses_simd_t(s::MtlSnpArray, k) -> Bool
 
-`out = s * X` with `_aX_simd_kernel!`.
+Return whether `transpose(s) * X` with `k` rhs columns runs the
+simdgroup-matrix kernel (Float32 and `k >= SIMD_T_MIN_RHS`).
+"""
+_uses_simd_t(::MtlSnpArray, ::Integer) = false
+_uses_simd_t(::MtlSnpArray{Float32}, k::Integer) = k >= SIMD_T_MIN_RHS
+
+"""
+    _simd_mul!(out::MtlMatrix{Float32}, s::MtlSnpArray{Float32},
+               X::MtlMatrix{Float32}; tile = AX_SIMD_TILE,
+               split_groups = SPLIT_GROUPS) -> out
+
+`out = s * X` with `_aX_simd_kernel!` on `tile = (BN, WM, WN, TM, TN)`.
 """
 function _simd_mul!(
-    out::MtlMatrix{Float32}, s::MtlSnpArray{Float32}, X::MtlMatrix{Float32},
+    out::MtlMatrix{Float32}, s::MtlSnpArray{Float32}, X::MtlMatrix{Float32};
+    tile::NTuple{5, Int} = AX_SIMD_TILE, split_groups::Integer = SPLIT_GROUPS,
 )
     m, n = size(s)
     k = size(X, 2)
-    (BN, WM, WN, TM, TN) = AX_SIMD_TILE
+    (BN, WM, WN, TM, TN) = tile
     BM = 8 * TM * WM
     BK = 8 * TN * WN
     row_blocks = cld(m, BM)
     rhs_blocks = cld(k, BK)
-    splits = _splits(row_blocks * rhs_blocks, n, BN)
+    splits = _splits(row_blocks * rhs_blocks, n, BN; split_groups)
     split_columns = BN * cld(cld(n, splits), BN)
     splits = cld(n, split_columns)
     partials = splits == 1 ? reshape(out, m, k, 1) :
@@ -336,21 +352,24 @@ end
 
 """
     _simd_t_mul!(out::MtlMatrix{Float32}, s::MtlSnpArray{Float32},
-                 X::MtlMatrix{Float32}) -> out
+                 X::MtlMatrix{Float32}; tile = ATX_SIMD_TILE,
+                 split_groups = SPLIT_GROUPS) -> out
 
-`out = transpose(s) * X` with `_atX_simd_kernel!`.
+`out = transpose(s) * X` with `_atX_simd_kernel!` on
+`tile = (BM, WM, WN, TM, TN)`.
 """
 function _simd_t_mul!(
-    out::MtlMatrix{Float32}, s::MtlSnpArray{Float32}, X::MtlMatrix{Float32},
+    out::MtlMatrix{Float32}, s::MtlSnpArray{Float32}, X::MtlMatrix{Float32};
+    tile::NTuple{5, Int} = ATX_SIMD_TILE, split_groups::Integer = SPLIT_GROUPS,
 )
     m, n = size(s)
     k = size(X, 2)
-    (BM, WM, WN, TM, TN) = ATX_SIMD_TILE
+    (BM, WM, WN, TM, TN) = tile
     BN = 8 * TM * WM
     BK = 8 * TN * WN
     column_blocks = cld(n, BN)
     rhs_blocks = cld(k, BK)
-    splits = _splits(column_blocks * rhs_blocks, m, BM)
+    splits = _splits(column_blocks * rhs_blocks, m, BM; split_groups)
     split_samples = BM * cld(cld(m, splits), BM)
     splits = cld(m, split_samples)
     partials = splits == 1 ? reshape(out, n, k, 1) :
