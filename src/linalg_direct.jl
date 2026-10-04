@@ -9,12 +9,13 @@ struct SnpLinAlg{T} <: AbstractMatrix{T}
     values::Matrix{T}
     # Packing workspace for the register-tiled matrix products, one slice
     # per spawned task. Resized on the first product of a given shape and
-    # reused after, so a repeated product allocates nothing here. Not
-    # reentrant: concurrent `mul!` calls on one `SnpLinAlg` would share it.
+    # reused after, so a repeated product allocates nothing here.
     panel::Vector{T}
     # Transposed genotype codes (one byte per sample and 4-SNP block) for
-    # the lookup-table `A*X` kernel; same lifetime and caveat as `panel`.
+    # the lookup-table `A*X` kernel; same lifetime as `panel`.
     blk::Vector{UInt8}
+    # Guards `panel` and `blk`, which every matrix product writes.
+    lock::ReentrantLock
 end
 
 AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
@@ -50,7 +51,8 @@ function SnpLinAlg{T}(
     _fill_statistics!(means, inverse_standard_deviations, values, s, model,
                       center, scale, impute)
     return SnpLinAlg{T}(s, model, center, scale, impute, means,
-                        inverse_standard_deviations, values, T[], UInt8[])
+                        inverse_standard_deviations, values, T[], UInt8[],
+                        ReentrantLock())
 end
 
 """
@@ -136,6 +138,8 @@ with at least `LOOKUP_MIN_RHS` columns on at least `LOOKUP_MIN_ROWS`
 samples uses the lookup-table kernel (`_snparray_AX_lookup_tile!`); other
 shapes use the register-tiled kernel. The five-argument form computes
 `out = sla * rhs + β * out` and requires `α == 1` and `β ∈ (0, 1)`.
+Concurrent matrix products on one `SnpLinAlg`, forward or transposed, run
+one at a time.
 """
 function mul!(
     out::AbstractVector{T},
@@ -189,8 +193,8 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
     β == 0 && fill!(out, zero(T))
-    _snparray_AX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, sla.panel,
-                       sla.blk)
+    @lock sla.lock _snparray_AX_tile!(out, sla.s.data, rhs, sla.values,
+                                      sla.s.m, sla.panel, sla.blk)
     return out
 end
 
@@ -270,8 +274,8 @@ function mul!(
     # The dense genotype arrays with `cols` as an index offset, never a
     # view: indexing a `SubArray` per element costs about 2x in the
     # register-tiled kernel.
-    _snparray_AtX_tile!(out, sla.s.data, rhs, sla.values, sla.s.m, cols,
-                        sla.panel)
+    @lock sla.lock _snparray_AtX_tile!(out, sla.s.data, rhs, sla.values,
+                                       sla.s.m, cols, sla.panel)
     return out
 end
 

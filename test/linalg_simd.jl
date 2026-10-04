@@ -664,3 +664,30 @@ end
     @test all(isnan, product[2, :])
     @test all(iszero, product[[1; 3:min_rows], :])
 end
+
+@testset "concurrent products on one SnpLinAlg" begin
+    min_rows = SnpArrays.LOOKUP_MIN_ROWS
+    min_rhs = SnpArrays.LOOKUP_MIN_RHS
+    # A register-tiled shape and a lookup-table shape.
+    for (rows, widths) in ((203, (2, 3)), (min_rows + 5, (min_rhs, 2min_rhs)))
+        packed, _ = simd_test_fixture(rows, 61)
+        operator = SnpLinAlg{Float64}(packed; center=true, scale=true)
+        forward_rhs = map(k -> simd_test_rhs(Float64, 61, k), widths)
+        transpose_rhs = map(k -> simd_test_rhs(Float64, rows, k), widths)
+        forward = map(rhs -> operator * rhs, forward_rhs)
+        transposed = map(rhs -> transpose(operator) * rhs, transpose_rhs)
+        for _ in 1:20
+            tasks = (
+                Threads.@spawn(operator * forward_rhs[1]),
+                Threads.@spawn(operator * forward_rhs[2]),
+                Threads.@spawn(transpose(operator) * transpose_rhs[1]),
+                Threads.@spawn(transpose(operator) * transpose_rhs[2]),
+            )
+            results = map(fetch, tasks)
+            @test results[1] == forward[1]
+            @test results[2] == forward[2]
+            @test results[3] == transposed[1]
+            @test results[4] == transposed[2]
+        end
+    end
+end
