@@ -16,13 +16,16 @@ AbstractSnpBitMatrix = Union{SnpBitMatrix, SubArray{T, 1, SnpBitMatrix{T}},
 """
     SnpBitMatrix{T}(s; model=ADDITIVE_MODEL, center=false, scale=false)
 
-Store an `AbstractSnpArray` `s` as two `BitMatrix`es to simplify linear algebra.
+Store an `AbstractSnpArray` `s` as two `BitMatrix`es.
 
 # Arguments
-- s: an `AbstractSnpArray`.
-- model: one of `ADDITIVE_MODEL`(default), `DOMINANT_MODEL`, `RECESSIVE_MODEL`.
-- center: whether to center (default: false).
-- scale: whether to scale to standard deviation 1 (default: false).
+- `s::AbstractSnpArray`: the genotypes to store
+
+# Keywords
+- `model = ADDITIVE_MODEL`: `ADDITIVE_MODEL`, `DOMINANT_MODEL`, or
+  `RECESSIVE_MODEL`
+- `center::Bool = false`: center each column
+- `scale::Bool = false`: scale each column to unit standard deviation
 """
 function SnpBitMatrix{T}(
     s::AbstractSnpArray;
@@ -138,7 +141,8 @@ function mul!(
 end
 
 """
-    LinearAlgebra.mul!(out, s::Union{Transpose{T, SnpBitMatrix{T}}, Adjoint{T, SnpBitMatrix{T}}}, v)
+    LinearAlgebra.mul!(out, st::Transpose{T, SnpBitMatrix{T}}, v)
+    LinearAlgebra.mul!(out, st::Adjoint{T, SnpBitMatrix{T}}, v)
 
 In-place matrix-vector multiplication, with transposed `SnpBitMatrix`.
 """
@@ -168,9 +172,7 @@ end
 """
     Base.copyto!(v, s)
 
-Copy SnpBitMatrix `s` to numeric vector or matrix `v`. If `s` is centered/scaled,
-`v` will be centered/scaled using precomputed column mean `s.μ` and inverse std
-`s.σinv`.
+Copy `s` to the vector or matrix `v`, centered and scaled as `s` is.
 """
 function Base.copyto!(
     v::AbstractVecOrMat{T},
@@ -188,12 +190,8 @@ end
 """
     Base.convert(t, s)
 
-Convert a SnpBitMatrix `s` to a numeric vector or matrix of same shape as `s`.
-If `s` is centered/scaled, `v` will be centered/scaled using precomputed column
-mean `s.μ` and inverse std `s.σinv`.
-
-# Arguments
-- `t::Type{AbstractVecOrMat{T}}`: Vector or matrix type.
+Convert `s` to an array of type `t` with the shape of `s`, centered and scaled
+as `s` is.
 """
 Base.convert(::Type{T}, s::AbstractSnpBitMatrix) where T <: Array = T(s)
 Array{T,N}(s::AbstractSnpBitMatrix) where {T,N} =

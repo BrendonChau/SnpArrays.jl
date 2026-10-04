@@ -14,8 +14,7 @@ const DECODE_WIDTH = 16
     TASKS_PER_THREAD
 
 Target task count is `TASKS_PER_THREAD * Threads.nthreads()`, so uneven
-per-task progress balances across threads. Measured at 91% scaling
-efficiency for `transpose(A)*X` on 12 cores of a Xeon 6736P.
+per-task progress balances across threads.
 """
 const TASKS_PER_THREAD = 4
 
@@ -23,8 +22,7 @@ const TASKS_PER_THREAD = 4
     TASK_AXIS_FLOOR
 
 Minimum block size along a task-partitioned axis; below it, per-task
-overhead and the output-tile read-modify-write dominate. The `A*x` and
-`A*X` row-step optima on a Xeon 6736P both land on this floor.
+overhead and the output-tile read-modify-write dominate.
 """
 const TASK_AXIS_FLOOR = 256
 
