@@ -24,7 +24,7 @@ Centered, scaled, mean-imputed. GFMA/s is from the warm call.
 |---|---|---:|---|---:|---:|---:|
 | Float32 | A*X | 512 | mul! (tensor-core) | 2.841 | 3.161 | 17907.14 |
 | Float32 | Aᵀ*X | 512 | mul! (tensor-core) | 2.932 | 2.934 | 19288.73 |
-| Float64 | A*X | 512 | mul! (decode) | 16.820 | 16.879 | 3353.32 |
+| Float64 | A*X | 512 | mul! (tiled) | 16.820 | 16.879 | 3353.32 |
 | Float64 | Aᵀ*X | 512 | mul! (tiled) | 16.302 | 16.157 | 3503.31 |
 
 ## Upload
