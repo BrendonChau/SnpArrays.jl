@@ -46,7 +46,10 @@ at that path is an error.
 function report_path(dir::AbstractString)
     kind = has_fork_internals() ? "fork" : "upstream"
     stamp = Dates.format(now(), "yyyymmdd-HHMMSS")
-    path = joinpath(dir, "matmul_$(Sys.CPU_NAME)_$(kind)_$(stamp).md")
+    threads = Threads.nthreads()
+    path = joinpath(
+        dir, "matmul_$(Sys.CPU_NAME)_$(kind)_t$(threads)_$(stamp).md",
+    )
     ispath(path) && error("$(path) exists; wait a second or remove it")
     mkpath(dir)
     return path

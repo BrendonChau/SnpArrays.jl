@@ -44,7 +44,10 @@ at that path is an error.
 """
 function report_path(dir::AbstractString)
     stamp = Dates.format(now(), "yyyymmdd-HHMMSS")
-    path = joinpath(dir, "streaming_matmul_$(Sys.CPU_NAME)_$(stamp).md")
+    threads = Threads.nthreads()
+    path = joinpath(
+        dir, "streaming_matmul_$(Sys.CPU_NAME)_t$(threads)_$(stamp).md",
+    )
     ispath(path) && error("$(path) exists; wait a second or remove it")
     mkpath(dir)
     return path
