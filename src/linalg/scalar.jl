@@ -25,6 +25,7 @@ function _snparray_AX_task!(
     column_step::Int,
     rhs_columns::UnitRange{Int},
     ::Val,
+    ::Val,
 )
     out = task.out
     packed = task.packed
@@ -68,6 +69,7 @@ function _snparray_AtX_task!(
     rows_filled::Int,
     columns::UnitRange{Int},
     rhs_columns::UnitRange{Int},
+    ::Val,
     ::Val,
 )
     out = task.out

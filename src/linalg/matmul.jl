@@ -245,14 +245,16 @@ Pack `rhs[columns, tile_columns]` into the task's panel, then sweep samples
 end
 
 """
-    _snparray_AX_blocks!(task, rhs, rows, column_step, rhs_columns,
-        ::Val{MR}, ::Val{W})
+    _snparray_AX_task!(task, rhs, rows, column_step, rhs_columns, ::Val{MR},
+        ::Val{W})
 
-Run one `A*X` task with a compile-time tile height `MR`, looping over SNP
-column blocks of width `column_step` and rhs tiles of width `2W`.
+Run one `A*X` task over samples `rows` and rhs columns `rhs_columns`,
+blocking the SNP columns into `column_step`-wide inner tiles and holding
+each `MR x 2W` tile in registers. On a Xeon 6736P the hot loop compiles to
+16 FMAs on zmm accumulators with no spills, 19 of 32 registers live.
 """
-function _snparray_AX_blocks!(
-    task::RegisterTileTask{T},
+function _snparray_AX_task!(
+    task::RegisterTileTask{T, <:StridedMatrix{T}, Matrix{UInt8}, Matrix{T}},
     rhs::StridedMatrix{T},
     rows::UnitRange{Int},
     column_step::Int,
@@ -261,6 +263,7 @@ function _snparray_AX_blocks!(
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, W}
     n = size(task.packed, 2)
+    n == 0 && return task.out
     rhs_last = last(rhs_columns)
     for column_first in 1:column_step:n
         columns = column_first:min(column_first + column_step - 1, n)
@@ -282,30 +285,6 @@ function _snparray_AX_blocks!(
         end
     end
     return task.out
-end
-
-"""
-    _snparray_AX_task!(task, rhs, rows, column_step, rhs_columns, width)
-
-Run one `A*X` task over samples `rows` and rhs columns `rhs_columns`,
-blocking the SNP columns into `column_step`-wide inner tiles and holding
-each `MR x 2W` tile, `(MR, NR) = _register_tile_shape(T)`, in registers.
-On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm accumulators with
-no spills, 19 of 32 registers live.
-"""
-function _snparray_AX_task!(
-    task::RegisterTileTask{T, <:StridedMatrix{T}, Matrix{UInt8}, Matrix{T}},
-    rhs::StridedMatrix{T},
-    rows::UnitRange{Int},
-    column_step::Int,
-    rhs_columns::UnitRange{Int},
-    width::Val{W},
-) where {T <: SIMD_FLOAT, W}
-    size(task.packed, 2) == 0 && return task.out
-    tile_rows, _ = _register_tile_shape(T)
-    return _snparray_AX_blocks!(
-        task, rhs, rows, column_step, rhs_columns, Val(tile_rows), width,
-    )
 end
 
 """
@@ -482,14 +461,19 @@ Pack `rhs[rows, tile_columns]` into the task's panel, then sweep SNP
 end
 
 """
-    _snparray_AtX_blocks!(task, rhs, row_step, rows_filled, columns,
+    _snparray_AtX_task!(task, rhs, row_step, rows_filled, columns,
         rhs_columns, ::Val{MR}, ::Val{W})
 
-Run one `transpose(A)*X` task with a compile-time tile width `MR`, looping
-over sample blocks of `row_step` samples and rhs tiles of width `2W`.
+Run one `transpose(A)*X` task over SNP `columns` (indices into the full
+genotype arrays) and rhs columns `rhs_columns`, blocking the samples into
+`row_step`-wide inner blocks and holding each `MR x 2W` tile in registers
+over a whole sample block. On a Xeon 6736P the hot loop compiles to 16 FMAs
+on zmm accumulators with no spills.
 """
-function _snparray_AtX_blocks!(
-    task::RegisterTileTask{T},
+function _snparray_AtX_task!(
+    task::RegisterTileTask{
+        T, <:StridedMatrix{T}, <:StridedMatrix{UInt8}, <:StridedMatrix{T},
+    },
     rhs::StridedMatrix{T},
     row_step::Int,
     rows_filled::Int,
@@ -498,6 +482,7 @@ function _snparray_AtX_blocks!(
     tile_width::Val{MR},
     width::Val{W},
 ) where {T <: SIMD_FLOAT, MR, W}
+    rows_filled == 0 && return task.out
     rhs_last = last(rhs_columns)
     for row_first in 1:row_step:rows_filled
         rows = row_first:min(row_first + row_step - 1, rows_filled)
@@ -519,34 +504,4 @@ function _snparray_AtX_blocks!(
         end
     end
     return task.out
-end
-
-"""
-    _snparray_AtX_task!(task, rhs, row_step, rows_filled, columns,
-        rhs_columns, width)
-
-Run one `transpose(A)*X` task over SNP `columns` (indices into the full
-genotype arrays) and rhs columns `rhs_columns`, blocking the samples into
-`row_step`-wide inner blocks and holding each `MR x 2W` tile,
-`(MR, NR) = _register_tile_shape(T)`, in registers over a whole sample
-block. On a Xeon 6736P the hot loop compiles to 16 FMAs on zmm
-accumulators with no spills.
-"""
-function _snparray_AtX_task!(
-    task::RegisterTileTask{
-        T, <:StridedMatrix{T}, <:StridedMatrix{UInt8}, <:StridedMatrix{T},
-    },
-    rhs::StridedMatrix{T},
-    row_step::Int,
-    rows_filled::Int,
-    columns::UnitRange{Int},
-    rhs_columns::UnitRange{Int},
-    width::Val{W},
-) where {T <: SIMD_FLOAT, W}
-    rows_filled == 0 && return task.out
-    tile_columns, _ = _register_tile_shape(T)
-    return _snparray_AtX_blocks!(
-        task, rhs, row_step, rows_filled, columns, rhs_columns,
-        Val(tile_columns), width,
-    )
 end

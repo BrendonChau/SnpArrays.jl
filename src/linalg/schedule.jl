@@ -73,7 +73,6 @@ function _snparray_AX_schedule!(
     workspace::Vector{T},
     blk::Vector{UInt8},
 ) where T <: AbstractFloat
-    n = size(packed, 2)
     k = size(out, 2)
     if _uses_lookup_kernel(rows_filled, k) &&
        _supports_lookup(out, packed, rhs)
@@ -83,7 +82,6 @@ function _snparray_AX_schedule!(
     row_step, column_step, rhs_step =
         _snparray_AX_steps(T, rows_filled, k)
     lanes = _rhs_width(T, k)
-    width = Val(lanes)
     @assert(
         row_step % DECODE_WIDTH == 0,
         "row_step must be a multiple of DECODE_WIDTH",
@@ -92,6 +90,38 @@ function _snparray_AX_schedule!(
     panel_length = 2lanes * column_step
     tasks = cld(rows_filled, row_step) * cld(k, rhs_step)
     _resize_workspace!(workspace, tasks * panel_length)
+    tile_rows, _ = _register_tile_shape(T)
+    return _snparray_AX_spawn_tasks!(
+        out, packed, rhs, values, rows_filled, workspace, row_step,
+        column_step, rhs_step, panel_length, Val(tile_rows), Val(lanes),
+    )
+end
+
+"""
+    _snparray_AX_spawn_tasks!(out, packed, rhs, values, rows_filled,
+        workspace, row_step, column_step, rhs_step, panel_length, ::Val{MR},
+        ::Val{W}) -> out
+
+Spawn one `_snparray_AX_task!` per row block and rhs tile, each with its own
+`panel_length` slice of `workspace`. The tile shape enters as `Val`s here so
+that each product makes one dynamic call, and the spawn loop and every task
+call inside it dispatch statically.
+"""
+function _snparray_AX_spawn_tasks!(
+    out::AbstractMatrix{T},
+    packed::AbstractMatrix{UInt8},
+    rhs::AbstractMatrix{T},
+    values::AbstractMatrix{T},
+    rows_filled::Int,
+    workspace::Vector{T},
+    row_step::Int,
+    column_step::Int,
+    rhs_step::Int,
+    panel_length::Int,
+    tile_rows::Val{MR},
+    width::Val{W},
+) where {T <: AbstractFloat, MR, W}
+    k = size(out, 2)
     task_index = 0
     @sync begin
         for rhs_first in 1:rhs_step:k
@@ -106,7 +136,7 @@ function _snparray_AX_schedule!(
                 task_index += 1
                 Threads.@spawn _snparray_AX_task!(
                     $tile_task, rhs, $(row_first:row_last), $column_step,
-                    $(rhs_first:rhs_last), $width,
+                    $(rhs_first:rhs_last), tile_rows, width,
                 )
             end
         end
@@ -291,11 +321,9 @@ function _snparray_AtX_schedule!(
 ) where T <: AbstractFloat
     n = length(cols)
     k = size(out, 2)
-    out_offset = first(cols) - 1
     row_step, column_step, rhs_step =
         _snparray_AtX_steps(T, n, k)
     lanes = _rhs_width(T, k)
-    width = Val(lanes)
     @assert(
         row_step % DECODE_WIDTH == 0,
         "row_step must be a multiple of DECODE_WIDTH",
@@ -303,6 +331,38 @@ function _snparray_AtX_schedule!(
     panel_length = 2lanes * row_step
     tasks = cld(n, column_step) * cld(k, rhs_step)
     _resize_workspace!(workspace, tasks * panel_length)
+    tile_columns, _ = _register_tile_shape(T)
+    return _snparray_AtX_spawn_tasks!(
+        out, packed, rhs, values, rows_filled, cols, workspace, row_step,
+        column_step, rhs_step, panel_length, Val(tile_columns), Val(lanes),
+    )
+end
+
+"""
+    _snparray_AtX_spawn_tasks!(out, packed, rhs, values, rows_filled, cols,
+        workspace, row_step, column_step, rhs_step, panel_length, ::Val{MR},
+        ::Val{W}) -> out
+
+Spawn one `_snparray_AtX_task!` per block of SNP columns in `cols` and rhs
+tile, each with its own `panel_length` slice of `workspace`.
+"""
+function _snparray_AtX_spawn_tasks!(
+    out::AbstractMatrix{T},
+    packed::AbstractMatrix{UInt8},
+    rhs::AbstractMatrix{T},
+    values::AbstractMatrix{T},
+    rows_filled::Int,
+    cols::UnitRange{Int},
+    workspace::Vector{T},
+    row_step::Int,
+    column_step::Int,
+    rhs_step::Int,
+    panel_length::Int,
+    tile_width::Val{MR},
+    width::Val{W},
+) where {T <: AbstractFloat, MR, W}
+    k = size(out, 2)
+    out_offset = first(cols) - 1
     task_index = 0
     @sync begin
         for rhs_first in 1:rhs_step:k
@@ -317,7 +377,7 @@ function _snparray_AtX_schedule!(
                 Threads.@spawn _snparray_AtX_task!(
                     $tile_task, rhs, $row_step, rows_filled,
                     $(column_first:column_last), $(rhs_first:rhs_last),
-                    $width,
+                    tile_width, width,
                 )
             end
         end
