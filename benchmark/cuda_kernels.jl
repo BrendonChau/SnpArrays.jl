@@ -1,5 +1,5 @@
 # Benchmark the CuSnpArray mul! kernels on simulated genotypes against the
-# decode kernels and CuBLAS on the materialized dense matrix.
+# tiled kernels and CuBLAS on the materialized dense matrix.
 #
 #     julia -t N --project=<env with CUDA and SnpArrays> \
 #       benchmark/cuda_kernels.jl [m] [n] [prefix] [results_dir]
@@ -183,13 +183,13 @@ function bench_row!(
 end
 
 """
-    decode_mul!(out, A, X) -> out
+    tiled_mul!(out, A, X) -> out
 
-Set `out = A * X` with the decode kernels.
+Set `out = A * X` with the tiled kernel.
 """
-function decode_mul!(out::CuArray{T}, A::CuSnpArray{T},
-                     X::CuArray{T}) where T <: AbstractFloat
-    return EXT._decode_mul!(out, A, X)
+function tiled_mul!(out::CuMatrix{T}, A::CuSnpArray{T},
+                    X::CuMatrix{T}) where T <: AbstractFloat
+    return EXT._tiled_mul!(out, A, X)
 end
 
 """
@@ -241,10 +241,10 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
         AtX = CuMatrix{T}(undef, n, k)
         tensor = EXT._uses_wmma(A, k)
         expected = bench_row!(
-            io, T, "A*X", k, tensor ? "mul! (tensor-core)" : "mul! (decode)",
+            io, T, "A*X", k, tensor ? "mul! (tensor-core)" : "mul! (tiled)",
             mul!, AX, A, X, nothing,
         )
-        tensor && bench_row!(io, T, "A*X", k, "decode", decode_mul!, AX, A,
+        tensor && bench_row!(io, T, "A*X", k, "tiled", tiled_mul!, AX, A,
                              X, expected)
         bench_row!(io, T, "A*X", k, "CuBLAS dense", mul!, AX, dense, X,
                    expected)

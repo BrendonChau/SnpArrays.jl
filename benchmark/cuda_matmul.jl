@@ -149,7 +149,7 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
     AtX = CuMatrix{T}(undef, n, K)
     fmas = Float64(m) * n * K
     print_row(io, T, "A*X",
-              EXT._uses_wmma(A, K) ? "mul! (tensor-core)" : "mul! (decode)",
+              EXT._uses_wmma(A, K) ? "mul! (tensor-core)" : "mul! (tiled)",
               AX, A, X, fmas)
     print_row(io, T, "Aᵀ*X",
               EXT._uses_wmma_t(A, K) ? "mul! (tensor-core)" : "mul! (tiled)",
