@@ -14,8 +14,7 @@ NEON packed as two 128-bit registers). Set in `__init__` from
 `_detect_vector_bytes()`; the first use of each `(T, W)` pair compiles
 in-process (no precompile workload). On a Xeon 6736P, 64 measured 1.27x to
 1.92x faster than 32 for every `k` at or above 8, and LLVM emitted zmm
-registers rather than splitting the 512-bit vectors; see
-`benchmark/results/x86_avx512_n1183.md`.
+registers rather than splitting the 512-bit vectors.
 """
 const VECTOR_BYTES = Ref{Int}(32)
 
@@ -260,7 +259,7 @@ not error.
 
 Across 106 swept configurations on a Xeon 6736P the step functions of the
 four products were within 1.15x of the best in every operation and element
-type; see `benchmark/results/x86_avx512_n1183.md`.
+type.
 """
 function _snparray_AtX_steps(
     ::Type{T},
