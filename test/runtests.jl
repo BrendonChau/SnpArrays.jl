@@ -1,4 +1,4 @@
-using LinearAlgebra, SnpArrays, SparseArrays, Test
+using LinearAlgebra, Random, SnpArrays, SparseArrays, Test
 
 const EUR = SnpArray(SnpArrays.datadir("EUR_subset.bed")) # no missing genotypes
 const mouse = SnpArray(SnpArrays.datadir("mouse.bed")) # has missing genotypes
@@ -443,7 +443,7 @@ for model in [ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL], t in [Float32, F
     # imputing missing data
     mousela = SnpLinAlg{t}(mouse, model=ADDITIVE_MODEL, center=true, scale=true, impute=true)
     v = copyto!(zeros(1), @view(mousela[702])) # missing entry
-    @test isapprox(v[1], 1.113003134727478, atol=1e-6)
+    @test iszero(v[1])
     # not imputing missing data
     mousela = SnpLinAlg{t}(mouse, model=ADDITIVE_MODEL, center=true, scale=true, impute=false)
     v = copyto!(zeros(1), @view(mousela[702])) # missing entry
@@ -652,6 +652,60 @@ end
         end
     end
 end
+
+@testset "transpose mul! over a column range" begin
+    rng = Random.Xoshiro(20260912)
+    m, n = 70, 41
+    mafs = 0.05 .+ 0.4 .* rand(rng, n)
+    G = SnpArrays.simulate(rng, m, n, mafs)
+    partitions = ((1:41,), (1:14, 15:30, 31:41), (1:1, 2:41))
+    for t in [Float32, Float64]
+        sla = SnpLinAlg{t}(G, model=ADDITIVE_MODEL, center=true, scale=true,
+                            impute=true)
+
+        # matrix rhs: each block gets its own freshly allocated output, so
+        # the fast tiled kernel (not the generic view fallback) runs for
+        # both the full and the per-block calls, keeping the reduction
+        # order, and hence the bit pattern, identical.
+        rhs = randn(rng, t, m, 3)
+        out_full = Matrix{t}(undef, n, 3)
+        mul!(out_full, transpose(sla), rhs)
+        for blocks in partitions
+            parts = Matrix{t}[]
+            for block in blocks
+                out = Matrix{t}(undef, length(block), 3)
+                mul!(out, transpose(sla), rhs, block)
+                push!(parts, out)
+            end
+            @test vcat(parts...) == out_full
+        end
+
+        # vector rhs
+        rhs_vector = randn(rng, t, m)
+        out_full_vector = Vector{t}(undef, n)
+        mul!(out_full_vector, transpose(sla), rhs_vector)
+        for blocks in partitions
+            parts = Vector{t}[]
+            for block in blocks
+                out = Vector{t}(undef, length(block))
+                mul!(out, transpose(sla), rhs_vector, block)
+                push!(parts, out)
+            end
+            @test vcat(parts...) == out_full_vector
+        end
+
+        @test_throws ArgumentError mul!(Matrix{t}(undef, 4, 3), transpose(sla),
+            rhs, 39:42)
+        @test_throws DimensionMismatch mul!(Matrix{t}(undef, 3, 3),
+            transpose(sla), rhs, 1:10)
+        @test_throws ArgumentError mul!(Vector{t}(undef, 4), transpose(sla),
+            rhs_vector, 39:42)
+        @test_throws DimensionMismatch mul!(Vector{t}(undef, 3),
+            transpose(sla), rhs_vector, 1:10)
+    end
+end
+
+include("linalg_simd.jl")
 
 @testset "subarrays" begin
 @test all(@view(EUR[1:2:10, 1:2:10]) .==

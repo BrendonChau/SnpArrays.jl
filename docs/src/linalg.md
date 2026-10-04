@@ -6,9 +6,11 @@
 2. Operations on transformed `BitMatrix`es: `SnpBitMatrix` (support for this will be dropped in the near future)
 3. Direct operations on a plink-formatted data on an Nvidia GPU: `CuSnpArray`.
 
-`SnpLinAlg` also supports matrix-matrix multiplications.
+`SnpLinAlg` also supports matrix-matrix multiplications. With `impute=false`,
+missing genotypes remain `NaN` and propagate through products, including when
+multiplied by zero.
 
-- `SnpLinAlg` and `SnpBitMatrix` use Chris Elrod's [LoopVectorization.jl](https://github.com/chriselrod/LoopVectorization.jl) internally. It is much faster on machines with AVX support.  
+- `SnpLinAlg` uses [SIMD.jl](https://github.com/eschnett/SIMD.jl) internally.
 - `CuSnpArray` uses [CUDA.jl](https://juliagpu.gitlab.io/CUDA.jl/) internally.
 On this page, we compare these three.
 - `SnpLinAlg` supports multithreading. See [this page](https://docs.julialang.org/en/v1/manual/multi-threading/#Starting-Julia-with-multiple-threads-1) to learn how to use it.

@@ -3,9 +3,9 @@ __precompile__()
 module SnpArrays
 
 using CodecZlib, CodecXz, CodecBzip2, CodecZstd,  TranscodingStreams
-using Adapt, Glob, LinearAlgebra, LoopVectorization, Missings, Mmap, Printf
+using Adapt, Glob, LinearAlgebra, Missings, Mmap, Printf, SIMD
 using Requires, SparseArrays, Statistics, StatsBase, Random
-import Base: IndexStyle, convert, copyto!, eltype, getindex, setindex!, length, size, wait
+import Base: IndexStyle, convert, copyto!, eltype, getindex, setindex!, length, size
 import DataFrames: DataFrame, rename!, eachrow
 import DelimitedFiles: readdlm, writedlm
 import CSV # for CSV.read, to avoid clash with Base.read
@@ -13,7 +13,6 @@ import LinearAlgebra: copytri!, mul!
 import Statistics: mean, mean!, std, var
 import StatsBase: counts
 import SpecialFunctions: gamma_inc
-import VectorizationBase: gesp
 import Tables: table
 export AbstractSnpArray, AbstractSnpBitMatrix, AbstractSnpLinAlg
 export SnpArray, SnpBitMatrix, SnpLinAlg, SnpData, StackedSnpArray
@@ -33,12 +32,15 @@ const RECESSIVE_MODEL = Val(3)
 include("codec.jl")
 include("snparray.jl")
 include("stackedsnparray.jl")
+include("snparray_statistics.jl")
+include("snparray_conversion.jl")
 include("filter.jl")
 include("cat.jl")
 include("snpdata.jl")
 include("grm.jl")
 include("kinship_pruning.jl")
 include("linalg_direct.jl")
+include("linalg_simd.jl")
 include("linalg_bitmatrix.jl")
 include("reorder.jl")
 include("vcf2plink.jl")
@@ -48,6 +50,7 @@ include("simulation.jl")
 datadir(parts...) = joinpath(@__DIR__, "..", "data", parts...)
 
 function __init__()
+    VECTOR_BYTES[] = _detect_vector_bytes()
     @require CUDA="052768ef-5323-5732-b1bb-66c8b64840ba" include("cuda.jl")
 end
 

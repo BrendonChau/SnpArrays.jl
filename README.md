@@ -34,6 +34,8 @@ If you use [OpenMendel](https://openmendel.github.io) analysis packages in your 
 
 Current implementation incorporates ideas in the package [BEDFiles.jl](https://github.com/dmbates/BEDFiles.jl) by Doug Bates (@dmbates).
 
-Chris Elrod (@chriselrod) helped us accelerate CPU linear algebra through his great support of [LoopVectorization.jl](https://github.com/chriselrod/LoopVectorization.jl) package.
+Historically, Chris Elrod (@chriselrod) helped accelerate CPU linear algebra
+through his support of
+[LoopVectorization.jl](https://github.com/chriselrod/LoopVectorization.jl).
 
 This project has been supported by the National Institutes of Health under awards R01GM053275, R01HG006139, R25GM103774, and 1R25HG011845.
