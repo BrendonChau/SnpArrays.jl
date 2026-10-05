@@ -36,7 +36,7 @@ function CuSnpArray{T}(s::SnpArray;
     model = ADDITIVE_MODEL,
     center::Bool = false,
     scale::Bool = false,
-    impute::Bool = false,
+    impute::Bool = true,
 ) where {T <: AbstractFloat}
     model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL) ||
         throw(ArgumentError("unrecognized model $model"))
