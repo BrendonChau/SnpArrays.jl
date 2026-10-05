@@ -1,4 +1,4 @@
-using CUDA
+using CUDA, Adapt
 using DelimitedFiles
 
 """
@@ -15,6 +15,42 @@ function golden_snparray(codes::AbstractMatrix{UInt8})
 end
 
 relerr(a, b) = norm(a - b) / max(norm(b), eps())
+
+@testset "lin. alg. cuda" begin
+reltol = 5e-4
+for t in [Float32, Float64]
+    v1 = randn(t, size(EUR, 1))
+    v2 = randn(t, size(EUR, 2))
+    v1_d = adapt(CuVector{t}, v1)
+    v2_d = adapt(CuVector{t}, v2)
+    for model in [ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL]
+        @test norm(collect(CuSnpArray{t}(EUR, model=model) * v2_d) -
+            convert(Matrix{t}, EUR, model=model) * v2) /
+            norm(convert(Matrix{t}, EUR, model=model) * v2) < reltol
+        @test norm(collect(CuSnpArray{t}(EUR, center=true, model=model) * v2_d) -
+            convert(Matrix{t}, EUR, center=true, model=model) * v2) /
+            norm(convert(Matrix{t}, EUR, center=true, model=model) * v2) < reltol
+        @test norm(collect(CuSnpArray{t}(EUR, scale=true, model=model) * v2_d) -
+            convert(Matrix{t}, EUR, scale=true, model=model) * v2) /
+            norm(convert(Matrix{t}, EUR, scale=true, model=model) * v2) < reltol
+        @test norm(collect(CuSnpArray{t}(EUR, center=true, scale=true, model=model) * v2_d) -
+            convert(Matrix{t}, EUR, center=true, scale=true, model=model) * v2) /
+            norm(convert(Matrix{t}, EUR, center=true, scale=true, model=model) * v2) < reltol
+        @test norm(collect(transpose(CuSnpArray{t}(EUR, model=model)) * v1_d) -
+            transpose(convert(Matrix{t}, EUR, model=model)) * v1) /
+            norm(transpose(convert(Matrix{t}, EUR, model=model)) * v1) < reltol
+        @test norm(collect(transpose(CuSnpArray{t}(EUR, center=true, model=model)) * v1_d) -
+            transpose(convert(Matrix{t}, EUR, center=true, model=model)) * v1) /
+            norm(transpose(convert(Matrix{t}, EUR, center=true, model=model)) * v1) < reltol
+        @test norm(collect(transpose(CuSnpArray{t}(EUR, scale=true, model=model)) * v1_d) -
+            transpose(convert(Matrix{t}, EUR, scale=true, model=model)) * v1) /
+            norm(transpose(convert(Matrix{t}, EUR, scale=true, model=model)) * v1) < reltol
+        @test norm(collect(transpose(CuSnpArray{t}(EUR, center=true, scale=true, model=model)) * v1_d) -
+            transpose(convert(Matrix{t}, EUR, center=true, scale=true, model=model)) * v1) /
+            norm(transpose(convert(Matrix{t}, EUR, center=true, scale=true, model=model)) * v1) < reltol
+    end
+end
+end
 
 @testset "CuSnpArray golden outputs (impute=false)" begin
     dir = joinpath(@__DIR__, "data", "cuda_golden")
