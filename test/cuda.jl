@@ -69,7 +69,7 @@ end
         scale = parse(Bool, combos[row, 3])
         T = combos[row, 4] == "Float32" ? Float32 : Float64
         rtol = T == Float32 ? 1e-5 : 1e-12
-        A = CuSnpArray{T}(s; model, center, scale)
+        A = CuSnpArray{T}(s; model, center, scale, impute=false)
         @test A isa CuSnpArray{T}
         @test size(A) == size(s)
         @test eltype(A) == T
@@ -208,7 +208,7 @@ end
         s = golden_snparray(codes)
         rtol = T == Float32 ? 1e-5 : 1e-12
         dense = missing_as_zero(s, codes, T, ADDITIVE_MODEL, true, true)
-        A = CuSnpArray{T}(s; center=true, scale=true)
+        A = CuSnpArray{T}(s; center=true, scale=true, impute=false)
         for k in (1, 2, 8, 9, 40)
             X = randn(rng, T, n, k)
             out = CuMatrix{T}(undef, m, k)
