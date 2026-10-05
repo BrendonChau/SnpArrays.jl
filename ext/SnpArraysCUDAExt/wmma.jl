@@ -580,22 +580,33 @@ function _atX_wmma_kernel!(
 end
 
 """
+    _tensor_cores_enabled() -> Bool
+
+Return whether the tensor-core kernels are switched on and the device has
+compute capability 8.0 or newer, which `cp.async` requires.
+"""
+_tensor_cores_enabled() =
+    CUDA_TENSOR_CORES[] && capability(device()) >= v"8.0"
+
+"""
     _uses_wmma(s::CuSnpArray, k) -> Bool
 
 Return whether `s * X` with `k` rhs columns runs the tensor-core kernel
-(Float32 and `k >= WMMA_MIN_RHS`).
+(enabled, Float32 and `k >= WMMA_MIN_RHS`).
 """
 _uses_wmma(::CuSnpArray, ::Integer) = false
-_uses_wmma(::CuSnpArray{Float32}, k::Integer) = k >= WMMA_MIN_RHS
+_uses_wmma(::CuSnpArray{Float32}, k::Integer) =
+    k >= WMMA_MIN_RHS && _tensor_cores_enabled()
 
 """
     _uses_wmma_t(s::CuSnpArray, k) -> Bool
 
 Return whether `transpose(s) * X` with `k` rhs columns runs the
-tensor-core kernel (Float32 and `k >= WMMA_T_MIN_RHS`).
+tensor-core kernel (enabled, Float32 and `k >= WMMA_T_MIN_RHS`).
 """
 _uses_wmma_t(::CuSnpArray, ::Integer) = false
-_uses_wmma_t(::CuSnpArray{Float32}, k::Integer) = k >= WMMA_T_MIN_RHS
+_uses_wmma_t(::CuSnpArray{Float32}, k::Integer) =
+    k >= WMMA_T_MIN_RHS && _tensor_cores_enabled()
 
 """
     _launch_wmma!(kernel_function, args, grid, shmem)

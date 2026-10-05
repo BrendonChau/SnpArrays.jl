@@ -22,6 +22,8 @@ const BED = length(ARGS) >= 1 ? ARGS[1] :
 const K = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 128
 const RESULTS_DIR = length(ARGS) >= 3 ? ARGS[3] : joinpath(@__DIR__, "results")
 const EXT = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
+# The tensor-core kernels are opt-in; this benchmark measures them.
+SnpArrays.cuda_tensor_cores!(true)
 
 """
     emit(io, line)

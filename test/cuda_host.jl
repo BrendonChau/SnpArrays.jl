@@ -40,3 +40,11 @@ end
     @test_throws DimensionMismatch SnpArrays._packed_words(
         zeros(UInt8, 3, 2), 16)
 end
+
+@testset "cuda tensor cores are opt-in (host)" begin
+    @test !SnpArrays.CUDA_TENSOR_CORES[]
+    @test SnpArrays.cuda_tensor_cores!(true)
+    @test SnpArrays.CUDA_TENSOR_CORES[]
+    @test !SnpArrays.cuda_tensor_cores!(false)
+    @test !SnpArrays.CUDA_TENSOR_CORES[]
+end
