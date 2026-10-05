@@ -200,6 +200,8 @@ end
 @testset "CuSnpArray tiled and tensor-core A*X agree" begin
     ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
     rng = Random.Xoshiro(13)
+    # The tensor-core kernels are opt-in; `mul!` uses them only when enabled.
+    SnpArrays.cuda_tensor_cores!(true)
     # m not a multiple of 16, n not a multiple of 4, and n large enough
     # for several SNP splits.
     for (m, n) in ((37, 5), (1001, 2049), (4099, 3001)), T in (Float32,
@@ -217,6 +219,7 @@ end
             @test relerr(Array(out), dense * X) < rtol
         end
     end
+    SnpArrays.cuda_tensor_cores!(false)
 end
 
 @testset "streamed_mul! on CuMatrix" begin

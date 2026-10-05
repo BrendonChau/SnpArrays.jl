@@ -22,6 +22,8 @@ const PREFIX = length(ARGS) >= 3 ? ARGS[3] : "linalg_kernels"
 const RESULTS_DIR = length(ARGS) >= 4 ? ARGS[4] : joinpath(@__DIR__, "results")
 const RHS_COUNTS = (8, 32, 128)
 const EXT = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
+# The tensor-core kernels are opt-in; this benchmark measures them.
+SnpArrays.cuda_tensor_cores!(true)
 
 """
     emit(io, line)
