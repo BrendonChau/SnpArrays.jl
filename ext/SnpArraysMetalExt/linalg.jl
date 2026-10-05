@@ -36,7 +36,7 @@ function MtlSnpArray{T}(s::SnpArray;
     model = ADDITIVE_MODEL,
     center::Bool = false,
     scale::Bool = false,
-    impute::Bool = false,
+    impute::Bool = true,
 ) where {T <: AbstractFloat}
     T <: Float32 || throw(ArgumentError(
         "MtlSnpArray{$T} is not supported; use MtlSnpArray{Float32}",

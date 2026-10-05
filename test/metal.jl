@@ -34,7 +34,7 @@ relerr(a, b) = norm(a - b) / max(norm(b), eps())
         scale = parse(Bool, combos[row, 3])
         T = Float32
         rtol = 1e-5
-        A = MtlSnpArray{T}(s; model, center, scale)
+        A = MtlSnpArray{T}(s; model, center, scale, impute=false)
         @test A isa MtlSnpArray{T}
         @test size(A) == size(s)
         @test eltype(A) == T
@@ -173,7 +173,7 @@ end
         s = golden_snparray(codes)
         rtol = 1e-5
         dense = missing_as_zero(s, codes, T, ADDITIVE_MODEL, true, true)
-        A = MtlSnpArray{T}(s; center=true, scale=true)
+        A = MtlSnpArray{T}(s; center=true, scale=true, impute=false)
         for k in (1, 2, 8, 9, 40)
             X = randn(rng, T, n, k)
             out = MtlMatrix{T}(undef, m, k)

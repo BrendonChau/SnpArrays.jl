@@ -1,6 +1,6 @@
 """
     MtlSnpArray{T}(s; model=ADDITIVE_MODEL, center=false, scale=false,
-                   impute=false)
+                   impute=true)
 
 Copy a `SnpArray` to an Apple Metal GPU to perform linear algebra
 operations. Constructors and `mul!` methods are defined by the
@@ -18,7 +18,7 @@ transformed value of each 2-bit PLINK code.
 - center: whether to center (default: false).
 - scale: whether to scale to standard deviation 1 (default: false).
 - impute: whether to impute missing values with the column mean (default:
-  false). With `impute=false` a missing genotype counts as 0 before
+  true). With `impute=false` a missing genotype counts as 0 before
   centering and scaling.
 """
 struct MtlSnpArray{T, D <: AbstractMatrix{UInt32}, V <: AbstractVector{T},
