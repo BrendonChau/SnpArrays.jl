@@ -197,7 +197,7 @@ end
         transpose(A), CUDA.zeros(Float32, m, 4))
 end
 
-@testset "CuSnpArray tiled and tensor-core A*X agree" begin
+@testset "CuSnpArray tiled and tensor-core kernels agree" begin
     ext = Base.get_extension(SnpArrays, :SnpArraysCUDAExt)
     rng = Random.Xoshiro(13)
     # The tensor-core kernels are opt-in; `mul!` uses them only when enabled.
@@ -217,6 +217,16 @@ end
             @test relerr(Array(mul!(out, A, CuArray(X))), dense * X) < rtol
             ext._tiled_mul!(out, A, CuArray(X))
             @test relerr(Array(out), dense * X) < rtol
+            Y = randn(rng, T, m, k)
+            outt = CuMatrix{T}(undef, n, k)
+            @test relerr(Array(mul!(outt, transpose(A), CuArray(Y))),
+                transpose(dense) * Y) < rtol
+            # The tiled transpose has no entry point of its own, so switch
+            # the tensor-core kernels off for one product.
+            SnpArrays.cuda_tensor_cores!(false)
+            @test relerr(Array(mul!(outt, transpose(A), CuArray(Y))),
+                transpose(dense) * Y) < rtol
+            SnpArrays.cuda_tensor_cores!(true)
         end
     end
     SnpArrays.cuda_tensor_cores!(false)
