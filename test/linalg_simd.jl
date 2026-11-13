@@ -615,6 +615,23 @@ end
         @test SnpArrays._lookup_gather4(x, s) == expected
     end
 
+    # Slice shape: fewest equal slices of at most LOOKUP_SLICE_MAX columns,
+    # padding under one vector per slice.
+    for T in (Float32, Float64)
+        shape_ok = true
+        for k in 1:200
+            lanes, vectors = SnpArrays._lookup_slice_shape(T, k)
+            slice = vectors * lanes
+            slices = cld(k, slice)
+            shape_ok &= lanes == SnpArrays._rhs_width(T, k) &&
+                        vectors >= 1 &&
+                        slice <= SnpArrays.LOOKUP_SLICE_MAX &&
+                        slices == cld(k, SnpArrays.LOOKUP_SLICE_MAX) &&
+                        slices * slice - k < slices * lanes
+        end
+        @test shape_ok
+    end
+
     for T in (Float32, Float64)
         nr = 2 * SnpArrays._vector_width(T)
         tolerance = T(64) * eps(T)
@@ -633,13 +650,14 @@ end
                            rtol=tolerance, nans=true)
         end
 
-        # 2b. Rhs widths on both sides of the 2W slice and the 32-wide slice,
-        #     including partial last slices.
+        # 2b. Every rhs width from the lookup minimum to 70, covering every
+        #     slice shape: one-vector and odd-vector slices and partial last
+        #     slices.
         packed, dense = simd_test_fixture(min_rows + 1, 37)
         reference = simd_test_reference(dense, T, ADDITIVE_MODEL, true, true,
                                         true)
         operator = SnpLinAlg{T}(packed; center=true, scale=true)
-        for k in (5, 16, 17, 40, 64)
+        for k in min_rhs:70
             rhs = simd_test_rhs(T, 37, k)
             @test isapprox(operator * rhs, reference * rhs; atol=tolerance,
                            rtol=tolerance, nans=true)

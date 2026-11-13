@@ -114,6 +114,13 @@ Fewest rhs columns for which `A*X` uses the lookup-table kernel.
 const LOOKUP_MIN_RHS = 4
 
 """
+    LOOKUP_SLICE_MAX
+
+Most rhs columns in one slice of the lookup-table `A*X` kernel.
+"""
+const LOOKUP_SLICE_MAX = 32
+
+"""
     _uses_lookup_kernel(m::Int, k::Int) -> Bool
 
 Return whether `A*X` with `m` samples and `k` rhs columns runs the
@@ -145,6 +152,20 @@ function _rhs_width(::Type{T}, k::Int) where T
         width >>= 1
     end
     return width
+end
+
+"""
+    _lookup_slice_shape(::Type{T}, k::Int) -> (lanes, vectors)
+
+Return the `Vec` lane count and the vectors per rhs slice of the lookup-table
+`A*X` kernel for `k >= 1` rhs columns: the fewest equal slices of at most
+`LOOKUP_SLICE_MAX` columns, each rounded up to whole vectors.
+"""
+function _lookup_slice_shape(::Type{T}, k::Int) where T
+    lanes = _rhs_width(T, k)
+    slices = cld(k, LOOKUP_SLICE_MAX)
+    vectors = cld(cld(k, slices), lanes)
+    return lanes, vectors
 end
 
 """

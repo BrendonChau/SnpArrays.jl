@@ -25,9 +25,8 @@ end
 Accumulate `out += A * rhs` with the lookup-table kernel: per chunk of
 `LOOKUP_CHUNK_SNPS` SNPs, build the 256-row tables of every 4-SNP block
 for all rhs columns (tasks over blocks), then gather them per sample
-(tasks over sample blocks). Rhs slices hold `NV` vectors of width
-`W = _vector_width(T)`, with `NV = 2` for `k ≤ 2W` and
-`NV = max(2, 32 ÷ W)` otherwise; `workspace` is laid out as in
+(tasks over sample blocks). Rhs slices hold `NV` vectors of width `W`, as
+chosen by `_lookup_slice_shape`; `workspace` is laid out as in
 `LookupLayout`, and `blk` holds the transposed codes of one chunk.
 """
 function _snparray_AX_lookup_schedule!(
@@ -41,8 +40,7 @@ function _snparray_AX_lookup_schedule!(
 ) where T <: SIMD_FLOAT
     n = size(packed, 2)
     k = size(out, 2)
-    lanes = _vector_width(T)
-    vectors = k <= 2lanes ? 2 : max(2, 32 ÷ lanes)
+    lanes, vectors = _lookup_slice_shape(T, k)
     slice = vectors * lanes
     k_padded = cld(k, slice) * slice
     nblk_max = min(LOOKUP_CHUNK_SNPS ÷ 4, cld(n, 4))
