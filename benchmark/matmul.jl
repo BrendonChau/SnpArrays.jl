@@ -107,9 +107,9 @@ function print_row(
     return nothing
 end
 
-function matrix_variant(m::Int, k::Int)
+function matrix_variant(::Type{T}, m::Int, k::Int) where T
     isdefined(SnpArrays, :_uses_lookup_kernel) || return "mul!"
-    return SnpArrays._uses_lookup_kernel(m, k) ? "mul! (lookup)" :
+    return SnpArrays._uses_lookup_kernel(T, m, k) ? "mul! (lookup)" :
            "mul! (register-tiled)"
 end
 
@@ -140,7 +140,7 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
     AX = Matrix{T}(undef, m, K)
     AtX = Matrix{T}(undef, n, K)
     fmas = Float64(m) * n * K
-    print_row(io, T, "A*X", matrix_variant(m, K),
+    print_row(io, T, "A*X", matrix_variant(T, m, K),
               @elapsed(mul!(AX, operator, X)), fmas)
     print_row(io, T, "Aᵀ*X",
               has_fork_internals() ? "mul! (register-tiled)" : "mul!",

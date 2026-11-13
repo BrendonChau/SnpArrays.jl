@@ -345,9 +345,9 @@ function sweep_tiled!(
     return nothing
 end
 
-function matrix_variant(m::Int, k::Int)
+function matrix_variant(::Type{T}, m::Int, k::Int) where T
     isdefined(SnpArrays, :_uses_lookup_kernel) || return "mul!"
-    return SnpArrays._uses_lookup_kernel(m, k) ? "mul! (lookup)" :
+    return SnpArrays._uses_lookup_kernel(T, m, k) ? "mul! (lookup)" :
            "mul! (register-tiled)"
 end
 
@@ -375,7 +375,7 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
         AX = Matrix{T}(undef, m, k)
         AtX = Matrix{T}(undef, n, k)
         fmas = Float64(m) * n * k
-        print_row(io, T, "A*X", k, matrix_variant(m, k),
+        print_row(io, T, "A*X", k, matrix_variant(T, m, k),
                   time_call(mul!, AX, operator, X), fmas)
         expected_AX = copy(AX)
         fork && sweep_tiled!(io, ax_register_tile!, AX, expected_AX, operator,

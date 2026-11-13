@@ -41,9 +41,10 @@ end
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs, α, β)
 
 Multiply `sla` by a vector or matrix and overwrite `out`. A matrix `rhs`
-with at least `LOOKUP_MIN_RHS` columns on at least `LOOKUP_MIN_ROWS`
-samples uses the lookup-table kernel (`_snparray_AX_lookup_schedule!`); other
-shapes use the register-tiled kernel. The five-argument form computes
+on at least `LOOKUP_MIN_ROWS` samples with at least the `LOOKUP_MIN_RHS`
+columns for its element type on this host uses the lookup-table kernel
+(`_snparray_AX_lookup_schedule!`); other shapes use the register-tiled
+kernel. The five-argument form computes
 `out = α * sla * rhs + β * out`.
 Concurrent matrix products on one `SnpLinAlg`, forward or transposed, run
 one at a time.

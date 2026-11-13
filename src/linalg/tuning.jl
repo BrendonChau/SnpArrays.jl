@@ -109,9 +109,33 @@ const LOOKUP_MIN_ROWS = 2048
 """
     LOOKUP_MIN_RHS
 
-Fewest rhs columns for which `A*X` uses the lookup-table kernel.
+Fewest rhs columns for which `A*X` uses the lookup-table kernel, as
+`(Float32, Float64)`. Set in `__init__` from `_detect_lookup_min_rhs()`.
 """
-const LOOKUP_MIN_RHS = 4
+const LOOKUP_MIN_RHS = Ref{NTuple{2, Int}}((4, 4))
+
+"""
+    _detect_lookup_min_rhs() -> NTuple{2, Int}
+
+Return the `(Float32, Float64)` rhs thresholds for the lookup-table `A*X`
+kernel: `(32, typemax(Int))` on aarch64, else `(4, 4)`. On an Apple M1 at 4
+threads (m = 8192, n = 49152) the lookup kernel was 1.5x (Float32) and 1.3x
+(Float64) slower than the register-tiled kernel at k = 8, about 1.1x faster
+for Float32 at k = 32 and 128, and never faster for Float64; `typemax(Int)`
+turns the lookup kernel off.
+"""
+function _detect_lookup_min_rhs()
+    return Sys.ARCH === :aarch64 ? (32, typemax(Int)) : (4, 4)
+end
+
+"""
+    _lookup_min_rhs(::Type{T}) -> Int
+
+Return the fewest rhs columns for which `A*X` with element type `T` uses the
+lookup-table kernel, from `LOOKUP_MIN_RHS[]`.
+"""
+_lookup_min_rhs(::Type{Float32}) = LOOKUP_MIN_RHS[][1]
+_lookup_min_rhs(::Type{Float64}) = LOOKUP_MIN_RHS[][2]
 
 """
     LOOKUP_SLICE_MAX
@@ -121,13 +145,17 @@ Most rhs columns in one slice of the lookup-table `A*X` kernel.
 const LOOKUP_SLICE_MAX = 32
 
 """
-    _uses_lookup_kernel(m::Int, k::Int) -> Bool
+    _uses_lookup_kernel(::Type{T}, m::Int, k::Int) -> Bool
 
-Return whether `A*X` with `m` samples and `k` rhs columns runs the
-lookup-table kernel rather than the register-tiled kernel.
+Return whether `A*X` with element type `T`, `m` samples and `k` rhs columns
+runs the lookup-table kernel rather than the register-tiled kernel.
 """
-function _uses_lookup_kernel(m::Int, k::Int)
-    return m >= LOOKUP_MIN_ROWS && k >= LOOKUP_MIN_RHS
+function _uses_lookup_kernel(
+    ::Type{T},
+    m::Int,
+    k::Int,
+) where T <: SIMD_FLOAT
+    return m >= LOOKUP_MIN_ROWS && k >= _lookup_min_rhs(T)
 end
 
 """

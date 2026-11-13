@@ -74,8 +74,8 @@ function _snparray_AX_schedule!(
     blk::Vector{UInt8},
 ) where T <: AbstractFloat
     k = size(out, 2)
-    if _uses_lookup_kernel(rows_filled, k) &&
-       _supports_lookup(out, packed, rhs)
+    if _supports_lookup(out, packed, rhs) &&
+       _uses_lookup_kernel(T, rows_filled, k)
         return _snparray_AX_lookup_schedule!(out, packed, rhs, values,
                                              rows_filled, workspace, blk)
     end

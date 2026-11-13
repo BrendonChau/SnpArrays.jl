@@ -595,14 +595,17 @@ end
 end
 
 @testset "SnpLinAlg lookup-table A*X" begin
+    SnpArrays.LOOKUP_MIN_RHS[] = (4, 4)
     min_rows = SnpArrays.LOOKUP_MIN_ROWS
-    min_rhs = SnpArrays.LOOKUP_MIN_RHS
+    min_rhs = 4
     tile = SnpArrays.LOOKUP_ROW_TILE
     chunk = SnpArrays.LOOKUP_CHUNK_SNPS
 
-    @test SnpArrays._uses_lookup_kernel(min_rows, min_rhs)
-    @test !SnpArrays._uses_lookup_kernel(min_rows - 1, min_rhs)
-    @test !SnpArrays._uses_lookup_kernel(min_rows, min_rhs - 1)
+    for T in (Float32, Float64)
+        @test SnpArrays._uses_lookup_kernel(T, min_rows, min_rhs)
+        @test !SnpArrays._uses_lookup_kernel(T, min_rows - 1, min_rhs)
+        @test !SnpArrays._uses_lookup_kernel(T, min_rows, min_rhs - 1)
+    end
 
     # 1. 4x4 two-bit transpose: sample s of x = r0 | r1<<8 | r2<<16 | r3<<24
     #    gets code (r_l >> 2s) & 3 in bits 2l:2l+1.
@@ -702,11 +705,25 @@ end
     product = operator * ones(5, min_rhs)
     @test all(isnan, product[2, :])
     @test all(iszero, product[[1; 3:min_rows], :])
+    SnpArrays.LOOKUP_MIN_RHS[] = SnpArrays._detect_lookup_min_rhs()
+end
+
+@testset "lookup-table rhs threshold by host and element type" begin
+    expected = Sys.ARCH === :aarch64 ? (32, typemax(Int)) : (4, 4)
+    @test SnpArrays._detect_lookup_min_rhs() == expected
+    saved = SnpArrays.LOOKUP_MIN_RHS[]
+    SnpArrays.LOOKUP_MIN_RHS[] = (32, typemax(Int))
+    min_rows = SnpArrays.LOOKUP_MIN_ROWS
+    @test SnpArrays._uses_lookup_kernel(Float32, min_rows, 32)
+    @test !SnpArrays._uses_lookup_kernel(Float32, min_rows, 31)
+    @test !SnpArrays._uses_lookup_kernel(Float64, min_rows, 4096)
+    SnpArrays.LOOKUP_MIN_RHS[] = saved
 end
 
 @testset "concurrent products on one SnpLinAlg" begin
+    SnpArrays.LOOKUP_MIN_RHS[] = (4, 4)
     min_rows = SnpArrays.LOOKUP_MIN_ROWS
-    min_rhs = SnpArrays.LOOKUP_MIN_RHS
+    min_rhs = 4
     # A register-tiled shape and a lookup-table shape.
     for (rows, widths) in ((203, (2, 3)), (min_rows + 5, (min_rhs, 2min_rhs)))
         packed, _ = simd_test_fixture(rows, 61)
@@ -729,4 +746,5 @@ end
             @test results[4] == transposed[2]
         end
     end
+    SnpArrays.LOOKUP_MIN_RHS[] = SnpArrays._detect_lookup_min_rhs()
 end
