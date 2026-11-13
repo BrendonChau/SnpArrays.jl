@@ -256,6 +256,21 @@ end
                    atol=64eps(Float32), rtol=64eps(Float32))
 end
 
+@testset "SnpLinAlg from a view of a SnpArray" begin
+    packed, dense = simd_test_fixture(17, 9)
+    columns = 3:6
+    operator = SnpLinAlg{Float64}(view(packed, :, columns); center=true,
+                                  scale=true)
+    reference = simd_test_reference(dense[:, columns], Float64,
+                                    ADDITIVE_MODEL, true, true, true)
+    @test size(operator) == (17, length(columns))
+    @test isapprox(Matrix(operator), reference; atol=64eps(Float64),
+                   rtol=64eps(Float64))
+    @test operator.s.data !== packed.data
+    @test_throws MethodError SnpLinAlg{Float64}(view(packed, 1:8, :))
+    @test_throws MethodError SnpLinAlg{Float64}(view(packed, :, [1, 3]))
+end
+
 @testset "SnpLinAlg IEEE nonfinite propagation" begin
     packed = SnpArray(undef, 4, 2)
     packed.data[:, :] .= reshape(UInt8[0xe1, 0x00], 1, 2)

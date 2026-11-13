@@ -37,7 +37,7 @@ Missing genotypes use the column mean before centering and scaling when
 - `impute`: replace missing genotypes with the column mean when `true`
 """
 function SnpLinAlg{T}(
-    s::AbstractSnpArray;
+    s::SnpArray;
     model = ADDITIVE_MODEL,
     center::Bool = false,
     scale::Bool = false,
@@ -53,6 +53,24 @@ function SnpLinAlg{T}(
     return SnpLinAlg{T}(s, model, center, scale, impute, means,
                         inverse_standard_deviations, values, T[], UInt8[],
                         ReentrantLock())
+end
+
+"""
+    SnpLinAlg{T}(block; kwargs...)
+
+Wrap a copy of the columns of `block`, a view of all rows and a contiguous
+column range of a `SnpArray`. The copy is held in memory, so later changes
+to the parent do not reach the result.
+"""
+function SnpLinAlg{T}(
+    block::SubArray{UInt8, 2, SnpArray,
+                    <:Tuple{Base.Slice, AbstractUnitRange{<:Integer}}};
+    kwargs...,
+) where T <: AbstractFloat
+    columns = parentindices(block)[2]
+    copied = SnpArray(undef, size(block, 1), length(columns))
+    copyto!(copied.data, view(parent(block).data, :, columns))
+    return SnpLinAlg{T}(copied; kwargs...)
 end
 
 """
