@@ -231,14 +231,17 @@ const ATX_TILE_COLUMNS = Ref{Int}(6)
 """
     _detect_atx_tile_columns(vector_bytes::Int) -> Int
 
-Return the `transpose(A)*X` tile height: 8 for 64-byte vectors, 2 on x86_64
-with 32-byte vectors, else 6. The 16 ymm registers of AVX2 cannot hold the
+Return the `transpose(A)*X` tile height: 4 for 64-byte vectors, 2 on x86_64
+with 32-byte vectors, else 6. With 64-byte vectors on a `znver4` host at 8
+threads (m = 50000, n = 667095, k = 128), 4 and 6 columns measured within 3%
+of each other, 1.7x faster than 8 and 2.0x faster than 2. With 32-byte
+vectors, the 16 ymm registers of AVX2 cannot hold the
 6-column tile, which also keeps one broadcast per column live: on a Haswell
 Xeon at 8 threads (m = 50000, n = 660966, k = 128) 6 columns spilled 10
 vectors per sample, 2 spilled none and measured 1.33x faster.
 """
 function _detect_atx_tile_columns(vector_bytes::Int)
-    vector_bytes == 64 && return 8
+    vector_bytes == 64 && return 4
     return Sys.ARCH === :x86_64 ? 2 : 6
 end
 

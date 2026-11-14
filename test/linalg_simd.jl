@@ -736,7 +736,7 @@ end
 end
 
 @testset "transpose tile height by host" begin
-    @test SnpArrays._detect_atx_tile_columns(64) == 8
+    @test SnpArrays._detect_atx_tile_columns(64) == 4
     @test SnpArrays._detect_atx_tile_columns(32) ==
           (Sys.ARCH === :x86_64 ? 2 : 6)
     saved = SnpArrays.ATX_TILE_COLUMNS[]
@@ -748,7 +748,7 @@ end
         operator = SnpLinAlg{T}(packed)
         rhs = simd_test_rhs(T, 37, 20)
         expected = transpose(reference) * rhs
-        for tile_columns in (1, 2, 6, 8)
+        for tile_columns in (1, 2, 4, 6, 8)
             SnpArrays.ATX_TILE_COLUMNS[] = tile_columns
             @test isapprox(transpose(operator) * rhs, expected;
                            atol=64eps(T), rtol=64eps(T))
