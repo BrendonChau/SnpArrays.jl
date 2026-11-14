@@ -735,6 +735,28 @@ end
     SnpArrays.LOOKUP_MIN_RHS[] = saved
 end
 
+@testset "transpose tile height by host" begin
+    @test SnpArrays._detect_atx_tile_columns(64) == 8
+    @test SnpArrays._detect_atx_tile_columns(32) ==
+          (Sys.ARCH === :x86_64 ? 2 : 6)
+    saved = SnpArrays.ATX_TILE_COLUMNS[]
+    packed, dense = simd_test_fixture(37, 23; allow_missing=false)
+    for T in (Float32, Float64)
+        reference = simd_test_reference(
+            dense, T, ADDITIVE_MODEL, false, false, true,
+        )
+        operator = SnpLinAlg{T}(packed)
+        rhs = simd_test_rhs(T, 37, 20)
+        expected = transpose(reference) * rhs
+        for tile_columns in (1, 2, 6, 8)
+            SnpArrays.ATX_TILE_COLUMNS[] = tile_columns
+            @test isapprox(transpose(operator) * rhs, expected;
+                           atol=64eps(T), rtol=64eps(T))
+        end
+    end
+    SnpArrays.ATX_TILE_COLUMNS[] = saved
+end
+
 @testset "concurrent products on one SnpLinAlg" begin
     SnpArrays.LOOKUP_MIN_RHS[] = (4, 4)
     min_rows = SnpArrays.LOOKUP_MIN_ROWS

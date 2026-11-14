@@ -66,6 +66,7 @@ datadir(parts...) = joinpath(@__DIR__, "..", "data", parts...)
 
 function __init__()
     VECTOR_BYTES[] = _detect_vector_bytes()
+    ATX_TILE_COLUMNS[] = _detect_atx_tile_columns(VECTOR_BYTES[])
     LOOKUP_MIN_RHS[] = _detect_lookup_min_rhs()
     @require CUDA="052768ef-5323-5732-b1bb-66c8b64840ba" include("cuda.jl")
 end

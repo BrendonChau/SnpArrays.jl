@@ -214,7 +214,7 @@ function _snparray_AtX_schedule!(
     panel_length = 2lanes * row_step
     tasks = cld(n, column_step) * cld(k, rhs_step)
     _resize_workspace!(workspace, tasks * panel_length)
-    tile_columns, _ = _register_tile_shape(T)
+    tile_columns = ATX_TILE_COLUMNS[]
     return _snparray_AtX_spawn_tasks!(
         out, packed, rhs, values, rows_filled, cols, workspace, row_step,
         column_step, rhs_step, panel_length, Val(tile_columns), Val(lanes),

@@ -169,7 +169,21 @@ function print_header(io::IO, m::Int, n::Int)
                        SnpArrays._register_tile_shape(T))
         end
     end
+    isdefined(SnpArrays, :ATX_TILE_COLUMNS) &&
+        print_fact(io, "ATX_TILE_COLUMNS", SnpArrays.ATX_TILE_COLUMNS[])
     return nothing
+end
+
+"""
+    default_tile_rows(::Type{T}, product) -> Int
+
+Return the register-tile height `mul!` uses for `product` (`"A*X"` or
+`"Aᵀ*X"`) with element type `T`.
+"""
+function default_tile_rows(::Type{T}, product::AbstractString) where T
+    product == "Aᵀ*X" && isdefined(SnpArrays, :ATX_TILE_COLUMNS) &&
+        return SnpArrays.ATX_TILE_COLUMNS[]
+    return SnpArrays._register_tile_shape(T)[1]
 end
 
 """
@@ -209,13 +223,13 @@ function print_tile_sizes(io::IO, m::Int, n::Int)
         print_steps(io, T, "A*x", 1, (rows, n, 1), "none")
         rows, columns = SnpArrays._snparray_atx_steps(T, n)
         print_steps(io, T, "Aᵀ*y", 1, (rows, columns, 1), "none")
-        tile_rows = SnpArrays._register_tile_shape(T)[1]
         for k in RHS_COUNTS
-            tile = "$(tile_rows) x $(2 * SnpArrays._rhs_width(T, k))"
+            lanes = 2 * SnpArrays._rhs_width(T, k)
             print_steps(io, T, "A*X", k, SnpArrays._snparray_AX_steps(T, m, k),
-                        tile)
+                        "$(default_tile_rows(T, "A*X")) x $(lanes)")
             print_steps(io, T, "Aᵀ*X", k,
-                        SnpArrays._snparray_AtX_steps(T, n, k), tile)
+                        SnpArrays._snparray_AtX_steps(T, n, k),
+                        "$(default_tile_rows(T, "Aᵀ*X")) x $(lanes)")
         end
     end
     return nothing
@@ -337,8 +351,7 @@ function sweep_tiled!(
             "relative error $(relative)",
         )
         times = time_call(driver!, out, operator, rhs, workspace, tile)
-        default = rows == SnpArrays._register_tile_shape(T)[1] ?
-                  " (default)" : ""
+        default = rows == default_tile_rows(T, product) ? " (default)" : ""
         print_row(io, T, product, k, "tiled MR=$(rows)$(default)", times,
                   Float64(m) * n * k)
     end
@@ -456,12 +469,14 @@ function write_generated_code(io::IO, stem::AbstractString, G::SnpArray)
         Matrix{Float32}(undef, 1, 1), operator.s.data, operator.values,
         Float32[], 0, 0,
     )
-    tile = typeof(Val(SnpArrays._register_tile_shape(Float32)[1]))
+    tile = typeof(Val(default_tile_rows(Float32, "A*X")))
+    transpose_tile = typeof(Val(default_tile_rows(Float32, "Aᵀ*X")))
     width = typeof(Val(SnpArrays._vector_width(Float32)))
     emit(io, "")
     emit(io, "## Generated code")
     emit(io, "")
-    emit(io, "Generated code for `$(tile)`, `Val{2}`, `$(width)`.")
+    emit(io, "Generated code for `$(tile)` (`A*X`) and `$(transpose_tile)` " *
+             "(`Aᵀ*X`), `Val{2}`, `$(width)`.")
     emit(io, "")
     emit(io, "| File | Lines with vfmadd or fmla |")
     emit(io, "| --- | ---: |")
@@ -470,7 +485,7 @@ function write_generated_code(io::IO, stem::AbstractString, G::SnpArray)
                        tile, Val{2}, width})
     write_native(io, stem * "_AtX.s", SnpArrays._snparray_AtX_register_tile!,
                  Tuple{typeof(task), UnitRange{Int}, Int, UnitRange{Int},
-                       tile, Val{2}, width})
+                       transpose_tile, Val{2}, width})
     return nothing
 end
 

@@ -87,6 +87,8 @@ function print_header(io::IO, stream::SnpLinAlgStream)
     print_fact(io, "readers", stream.readers)
     isdefined(SnpArrays, :VECTOR_BYTES) &&
         print_fact(io, "VECTOR_BYTES", SnpArrays.VECTOR_BYTES[])
+    isdefined(SnpArrays, :ATX_TILE_COLUMNS) &&
+        print_fact(io, "ATX_TILE_COLUMNS", SnpArrays.ATX_TILE_COLUMNS[])
     return nothing
 end
 

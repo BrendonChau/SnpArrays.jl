@@ -204,11 +204,34 @@ Return the register-tile shape `(MR, NR)` for element type `T`: `NR =
 budget: AVX2 Float32 gives `MR=6, NR=16` (12 accumulators + 2 rhs + 1
 broadcast = 15 ymm registers); AVX2 Float64 gives `MR=6, NR=8` (15 ymm);
 AVX-512 gives `MR=8` (19 zmm); NEON packs `W=8` Float32 lanes as two q
-registers, using 30 of 32 registers.
+registers, using 30 of 32 registers. `transpose(A)*X` takes its tile height
+from `ATX_TILE_COLUMNS[]` instead of `MR`.
 """
 function _register_tile_shape(::Type{T}) where T
     mr = VECTOR_BYTES[] == 64 ? 8 : 6
     return mr, 2 * _vector_width(T)
+end
+
+"""
+    ATX_TILE_COLUMNS
+
+SNP columns per register tile of `transpose(A)*X`. Set in `__init__` from
+`_detect_atx_tile_columns(VECTOR_BYTES[])`.
+"""
+const ATX_TILE_COLUMNS = Ref{Int}(6)
+
+"""
+    _detect_atx_tile_columns(vector_bytes::Int) -> Int
+
+Return the `transpose(A)*X` tile height: 8 for 64-byte vectors, 2 on x86_64
+with 32-byte vectors, else 6. The 16 ymm registers of AVX2 cannot hold the
+6-column tile, which also keeps one broadcast per column live: on a Haswell
+Xeon at 8 threads (m = 50000, n = 660966, k = 128) 6 columns spilled 10
+vectors per sample, 2 spilled none and measured 1.33x faster.
+"""
+function _detect_atx_tile_columns(vector_bytes::Int)
+    vector_bytes == 64 && return 8
+    return Sys.ARCH === :x86_64 ? 2 : 6
 end
 
 """
