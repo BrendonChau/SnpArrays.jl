@@ -9,7 +9,7 @@ const SIMD_FLOAT = Union{Float32, Float64}
     VECTOR_BYTES
 
 SIMD register width in bytes used by the register-tiled kernels: 64 on
-x86_64 hosts whose ISA includes the AVX-512 tier, 32 otherwise (AVX2, or
+x86_64 hosts that report the AVX-512 features, 32 otherwise (AVX2, or
 NEON packed as two 128-bit registers). Set in `__init__` from
 `_detect_vector_bytes()`; the first use of each `(T, W)` pair compiles
 in-process (no precompile workload). On a Xeon 6736P, 64 measured 1.27x to
@@ -22,18 +22,26 @@ const VECTOR_BYTES = Ref{Int}(32)
 """
     _detect_vector_bytes() -> Int
 
-Return 64 on x86_64 hosts whose CPU ISA includes AVX-512, else 32. Relies
-on `Base.BinaryPlatforms` internals (`arch_march_isa_mapping`,
-`CPUID.cpu_isa()`) that exist in Julia 1.12 but are not part of the public
-API, so the fallback to 32 is mandatory if they are unavailable or raise
-an error.
+Return 64 on x86_64 hosts whose CPU reports the AVX-512 F, VL, BW, DQ and
+CD features, else 32. Julia's `avx512` ISA tier also requires `pku`, which
+a virtual machine can hide: a `znver4` cloud host has all five and fails
+the tier. Relies on `Base.BinaryPlatforms.CPUID` internals
+(`test_cpu_feature`, the `JL_X86_*` constants) that exist in Julia 1.12 but
+are not part of the public API, so the fallback to 32 is mandatory if they
+are unavailable or raise an error.
 """
 function _detect_vector_bytes()
     Sys.ARCH === :x86_64 || return 32
     try
-        isa_map = Dict(Base.BinaryPlatforms.arch_march_isa_mapping["x86_64"])
-        return isa_map["avx512"] <= Base.BinaryPlatforms.CPUID.cpu_isa() ?
-               64 : 32
+        cpuid = Base.BinaryPlatforms.CPUID
+        features = (
+            cpuid.JL_X86_avx512f,
+            cpuid.JL_X86_avx512vl,
+            cpuid.JL_X86_avx512bw,
+            cpuid.JL_X86_avx512dq,
+            cpuid.JL_X86_avx512cd,
+        )
+        return all(cpuid.test_cpu_feature, features) ? 64 : 32
     catch
         return 32
     end
