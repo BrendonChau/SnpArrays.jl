@@ -757,6 +757,32 @@ end
     SnpArrays.ATX_TILE_COLUMNS[] = saved
 end
 
+@testset "SnpLinAlg sums of squares from genotype counts" begin
+    for allow_missing in (true, false)
+        packed, dense = simd_test_fixture(37, 23; allow_missing=allow_missing)
+        for T in (Float32, Float64),
+            model in (ADDITIVE_MODEL, DOMINANT_MODEL, RECESSIVE_MODEL),
+            impute in (false, true), center in (false, true),
+            scale in (false, true)
+            operator = SnpLinAlg{T}(packed; model=model, impute=impute,
+                                    center=center, scale=scale)
+            reference = simd_test_reference(dense, T, model, center, scale,
+                                            impute)
+            tolerance = T(64) * eps(T)
+            expected = sum(abs2, reference; dims=1)
+            observed = sum(abs2, operator; dims=1)
+            @test size(observed) == (1, 23)
+            @test isapprox(observed, expected; nans=true, atol=tolerance,
+                           rtol=tolerance)
+            @test isapprox(sum(abs2, operator), sum(expected); nans=true,
+                           atol=tolerance, rtol=tolerance)
+            @test isapprox(sum(abs2, operator; dims=2),
+                           sum(abs2, reference; dims=2); nans=true,
+                           atol=tolerance, rtol=tolerance)
+        end
+    end
+end
+
 @testset "concurrent products on one SnpLinAlg" begin
     SnpArrays.LOOKUP_MIN_RHS[] = (4, 4)
     min_rows = SnpArrays.LOOKUP_MIN_ROWS

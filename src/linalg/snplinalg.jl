@@ -148,6 +148,53 @@ Base.eltype(::SnpLinAlg{T}) where T = T
 end
 
 """
+    _column_sums_of_squares(sla::SnpLinAlg{T}) -> Vector{T}
+
+Return the sum of squared entries of each column of `sla`: its four
+transformed genotype values, squared and weighted by their counts. A code
+that never occurs contributes nothing, so its `NaN` value under
+`impute=false` does not reach the sum.
+"""
+function _column_sums_of_squares(sla::SnpLinAlg{T}) where T <: AbstractFloat
+    column_counts = _counts(sla.s, 1)
+    values = sla.values
+    result = zeros(T, size(sla, 2))
+    @inbounds for column in axes(values, 2)
+        total = zero(T)
+        for code in 1:4
+            count = column_counts[code, column]
+            if count > 0
+                total += T(count) * abs2(values[code, column])
+            end
+        end
+        result[column] = total
+    end
+    return result
+end
+
+"""
+    sum(abs2, sla::SnpLinAlg; dims=:)
+
+Sum of the squared entries of `sla`. For `dims = 1` (a `1 x n` matrix) and
+`dims = :` the result comes from the genotype counts of each column, four
+terms per column, and reads no genotype once those counts are cached. Any
+other `dims` uses the generic reduction.
+"""
+function Base.sum(
+    ::typeof(abs2),
+    sla::SnpLinAlg{T};
+    dims = :,
+) where T <: AbstractFloat
+    if dims === Colon()
+        return sum(_column_sums_of_squares(sla))
+    elseif dims == 1
+        return reshape(_column_sums_of_squares(sla), 1, :)
+    end
+    return invoke(sum, Tuple{typeof(abs2), AbstractArray}, abs2, sla;
+                  dims = dims)
+end
+
+"""
     Base.copyto!(destination, source)
 
 Copy a `SnpLinAlg` or one of its views to a floating-point vector or matrix.
