@@ -8,6 +8,18 @@ const PACKED_EXPANSION = Val((0, 0, 0, 0, 1, 1, 1, 1,
                               2, 2, 2, 2, 3, 3, 3, 3))
 
 """
+    SimdVector{T}
+
+`Vector{T}` or a unit-stride contiguous vector view of a `Matrix{T}`, such
+as `view(M, :, j)`: the vectors the SIMD vector kernels index with
+`VecRange`.
+"""
+const SimdVector{T} = Union{
+    Vector{T},
+    Base.FastContiguousSubArray{T, 1, Matrix{T}},
+}
+
+"""
     PACKED_SHIFTS
 
 Per-lane right shifts that bring the 2-bit code of each sample to the low bits
@@ -74,9 +86,9 @@ matrix `A`, decoding genotypes with the 16-lane vector decode. Requires
 `first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_ax_kernel!(
-    out::Vector{T},
+    out::SimdVector{T},
     packed::Matrix{UInt8},
-    rhs::Vector{T},
+    rhs::SimdVector{T},
     values::Matrix{T},
     rows::UnitRange{Int},
     columns::UnitRange{Int},
@@ -114,9 +126,9 @@ vector decode and a SIMD tree reduction per column. `columns` index the full
 genotype arrays `packed` and `values`; requires `first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_atx_kernel!(
-    out::Vector{T},
+    out::SimdVector{T},
     packed::StridedMatrix{UInt8},
-    rhs::Vector{T},
+    rhs::SimdVector{T},
     values::StridedMatrix{T},
     rows::UnitRange{Int},
     columns::UnitRange{Int},

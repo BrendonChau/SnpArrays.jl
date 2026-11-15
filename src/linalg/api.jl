@@ -113,17 +113,36 @@ function _check_eltypes(
 end
 
 """
+    ColumnRangeView{T}
+
+Contiguous column-range view `view(M, :, j:k)` of a `Matrix{T}`.
+"""
+const ColumnRangeView{T} = SubArray{T, 2, Matrix{T},
+    Tuple{Base.Slice{Base.OneTo{Int}}, UnitRange{Int}}, true}
+
+"""
+    _column_vector(x) -> SimdVector
+
+Alias the one column of `x` as a `SimdVector` without copying.
+"""
+_column_vector(x::Matrix) = vec(x)
+
+function _column_vector(x::ColumnRangeView)
+    return view(parent(x), :, first(parentindices(x)[2]))
+end
+
+"""
     _use_vector_kernels(out, ::Type{T}, rhs) -> Bool
 
 Return whether a matrix product can run on the vector kernels through
-`vec(out)` and `vec(rhs)`: both are dense one-column `Matrix{T}` sharing the
-`Float32` or `Float64` operator element type `T`, so `vec` aliases them as the
-`Vector{T}` the SIMD kernels take.
+`_column_vector(out)` and `_column_vector(rhs)`: each is a dense `Matrix{T}`
+or a `ColumnRangeView{T}` with one column, sharing the `Float32` or `Float64`
+operator element type `T`.
 """
 function _use_vector_kernels(
-    out::Matrix{T},
+    out::Union{Matrix{T}, ColumnRangeView{T}},
     ::Type{T},
-    rhs::Matrix{T},
+    rhs::Union{Matrix{T}, ColumnRangeView{T}},
 ) where T <: SIMD_FLOAT
     return size(rhs, 2) == 1
 end
@@ -139,8 +158,9 @@ share one element type, or `sla` is a `SnpLinAlg{Float32}` and each of `out`
 and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs` is rounded to
 `Float32`; with a `Float64` `out`, partial sums over at most 1024 SNPs are
 formed in `Float32` and summed in `Float64`. Other element types throw an
-`ArgumentError`. A one-column dense `Matrix` `out` and `rhs` of the
-operator's `Float32` or `Float64` element type run the vector kernel.
+`ArgumentError`. One-column `out` and `rhs` of the operator's `Float32` or
+`Float64` element type, each a dense `Matrix` or a `view(M, :, j:j)` of one,
+run the vector kernel.
 """
 function mul!(
     out::AbstractMatrix{<:AbstractFloat},
@@ -165,7 +185,7 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
     if _use_vector_kernels(out, T, rhs)
-        mul!(vec(out), sla, vec(rhs), α, β)
+        mul!(_column_vector(out), sla, _column_vector(rhs), α, β)
         return out
     end
     _begin_scaled_product!(out, α, β) || return out
@@ -252,8 +272,9 @@ Matrix right-hand-side forms of the methods above. `out`, the operator, and
 each of `out` and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs`
 is rounded to `Float32`; with a `Float64` `out`, partial sums over at most
 4096 samples are formed in `Float32` and summed in `Float64`. Other element
-types throw an `ArgumentError`. A one-column dense `Matrix` `out` and `rhs`
-of the operator's `Float32` or `Float64` element type run the vector kernel.
+types throw an `ArgumentError`. One-column `out` and `rhs` of the operator's
+`Float32` or `Float64` element type, each a dense `Matrix` or a
+`view(M, :, j:j)` of one, run the vector kernel.
 """
 function mul!(
     out::AbstractMatrix{<:AbstractFloat},
@@ -284,7 +305,7 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
     if _use_vector_kernels(out, T, rhs)
-        mul!(vec(out), transposed, vec(rhs), cols)
+        mul!(_column_vector(out), transposed, _column_vector(rhs), cols)
         return out
     end
     fill!(out, zero(TO))
@@ -313,7 +334,7 @@ function mul!(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
     if _use_vector_kernels(out, T, rhs)
-        mul!(vec(out), transposed, vec(rhs), α, β)
+        mul!(_column_vector(out), transposed, _column_vector(rhs), α, β)
         return out
     end
     _begin_scaled_product!(out, α, β) || return out

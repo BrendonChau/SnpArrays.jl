@@ -976,3 +976,93 @@ end
     @test_throws ArgumentError mul!(zeros(n + 1, 1), transpose(operator),
                                     zeros(m, 1), 1:(n + 1))
 end
+
+# A one-column operand: a dense `Matrix` (j == 0), or column `j` of a
+# three-column buffer whose other columns hold `sentinel`.
+function simd_test_column(values::Matrix{T}, j::Int, sentinel::T) where T
+    j == 0 && return copy(values), values
+    buffer = fill(sentinel, size(values, 1), 3)
+    buffer[:, j] .= vec(values)
+    return view(buffer, :, j:j), buffer
+end
+
+function simd_test_others_untouched(buffer::Matrix, j::Int, sentinel)
+    j == 0 && return true
+    return all(isequal(sentinel), view(buffer, :, setdiff(1:3, j)))
+end
+
+@testset "SnpLinAlg products on contiguous column views" begin
+    m, n = 70, 23
+    cols = 3:17
+    α, β = 2.5, -0.75
+    packed, _ = simd_test_fixture(m, n)
+    for T in (Float32, Float64)
+        operator = SnpLinAlg{T}(packed; center=true, scale=true)
+        sentinel = T(19)
+        x = simd_test_rhs(T, n, 1)
+        y = simd_test_rhs(T, m, 1)
+        prior_m = simd_test_rhs(T, m, 1)
+        prior_n = simd_test_rhs(T, n, 1)
+        forward = mul!(zeros(T, m), operator, vec(x))
+        forward5 = mul!(vec(copy(prior_m)), operator, vec(x), α, β)
+        for jo in 0:2, jr in 0:2
+            rhs, _ = simd_test_column(x, jr, sentinel)
+            @test SnpArrays._use_vector_kernels(zeros(T, m, 1), T, rhs)
+            out, buffer = simd_test_column(zeros(T, m, 1), jo, sentinel)
+            @test mul!(out, operator, rhs) === out
+            @test isequal(vec(out), forward)
+            @test simd_test_others_untouched(buffer, jo, sentinel)
+            out, buffer = simd_test_column(prior_m, jo, sentinel)
+            mul!(out, operator, rhs, α, β)
+            @test isequal(vec(out), forward5)
+            @test simd_test_others_untouched(buffer, jo, sentinel)
+
+            rhs, _ = simd_test_column(y, jr, sentinel)
+            for wrapped in (transpose(operator), adjoint(operator))
+                out, buffer = simd_test_column(zeros(T, n, 1), jo, sentinel)
+                @test mul!(out, wrapped, rhs) === out
+                @test isequal(vec(out), mul!(zeros(T, n), wrapped, vec(y)))
+                @test simd_test_others_untouched(buffer, jo, sentinel)
+                out, buffer = simd_test_column(prior_n, jo, sentinel)
+                mul!(out, wrapped, rhs, α, β)
+                @test isequal(vec(out),
+                              mul!(vec(copy(prior_n)), wrapped, vec(y), α, β))
+                @test simd_test_others_untouched(buffer, jo, sentinel)
+                out, buffer = simd_test_column(zeros(T, length(cols), 1), jo,
+                                               sentinel)
+                mul!(out, wrapped, rhs, cols)
+                @test isequal(vec(out), mul!(zeros(T, length(cols)), wrapped,
+                                             vec(y), cols))
+                @test simd_test_others_untouched(buffer, jo, sentinel)
+            end
+        end
+
+        # Vector form on `view(buffer, :, 2)` for both operands.
+        rhs_buffer = fill(sentinel, n, 3)
+        rhs_buffer[:, 2] .= vec(x)
+        out_buffer = fill(sentinel, m, 3)
+        mul!(view(out_buffer, :, 2), operator, view(rhs_buffer, :, 2))
+        @test isequal(out_buffer[:, 2], forward)
+        @test simd_test_others_untouched(out_buffer, 2, sentinel)
+
+        # The reduced operands reach the SIMD methods in matvec.jl.
+        column = SnpArrays._column_vector(view(out_buffer, :, 2:2))
+        @test column isa SubArray{T, 1, Matrix{T},
+                                  Tuple{Base.Slice{Base.OneTo{Int}}, Int}, true}
+        @test parent(column) === out_buffer
+        @test column isa SnpArrays.SimdVector{T}
+        ax_arguments = (column, packed.data, column, operator.values, 1:1, 1:1)
+        atx_arguments = (ax_arguments..., 0)
+        for (kernel, arguments) in (
+            (SnpArrays._snparray_ax_kernel!, ax_arguments),
+            (SnpArrays._snparray_atx_kernel!, atx_arguments),
+        )
+            method = which(kernel, typeof(arguments))
+            @test endswith(String(method.file), "matvec.jl")
+        end
+    end
+    @test !SnpArrays._use_vector_kernels(zeros(Float64, 4, 1), Float32,
+                                         zeros(Float64, 4, 1))
+    @test !SnpArrays._use_vector_kernels(view(zeros(8, 1), 1:2:8, :), Float64,
+                                         zeros(4, 1))
+end
