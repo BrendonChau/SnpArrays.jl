@@ -7,7 +7,7 @@ sweeping every SNP column with `_snparray_ax_kernel!`.
 function _snparray_ax_schedule!(
     out::AbstractVector{T},
     packed::AbstractMatrix{UInt8},
-    rhs::AbstractVector{T},
+    rhs::AbstractVector{<:AbstractFloat},
     values::AbstractMatrix{T},
     rows_filled::Int,
 ) where T <: AbstractFloat
@@ -23,6 +23,39 @@ function _snparray_ax_schedule!(
             @assert (row_first - 1) % 4 == 0 "row_first must be ≡ 1 (mod 4)"
             Threads.@spawn _snparray_ax_kernel!(
                 out, packed, rhs, values, $(row_first:row_last), 1:n,
+            )
+        end
+    end
+    return out
+end
+
+"""
+    _snparray_ax_mixed_schedule!(out, scratch, packed, rhs, values,
+        rows_filled) -> out
+
+Accumulate `Float64` `out += A * rhs` for a `SnpLinAlg{Float32}` matrix `A`
+by spawning one `_snparray_ax_mixed_kernel!` task per block of samples, each
+using its rows of the zeroed `Float32` `scratch`.
+"""
+function _snparray_ax_mixed_schedule!(
+    out::SimdVector{Float64},
+    scratch::Vector{Float32},
+    packed::Matrix{UInt8},
+    rhs::SimdVector{<:SIMD_FLOAT},
+    values::Matrix{Float32},
+    rows_filled::Int,
+)
+    n = size(packed, 2)
+    row_step = _snparray_ax_row_step(Float32, rows_filled)
+    @assert(
+        row_step % DECODE_WIDTH == 0,
+        "row_step must be a multiple of DECODE_WIDTH",
+    )
+    @sync begin
+        for row_first in 1:row_step:rows_filled
+            row_last = min(row_first + row_step - 1, rows_filled)
+            Threads.@spawn _snparray_ax_mixed_kernel!(
+                out, scratch, packed, rhs, values, $(row_first:row_last), 1:n,
             )
         end
     end
@@ -152,7 +185,7 @@ Accumulate `out += transpose(A[:, cols]) * rhs` by spawning one task per block
 of SNP columns, each sweeping every sample with `_snparray_atx_kernel!`.
 """
 function _snparray_atx_schedule!(
-    out::AbstractVector{T},
+    out::AbstractVector{<:AbstractFloat},
     packed::AbstractMatrix{UInt8},
     rhs::AbstractVector{T},
     values::AbstractMatrix{T},

@@ -46,6 +46,10 @@ columns for its element type on this host uses the lookup-table kernel
 (`_snparray_AX_lookup_schedule!`); other shapes use the register-tiled
 kernel. The five-argument form computes
 `out = α * sla * rhs + β * out`.
+A `SnpLinAlg{Float32}` also takes a `Float32` or `Float64` vector `out` and
+`rhs`, each a `Vector` or `view(M, :, j)` of a `Matrix`: a `Float64` `rhs`
+is rounded to `Float32`, and with a `Float64` `out`, `Float32` partial sums
+over runs of at most 256 SNPs are added in `Float64`.
 Concurrent matrix products on one `SnpLinAlg`, forward or transposed, run
 one at a time.
 """
@@ -113,6 +117,18 @@ function _check_eltypes(
 end
 
 """
+    SimdVector{T}
+
+`Vector{T}` or a unit-stride contiguous vector view of a `Matrix{T}`, such
+as `view(M, :, j)`: the vectors the SIMD vector kernels index with
+`VecRange`.
+"""
+const SimdVector{T} = Union{
+    Vector{T},
+    Base.FastContiguousSubArray{T, 1, Matrix{T}},
+}
+
+"""
     ColumnRangeView{T}
 
 Contiguous column-range view `view(M, :, j:k)` of a `Matrix{T}`.
@@ -135,19 +151,163 @@ end
     _use_vector_kernels(out, ::Type{T}, rhs) -> Bool
 
 Return whether a matrix product can run on the vector kernels through
-`_column_vector(out)` and `_column_vector(rhs)`: each is a dense `Matrix{T}`
-or a `ColumnRangeView{T}` with one column, sharing the `Float32` or `Float64`
-operator element type `T`.
+`_column_vector(out)` and `_column_vector(rhs)`: each is a dense `Matrix` or
+a `ColumnRangeView` with one column, of `Float32` or `Float64` element types
+that `_supports_eltypes` accepts with the operator element type `T`.
 """
 function _use_vector_kernels(
-    out::Union{Matrix{T}, ColumnRangeView{T}},
+    out::Union{Matrix{TO}, ColumnRangeView{TO}},
     ::Type{T},
-    rhs::Union{Matrix{T}, ColumnRangeView{T}},
-) where T <: SIMD_FLOAT
-    return size(rhs, 2) == 1
+    rhs::Union{Matrix{TR}, ColumnRangeView{TR}},
+) where {TO <: SIMD_FLOAT, T <: SIMD_FLOAT, TR <: SIMD_FLOAT}
+    return _supports_eltypes(TO, T, TR) && size(rhs, 2) == 1
 end
 
 _use_vector_kernels(out, ::Type, rhs) = false
+
+"""
+    _mixed_ax!(out, sla, rhs, α, β) -> out
+
+Mixed-precision `out = α * sla * rhs + β * out` on the SIMD vector kernels.
+"""
+function _mixed_ax!(
+    out::SimdVector{<:SIMD_FLOAT},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{<:SIMD_FLOAT},
+    α::Number,
+    β::Number,
+)
+    length(out) == size(sla, 1) || throw(DimensionMismatch(
+        "output has length $(length(out)); expected $(size(sla, 1))",
+    ))
+    length(rhs) == size(sla, 2) || throw(DimensionMismatch(
+        "right-hand side has length $(length(rhs)); expected $(size(sla, 2))",
+    ))
+    _begin_scaled_product!(out, α, β) || return out
+    _mixed_ax_accumulate!(out, sla, rhs)
+    return _finish_scaled_product!(out, α)
+end
+
+function _mixed_ax_accumulate!(
+    out::SimdVector{Float32},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{Float64},
+)
+    return _snparray_ax_schedule!(out, sla.s.data, rhs, sla.values, sla.s.m)
+end
+
+# The Float32 run sums live in `sla.panel`, the matrix products' workspace.
+function _mixed_ax_accumulate!(
+    out::SimdVector{Float64},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{<:SIMD_FLOAT},
+)
+    @lock sla.lock begin
+        scratch = fill!(_resize_workspace!(sla.panel, sla.s.m), 0.0f0)
+        _snparray_ax_mixed_schedule!(out, scratch, sla.s.data, rhs,
+                                     sla.values, sla.s.m)
+    end
+    return out
+end
+
+"""
+    _mixed_atx!(out, sla, rhs, cols) -> out
+    _mixed_atx!(out, sla, rhs, α, β) -> out
+
+Mixed-precision transposed products on the SIMD vector kernels.
+"""
+function _mixed_atx!(
+    out::SimdVector{<:SIMD_FLOAT},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{<:SIMD_FLOAT},
+    cols::UnitRange{Int},
+)
+    cols ⊆ 1:size(sla, 2) || throw(ArgumentError(
+        "cols $cols is not a subset of 1:$(size(sla, 2))",
+    ))
+    length(out) == length(cols) || throw(DimensionMismatch(
+        "output has length $(length(out)); expected $(length(cols))",
+    ))
+    length(rhs) == size(sla, 1) || throw(DimensionMismatch(
+        "right-hand side has length $(length(rhs)); expected $(size(sla, 1))",
+    ))
+    fill!(out, zero(eltype(out)))
+    return _mixed_atx_accumulate!(out, sla, rhs, cols)
+end
+
+function _mixed_atx!(
+    out::SimdVector{<:SIMD_FLOAT},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{<:SIMD_FLOAT},
+    α::Number,
+    β::Number,
+)
+    length(out) == size(sla, 2) || throw(DimensionMismatch(
+        "output has length $(length(out)); expected $(size(sla, 2))",
+    ))
+    length(rhs) == size(sla, 1) || throw(DimensionMismatch(
+        "right-hand side has length $(length(rhs)); expected $(size(sla, 1))",
+    ))
+    _begin_scaled_product!(out, α, β) || return out
+    _mixed_atx_accumulate!(out, sla, rhs, 1:size(sla, 2))
+    return _finish_scaled_product!(out, α)
+end
+
+function _mixed_atx_accumulate!(
+    out::SimdVector{Float64},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{Float32},
+    cols::UnitRange{Int},
+)
+    return _snparray_atx_schedule!(out, sla.s.data, rhs, sla.values, sla.s.m,
+                                   cols)
+end
+
+# `rhs` is rounded once into `sla.panel`, the matrix products' workspace.
+function _mixed_atx_accumulate!(
+    out::SimdVector{<:SIMD_FLOAT},
+    sla::SnpLinAlg{Float32},
+    rhs::SimdVector{Float64},
+    cols::UnitRange{Int},
+)
+    @lock sla.lock begin
+        narrowed = copyto!(_resize_workspace!(sla.panel, length(rhs)), rhs)
+        _snparray_atx_schedule!(out, sla.s.data, narrowed, sla.values,
+                                sla.s.m, cols)
+    end
+    return out
+end
+
+const MIXED_TRANSPOSED = Union{Transpose{Float32, SnpLinAlg{Float32}},
+                               Adjoint{Float32, SnpLinAlg{Float32}}}
+
+# Supported mixed pairs (out, rhs): Float64 out with either rhs, or Float32
+# out with Float64 rhs. All-Float32 calls keep the same-type methods.
+for (TO, TR) in ((Float64, SIMD_FLOAT), (Float32, Float64))
+    @eval begin
+        function mul!(out::SimdVector{$TO}, sla::SnpLinAlg{Float32},
+                      rhs::SimdVector{<:$TR})
+            return _mixed_ax!(out, sla, rhs, 1, 0)
+        end
+        function mul!(out::SimdVector{$TO}, sla::SnpLinAlg{Float32},
+                      rhs::SimdVector{<:$TR}, α::Number, β::Number)
+            return _mixed_ax!(out, sla, rhs, α, β)
+        end
+        function mul!(out::SimdVector{$TO}, transposed::MIXED_TRANSPOSED,
+                      rhs::SimdVector{<:$TR})
+            sla = transposed.parent
+            return _mixed_atx!(out, sla, rhs, 1:size(sla, 2))
+        end
+        function mul!(out::SimdVector{$TO}, transposed::MIXED_TRANSPOSED,
+                      rhs::SimdVector{<:$TR}, cols::UnitRange{Int})
+            return _mixed_atx!(out, transposed.parent, rhs, cols)
+        end
+        function mul!(out::SimdVector{$TO}, transposed::MIXED_TRANSPOSED,
+                      rhs::SimdVector{<:$TR}, α::Number, β::Number)
+            return _mixed_atx!(out, transposed.parent, rhs, α, β)
+        end
+    end
+end
 
 """
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs::AbstractMatrix)
@@ -158,9 +318,9 @@ share one element type, or `sla` is a `SnpLinAlg{Float32}` and each of `out`
 and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs` is rounded to
 `Float32`; with a `Float64` `out`, partial sums over at most 1024 SNPs are
 formed in `Float32` and summed in `Float64`. Other element types throw an
-`ArgumentError`. One-column `out` and `rhs` of the operator's `Float32` or
-`Float64` element type, each a dense `Matrix` or a `view(M, :, j:j)` of one,
-run the vector kernel.
+`ArgumentError`. One-column `out` and `rhs` of supported `Float32` or
+`Float64` element types, each a dense `Matrix` or a `view(M, :, j:j)` of
+one, run the vector kernel, with its run bound of 256 SNPs.
 """
 function mul!(
     out::AbstractMatrix{<:AbstractFloat},
@@ -205,6 +365,10 @@ overwrite `out`. With a `cols::UnitRange{Int}` argument, compute
 without materializing a new `SnpLinAlg`); `out` then has `length(cols)`
 rows. The five-argument form computes
 `out = α * transpose(sla) * rhs + β * out`.
+For a `SnpLinAlg{Float32}`, `out` and `rhs` may be mixed as in the forward
+form: a `Float64` `rhs` is rounded to `Float32` once per call, and with a
+`Float64` `out`, `Float32` partial sums over at most 4096 samples are added
+in `Float64`.
 """
 function mul!(
     out::AbstractVector{T},
@@ -272,9 +436,9 @@ Matrix right-hand-side forms of the methods above. `out`, the operator, and
 each of `out` and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs`
 is rounded to `Float32`; with a `Float64` `out`, partial sums over at most
 4096 samples are formed in `Float32` and summed in `Float64`. Other element
-types throw an `ArgumentError`. One-column `out` and `rhs` of the operator's
-`Float32` or `Float64` element type, each a dense `Matrix` or a
-`view(M, :, j:j)` of one, run the vector kernel.
+types throw an `ArgumentError`. One-column `out` and `rhs` of supported
+`Float32` or `Float64` element types, each a dense `Matrix` or a
+`view(M, :, j:j)` of one, run the vector kernel (same 4096-sample bound).
 """
 function mul!(
     out::AbstractMatrix{<:AbstractFloat},

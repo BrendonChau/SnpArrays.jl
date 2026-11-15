@@ -8,18 +8,6 @@ const PACKED_EXPANSION = Val((0, 0, 0, 0, 1, 1, 1, 1,
                               2, 2, 2, 2, 3, 3, 3, 3))
 
 """
-    SimdVector{T}
-
-`Vector{T}` or a unit-stride contiguous vector view of a `Matrix{T}`, such
-as `view(M, :, j)`: the vectors the SIMD vector kernels index with
-`VecRange`.
-"""
-const SimdVector{T} = Union{
-    Vector{T},
-    Base.FastContiguousSubArray{T, 1, Matrix{T}},
-}
-
-"""
     PACKED_SHIFTS
 
 Per-lane right shifts that bring the 2-bit code of each sample to the low bits
@@ -82,22 +70,22 @@ end
     _snparray_ax_kernel!(out, packed, rhs, values, rows, columns)
 
 Accumulate `out[rows] += A[rows, columns] * rhs[columns]` for a `SnpLinAlg`
-matrix `A`, decoding genotypes with the 16-lane vector decode. Requires
-`first(rows) ≡ 1 (mod 4)`.
+matrix `A`, decoding genotypes with the 16-lane vector decode; each
+`rhs[column]` is rounded to `T`. Requires `first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_ax_kernel!(
     out::SimdVector{T},
     packed::Matrix{UInt8},
-    rhs::SimdVector{T},
+    rhs::SimdVector{TR},
     values::Matrix{T},
     rows::UnitRange{Int},
     columns::UnitRange{Int},
-) where T <: SIMD_FLOAT
+) where {T <: SIMD_FLOAT, TR <: SIMD_FLOAT}
     row_first = first(rows)
     row_last = last(rows)
     vectorized_row_last = row_last - 15
     @inbounds for column in columns
-        rhs_value = rhs[column]
+        rhs_value = T(rhs[column])
         lookup = _broadcast_lookup(values, column, Val(16))
         row = row_first
         while row <= vectorized_row_last
@@ -117,23 +105,65 @@ function _snparray_ax_kernel!(
 end
 
 """
+    MIXED_AX_RUN
+
+SNP columns per `Float32` run of the mixed-precision `A*x` vector kernel:
+each run is summed in a `Float32` scratch and then added to the `Float64`
+output. At most 1024, the documented bound of the matrix products.
+"""
+const MIXED_AX_RUN = 256
+
+"""
+    _snparray_ax_mixed_kernel!(out, scratch, packed, rhs, values, rows,
+        columns)
+
+Accumulate `out[rows] += A[rows, columns] * rhs[columns]` for a
+`SnpLinAlg{Float32}` matrix `A` and `Float64` `out`: each run of
+`MIXED_AX_RUN` columns is summed into `scratch[rows]` in `Float32`, added to
+`out[rows]`, and `scratch[rows]` reset to zero. `scratch[rows]` must start
+at zero.
+"""
+function _snparray_ax_mixed_kernel!(
+    out::SimdVector{Float64},
+    scratch::Vector{Float32},
+    packed::Matrix{UInt8},
+    rhs::SimdVector{<:SIMD_FLOAT},
+    values::Matrix{Float32},
+    rows::UnitRange{Int},
+    columns::UnitRange{Int},
+)
+    for run_first in first(columns):MIXED_AX_RUN:last(columns)
+        run_last = min(run_first + MIXED_AX_RUN - 1, last(columns))
+        _snparray_ax_kernel!(scratch, packed, rhs, values, rows,
+                             run_first:run_last)
+        for row in rows
+            out[row] += scratch[row]
+            scratch[row] = 0.0f0
+        end
+    end
+    return out
+end
+
+"""
     _snparray_atx_kernel!(out, packed, rhs, values, rows, columns,
         out_offset)
 
 Accumulate `out[columns .- out_offset] += transpose(A[rows, columns]) *
 rhs[rows]` for a `SnpLinAlg` matrix `A`, decoding genotypes with the 16-lane
-vector decode and a SIMD tree reduction per column. `columns` index the full
-genotype arrays `packed` and `values`; requires `first(rows) ≡ 1 (mod 4)`.
+vector decode and a SIMD tree reduction per column. The SIMD sum over `rows`
+runs in `T` and is then added to `out` in its own element type. `columns`
+index the full genotype arrays `packed` and `values`; requires
+`first(rows) ≡ 1 (mod 4)`.
 """
 function _snparray_atx_kernel!(
-    out::SimdVector{T},
+    out::SimdVector{TO},
     packed::StridedMatrix{UInt8},
     rhs::SimdVector{T},
     values::StridedMatrix{T},
     rows::UnitRange{Int},
     columns::UnitRange{Int},
     out_offset::Int,
-) where T <: SIMD_FLOAT
+) where {TO <: SIMD_FLOAT, T <: SIMD_FLOAT}
     row_first = first(rows)
     row_last = last(rows)
     vectorized_row_last = row_last - 15

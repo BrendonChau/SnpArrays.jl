@@ -1061,8 +1061,146 @@ end
             @test endswith(String(method.file), "matvec.jl")
         end
     end
-    @test !SnpArrays._use_vector_kernels(zeros(Float64, 4, 1), Float32,
+    @test SnpArrays._use_vector_kernels(zeros(Float64, 4, 1), Float32,
+                                        zeros(Float64, 4, 1))
+    @test !SnpArrays._use_vector_kernels(zeros(Float32, 4, 1), Float64,
                                          zeros(Float64, 4, 1))
     @test !SnpArrays._use_vector_kernels(view(zeros(8, 1), 1:2:8, :), Float64,
                                          zeros(4, 1))
+end
+
+@testset "SnpLinAlg{Float32} vector products with Float64 operands" begin
+    combinations = ((Float32, Float32), (Float32, Float64),
+                    (Float64, Float32), (Float64, Float64))
+    α, β = 2.5, -0.75
+    tolerance = 64eps(Float32)
+
+    # 1. One accumulation run per output entry (at most MIXED_AX_RUN SNPs;
+    #    a multiple of 16 samples, all inside one Aᵀ*y SIMD run), so the
+    #    widened result reproduces the Float32 product of Float32.(rhs).
+    m, n = 64, 37
+    @test n <= SnpArrays.MIXED_AX_RUN
+    @test m <= SnpArrays._snparray_atx_steps(Float32, n)[1]
+    packed, _ = simd_test_fixture(m, n)
+    operator = SnpLinAlg{Float32}(packed; center=true, scale=true)
+    cols = 3:(n - 2)
+    for TR in (Float32, Float64)
+        x = vec(simd_test_rhs(TR, n, 1))
+        y = vec(simd_test_rhs(TR, m, 1))
+        expected = mul!(zeros(Float32, m), operator, Float32.(x))
+        for TO in (Float32, Float64)
+            @test isequal(mul!(zeros(TO, m), operator, x), TO.(expected))
+        end
+        for wrapped in (transpose(operator), adjoint(operator))
+            expected = mul!(zeros(Float32, n), wrapped, Float32.(y))
+            expected_cols = mul!(zeros(Float32, length(cols)), wrapped,
+                                 Float32.(y), cols)
+            for TO in (Float32, Float64)
+                @test isequal(mul!(zeros(TO, n), wrapped, y), TO.(expected))
+                @test isequal(mul!(zeros(TO, length(cols)), wrapped, y, cols),
+                              TO.(expected_cols))
+            end
+        end
+    end
+
+    # 2. Against the dense Float64 product, on the small shape and on one
+    #    past two A*x runs and one Aᵀ*y SIMD run, spanning several tasks.
+    m_large = SnpArrays._snparray_atx_steps(Float32, 1)[1] + 37
+    n_large = 2SnpArrays.MIXED_AX_RUN + 3
+    @test SnpArrays._snparray_ax_row_step(Float32, m_large) < m_large
+    for (m, n) in ((64, 37), (m_large, n_large))
+        packed, dense = simd_test_fixture(m, n)
+        reference = simd_test_reference(dense, Float64, ADDITIVE_MODEL, true,
+                                        true, true)
+        operator = SnpLinAlg{Float32}(packed; center=true, scale=true)
+        cols = 3:(n - 2)
+        for (TO, TR) in combinations
+            x = vec(simd_test_rhs(TR, n, 1))
+            expected = reference * Float64.(x)
+            @test isapprox(mul!(zeros(TO, m), operator, x), expected;
+                           atol=tolerance, rtol=tolerance)
+            prior = vec(simd_test_rhs(TO, m, 1))
+            @test isapprox(mul!(copy(prior), operator, x, α, β),
+                           α .* expected .+ β .* prior;
+                           atol=tolerance, rtol=tolerance)
+            y = vec(simd_test_rhs(TR, m, 1))
+            expected = transpose(reference) * Float64.(y)
+            prior = vec(simd_test_rhs(TO, n, 1))
+            for wrapped in (transpose(operator), adjoint(operator))
+                @test isapprox(mul!(zeros(TO, n), wrapped, y), expected;
+                               atol=tolerance, rtol=tolerance)
+                @test isapprox(mul!(copy(prior), wrapped, y, α, β),
+                               α .* expected .+ β .* prior;
+                               atol=tolerance, rtol=tolerance)
+                @test isapprox(mul!(zeros(TO, length(cols)), wrapped, y, cols),
+                               transpose(reference[:, cols]) * Float64.(y);
+                               atol=tolerance, rtol=tolerance)
+            end
+        end
+    end
+
+    # 3. One-column mixed matrix products equal the mixed vector products.
+    m, n = 70, 23
+    packed, _ = simd_test_fixture(m, n)
+    operator = SnpLinAlg{Float32}(packed; center=true, scale=true)
+    cols = 3:17
+    for (TO, TR) in combinations[2:end]
+        sentinel_o, sentinel_r = TO(19), TR(19)
+        x = simd_test_rhs(TR, n, 1)
+        y = simd_test_rhs(TR, m, 1)
+        prior_m = simd_test_rhs(TO, m, 1)
+        prior_n = simd_test_rhs(TO, n, 1)
+        forward = mul!(zeros(TO, m), operator, vec(x))
+        forward5 = mul!(vec(copy(prior_m)), operator, vec(x), α, β)
+        for jo in 0:2, jr in 0:2
+            rhs, _ = simd_test_column(x, jr, sentinel_r)
+            out, buffer = simd_test_column(zeros(TO, m, 1), jo, sentinel_o)
+            @test SnpArrays._use_vector_kernels(out, Float32, rhs)
+            method = which(mul!, Tuple{
+                typeof(SnpArrays._column_vector(out)), SnpLinAlg{Float32},
+                typeof(SnpArrays._column_vector(rhs)), Float64, Float64,
+            })
+            @test Base.unwrap_unionall(method.sig).parameters[3] ===
+                  SnpLinAlg{Float32}
+            @test mul!(out, operator, rhs) === out
+            @test isequal(vec(out), forward)
+            @test simd_test_others_untouched(buffer, jo, sentinel_o)
+            out, buffer = simd_test_column(prior_m, jo, sentinel_o)
+            mul!(out, operator, rhs, α, β)
+            @test isequal(vec(out), forward5)
+            @test simd_test_others_untouched(buffer, jo, sentinel_o)
+
+            rhs, _ = simd_test_column(y, jr, sentinel_r)
+            for wrapped in (transpose(operator), adjoint(operator))
+                out, buffer = simd_test_column(zeros(TO, n, 1), jo, sentinel_o)
+                @test mul!(out, wrapped, rhs) === out
+                @test isequal(vec(out), mul!(zeros(TO, n), wrapped, vec(y)))
+                @test simd_test_others_untouched(buffer, jo, sentinel_o)
+                out, buffer = simd_test_column(prior_n, jo, sentinel_o)
+                mul!(out, wrapped, rhs, α, β)
+                @test isequal(vec(out),
+                              mul!(vec(copy(prior_n)), wrapped, vec(y), α, β))
+                @test simd_test_others_untouched(buffer, jo, sentinel_o)
+                out, buffer = simd_test_column(zeros(TO, length(cols), 1), jo,
+                                               sentinel_o)
+                mul!(out, wrapped, rhs, cols)
+                @test isequal(vec(out), mul!(zeros(TO, length(cols)), wrapped,
+                                             vec(y), cols))
+                @test simd_test_others_untouched(buffer, jo, sentinel_o)
+            end
+        end
+    end
+
+    # 4. Other mixed vector calls keep the generic LinearAlgebra fallback
+    #    they used before the mixed methods existed.
+    packed, dense = simd_test_fixture(37, 23)
+    reference = simd_test_reference(dense, Float64, ADDITIVE_MODEL, false,
+                                    false, true)
+    operator = SnpLinAlg{Float64}(packed; impute=true)
+    x = vec(simd_test_rhs(Float64, 23, 1))
+    y = vec(simd_test_rhs(Float64, 37, 1))
+    @test isapprox(mul!(zeros(Float32, 37), operator, x), reference * x;
+                   atol=tolerance, rtol=tolerance)
+    @test isapprox(mul!(zeros(Float32, 23), transpose(operator), y),
+                   transpose(reference) * y; atol=tolerance, rtol=tolerance)
 end
