@@ -900,3 +900,79 @@ end
                                     zeros(Float32, 37, 2), 1.0, 0.0)
     SnpArrays.LOOKUP_MIN_RHS[] = SnpArrays._detect_lookup_min_rhs()
 end
+
+@testset "SnpLinAlg one-column matrix products" begin
+    # A one-column same-type product runs the vector kernel, so it equals the
+    # vector product exactly; other inputs keep the matrix path.
+    packed, dense = simd_test_fixture(37, 23)
+    m, n = size(dense)
+    cols = 3:(n - 2)
+    α, β = 2.5, -0.75
+    for T in (Float32, Float64),
+        impute in (false, true), center in (false, true), scale in (false, true)
+        operator = SnpLinAlg{T}(packed; impute=impute, center=center,
+                                scale=scale)
+        rhs = simd_test_rhs(T, n, 1)
+        prior = simd_test_rhs(T, m, 1)
+        @test isequal(mul!(zeros(T, m, 1), operator, rhs),
+                      reshape(operator * vec(rhs), m, 1))
+        @test isequal(mul!(copy(prior), operator, rhs, α, β),
+                      reshape(mul!(vec(copy(prior)), operator, vec(rhs), α, β),
+                              m, 1))
+        rhs = simd_test_rhs(T, m, 1)
+        prior = simd_test_rhs(T, n, 1)
+        for wrapped in (transpose(operator), adjoint(operator))
+            destination = zeros(T, n, 1)
+            @test mul!(destination, wrapped, rhs) === destination
+            @test isequal(destination, reshape(wrapped * vec(rhs), n, 1))
+            @test isequal(mul!(copy(prior), wrapped, rhs, α, β),
+                          reshape(mul!(vec(copy(prior)), wrapped, vec(rhs),
+                                       α, β), n, 1))
+            @test isequal(mul!(zeros(T, length(cols), 1), wrapped, rhs, cols),
+                          reshape(mul!(zeros(T, length(cols)), wrapped,
+                                       vec(rhs), cols), length(cols), 1))
+        end
+    end
+
+    reference = simd_test_reference(dense, Float64, ADDITIVE_MODEL, true,
+                                    true, true)
+    tolerance = 64eps(Float32)
+    operator32 = SnpLinAlg{Float32}(packed; center=true, scale=true)
+    rhs = simd_test_rhs(Float64, n, 1)
+    @test isapprox(mul!(zeros(m, 1), operator32, rhs), reference * rhs;
+                   atol=tolerance, rtol=tolerance)
+    rhs = simd_test_rhs(Float64, m, 1)
+    @test isapprox(mul!(zeros(n, 1), transpose(operator32), rhs),
+                   transpose(reference) * rhs; atol=tolerance, rtol=tolerance)
+
+    operator = SnpLinAlg{Float64}(packed; center=true, scale=true)
+    tolerance = 64eps(Float64)
+    rhs_parent = zeros(n, 2)
+    rhs_parent[:, 2] .= vec(simd_test_rhs(Float64, n, 1))
+    rhs = view(rhs_parent, :, 2:2)
+    destination_parent = fill(19.0, 2m, 1)
+    destination = view(destination_parent, 1:2:2m, :)
+    @test mul!(destination, operator, rhs) === destination
+    @test isapprox(destination, reference * rhs; atol=tolerance,
+                   rtol=tolerance)
+    rhs_parent = zeros(2m, 1)
+    rhs = view(rhs_parent, 2:2:2m, :)
+    rhs .= simd_test_rhs(Float64, m, 1)
+    destination = fill(19.0, length(cols), 1)
+    @test mul!(destination, adjoint(operator), rhs, cols) === destination
+    @test isapprox(destination, transpose(reference[:, cols]) * rhs;
+                   atol=tolerance, rtol=tolerance)
+
+    @test_throws DimensionMismatch mul!(zeros(m + 1, 1), operator,
+                                        zeros(n, 1))
+    @test_throws DimensionMismatch mul!(zeros(m, 1), operator,
+                                        zeros(n + 1, 1), 1.0, 0.0)
+    @test_throws DimensionMismatch mul!(zeros(n, 1), transpose(operator),
+                                        zeros(m + 1, 1))
+    @test_throws DimensionMismatch mul!(zeros(n + 1, 1), adjoint(operator),
+                                        zeros(m, 1), 1.0, 0.0)
+    @test_throws DimensionMismatch mul!(zeros(length(cols) + 1, 1),
+                                        transpose(operator), zeros(m, 1), cols)
+    @test_throws ArgumentError mul!(zeros(n + 1, 1), transpose(operator),
+                                    zeros(m, 1), 1:(n + 1))
+end

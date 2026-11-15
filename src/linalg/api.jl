@@ -113,6 +113,24 @@ function _check_eltypes(
 end
 
 """
+    _use_vector_kernels(out, ::Type{T}, rhs) -> Bool
+
+Return whether a matrix product can run on the vector kernels through
+`vec(out)` and `vec(rhs)`: both are dense one-column `Matrix{T}` sharing the
+`Float32` or `Float64` operator element type `T`, so `vec` aliases them as the
+`Vector{T}` the SIMD kernels take.
+"""
+function _use_vector_kernels(
+    out::Matrix{T},
+    ::Type{T},
+    rhs::Matrix{T},
+) where T <: SIMD_FLOAT
+    return size(rhs, 2) == 1
+end
+
+_use_vector_kernels(out, ::Type, rhs) = false
+
+"""
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs::AbstractMatrix)
     LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs::AbstractMatrix, α, β)
 
@@ -121,7 +139,8 @@ share one element type, or `sla` is a `SnpLinAlg{Float32}` and each of `out`
 and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs` is rounded to
 `Float32`; with a `Float64` `out`, partial sums over at most 1024 SNPs are
 formed in `Float32` and summed in `Float64`. Other element types throw an
-`ArgumentError`.
+`ArgumentError`. A one-column dense `Matrix` `out` and `rhs` of the
+operator's `Float32` or `Float64` element type run the vector kernel.
 """
 function mul!(
     out::AbstractMatrix{<:AbstractFloat},
@@ -145,6 +164,10 @@ function mul!(
     size(rhs, 1) == size(sla, 2) || throw(DimensionMismatch(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 2))",
     ))
+    if _use_vector_kernels(out, T, rhs)
+        mul!(vec(out), sla, vec(rhs), α, β)
+        return out
+    end
     _begin_scaled_product!(out, α, β) || return out
     @lock sla.lock _snparray_AX_schedule!(out, sla.s.data, rhs, sla.values,
                                           sla.s.m, sla.panel, sla.blk)
@@ -229,7 +252,8 @@ Matrix right-hand-side forms of the methods above. `out`, the operator, and
 each of `out` and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs`
 is rounded to `Float32`; with a `Float64` `out`, partial sums over at most
 4096 samples are formed in `Float32` and summed in `Float64`. Other element
-types throw an `ArgumentError`.
+types throw an `ArgumentError`. A one-column dense `Matrix` `out` and `rhs`
+of the operator's `Float32` or `Float64` element type run the vector kernel.
 """
 function mul!(
     out::AbstractMatrix{<:AbstractFloat},
@@ -259,6 +283,10 @@ function mul!(
     size(rhs, 1) == size(sla, 1) || throw(DimensionMismatch(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
+    if _use_vector_kernels(out, T, rhs)
+        mul!(vec(out), transposed, vec(rhs), cols)
+        return out
+    end
     fill!(out, zero(TO))
     # The dense genotype arrays with `cols` as an index offset, never a
     # view: indexing a `SubArray` per element costs about 2x in the
@@ -284,6 +312,10 @@ function mul!(
     size(rhs, 1) == size(sla, 1) || throw(DimensionMismatch(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
+    if _use_vector_kernels(out, T, rhs)
+        mul!(vec(out), transposed, vec(rhs), α, β)
+        return out
+    end
     _begin_scaled_product!(out, α, β) || return out
     @lock sla.lock _snparray_AtX_schedule!(out, sla.s.data, rhs, sla.values,
                                            sla.s.m, 1:size(sla, 2), sla.panel)
