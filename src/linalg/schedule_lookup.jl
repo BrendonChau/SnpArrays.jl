@@ -27,12 +27,13 @@ Accumulate `out += A * rhs` with the lookup-table kernel: per chunk of
 for all rhs columns (tasks over blocks), then gather them per sample
 (tasks over sample blocks). Rhs slices hold `NV` vectors of width `W`, as
 chosen by `_lookup_slice_shape`; `workspace` is laid out as in
-`LookupLayout`, and `blk` holds the transposed codes of one chunk.
+`LookupLayout`, and `blk` holds the transposed codes of one chunk. The
+compute type is `T`; `out` and `rhs` may be either `SIMD_FLOAT` type.
 """
 function _snparray_AX_lookup_schedule!(
-    out::StridedMatrix{T},
+    out::StridedMatrix{<:SIMD_FLOAT},
     packed::Matrix{UInt8},
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     values::Matrix{T},
     rows_filled::Int,
     workspace::Vector{T},
@@ -81,9 +82,9 @@ here so that each product makes one dynamic call and every spawned task
 call dispatches statically.
 """
 function _snparray_AX_lookup_chunks!(
-    out::StridedMatrix{T},
+    out::StridedMatrix{<:SIMD_FLOAT},
     packed::Matrix{UInt8},
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     values::Matrix{T},
     rows_filled::Int,
     workspace::Vector{T},

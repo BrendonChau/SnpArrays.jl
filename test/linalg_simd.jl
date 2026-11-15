@@ -811,3 +811,92 @@ end
     end
     SnpArrays.LOOKUP_MIN_RHS[] = SnpArrays._detect_lookup_min_rhs()
 end
+
+@testset "SnpLinAlg{Float32} with Float64 output or rhs" begin
+    SnpArrays.LOOKUP_MIN_RHS[] = (4, 4)
+    min_rows = SnpArrays.LOOKUP_MIN_ROWS
+    chunk = SnpArrays.LOOKUP_CHUNK_SNPS
+    nr = 2 * SnpArrays._vector_width(Float32)
+    combinations = ((Float32, Float32), (Float32, Float64),
+                    (Float64, Float32), (Float64, Float64))
+
+    # 1. One accumulation run per output entry (at most 64 SNPs for A*X, at
+    #    most 64 samples for Aᵀ*X, one lookup chunk), so widening the run
+    #    into Float64 reproduces the Float32 product of Float32.(rhs) exactly.
+    for (m, n, k) in ((37, 23, 5), (37, 23, nr + 1), (min_rows + 5, 37, nr + 1))
+        packed, _ = simd_test_fixture(m, n)
+        operator = SnpLinAlg{Float32}(packed; center=true, scale=true)
+        @test SnpArrays._uses_lookup_kernel(Float32, m, k) == (m >= min_rows)
+        for TR in (Float32, Float64)
+            rhs = simd_test_rhs(TR, n, k)
+            expected = mul!(zeros(Float32, m, k), operator, Float32.(rhs))
+            @test mul!(zeros(Float32, m, k), operator, rhs) == expected
+            @test mul!(zeros(Float64, m, k), operator, rhs) ==
+                  Float64.(expected)
+            if m <= 64
+                rhs = simd_test_rhs(TR, m, k)
+                expected = mul!(zeros(Float32, n, k), transpose(operator),
+                                Float32.(rhs))
+                @test mul!(zeros(Float64, n, k), transpose(operator), rhs) ==
+                      Float64.(expected)
+            end
+        end
+    end
+
+    # 2. Against the dense Float64 product: register-tiled shapes one past
+    #    the Float32 SNP and sample blocks, and a lookup shape past a chunk.
+    k = nr + 3
+    forward_step = SnpArrays._snparray_AX_steps(Float32, 37, k)[2]
+    transpose_step = SnpArrays._snparray_AtX_steps(Float32, 23, k)[1]
+    tolerance = 64eps(Float32)
+    α, β = 2.5, -0.75
+    for (m, n) in ((37, forward_step + 1), (transpose_step + 1, 23),
+                   (min_rows + 5, chunk + 2))
+        packed, dense = simd_test_fixture(m, n)
+        reference = simd_test_reference(dense, Float64, ADDITIVE_MODEL, true,
+                                        true, true)
+        operator = SnpLinAlg{Float32}(packed; center=true, scale=true)
+        cols = 3:(n - 2)
+        for (TO, TR) in combinations
+            rhs = simd_test_rhs(TR, n, k)
+            expected = reference * Float64.(rhs)
+            @test isapprox(mul!(zeros(TO, m, k), operator, rhs), expected;
+                           atol=tolerance, rtol=tolerance)
+            prior = simd_test_rhs(TO, m, k)
+            @test isapprox(mul!(copy(prior), operator, rhs, α, β),
+                           α .* expected .+ β .* prior;
+                           atol=tolerance, rtol=tolerance)
+
+            rhs = simd_test_rhs(TR, m, k)
+            expected = transpose(reference) * Float64.(rhs)
+            prior = simd_test_rhs(TO, n, k)
+            for wrapped in (transpose(operator), adjoint(operator))
+                @test isapprox(mul!(zeros(TO, n, k), wrapped, rhs), expected;
+                               atol=tolerance, rtol=tolerance)
+                @test isapprox(mul!(copy(prior), wrapped, rhs, α, β),
+                               α .* expected .+ β .* prior;
+                               atol=tolerance, rtol=tolerance)
+                @test isapprox(
+                    mul!(zeros(TO, length(cols), k), wrapped, rhs, cols),
+                    transpose(reference[:, cols]) * Float64.(rhs);
+                    atol=tolerance, rtol=tolerance,
+                )
+            end
+        end
+    end
+
+    # 3. Other mixed element types are rejected.
+    packed, _ = simd_test_fixture(37, 23)
+    operator = SnpLinAlg{Float64}(packed)
+    @test_throws ArgumentError mul!(zeros(Float32, 37, 2), operator,
+                                    zeros(23, 2))
+    @test_throws ArgumentError mul!(zeros(37, 2), operator,
+                                    zeros(Float32, 23, 2))
+    @test_throws ArgumentError mul!(zeros(Float32, 23, 2),
+                                    transpose(operator), zeros(37, 2))
+    @test_throws ArgumentError mul!(zeros(Float32, 3, 2), adjoint(operator),
+                                    zeros(37, 2), 1:3)
+    @test_throws ArgumentError mul!(zeros(23, 2), transpose(operator),
+                                    zeros(Float32, 37, 2), 1.0, 0.0)
+    SnpArrays.LOOKUP_MIN_RHS[] = SnpArrays._detect_lookup_min_rhs()
+end

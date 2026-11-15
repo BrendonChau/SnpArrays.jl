@@ -44,13 +44,13 @@ end
     _supports_lookup(out, packed, rhs) -> Bool
 
 Return whether the argument types are the dense `Float32` or `Float64` arrays
-that the lookup-table `A*X` kernel accepts.
+that the lookup-table `A*X` kernel accepts; `out` and `rhs` may differ.
 """
 function _supports_lookup(
-    ::StridedMatrix{T},
+    ::StridedMatrix{<:SIMD_FLOAT},
     ::Matrix{UInt8},
-    ::StridedMatrix{T},
-) where T <: SIMD_FLOAT
+    ::StridedMatrix{<:SIMD_FLOAT},
+)
     return true
 end
 
@@ -62,12 +62,13 @@ _supports_lookup(out, packed, rhs) = false
 
 Accumulate `out += A * rhs` with the lookup-table kernel when the shape and
 array types allow it, else by spawning one register-tiled task per row block
-and rhs tile.
+and rhs tile. Arithmetic runs in the element type `T` of `values`; `out` and
+`rhs` may have other element types.
 """
 function _snparray_AX_schedule!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     packed::AbstractMatrix{UInt8},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     values::AbstractMatrix{T},
     rows_filled::Int,
     workspace::Vector{T},
@@ -108,9 +109,9 @@ that each product makes one dynamic call, and the spawn loop and every task
 call inside it dispatch statically.
 """
 function _snparray_AX_spawn_tasks!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     packed::AbstractMatrix{UInt8},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     values::AbstractMatrix{T},
     rows_filled::Int,
     workspace::Vector{T},
@@ -191,12 +192,13 @@ end
         workspace) -> out
 
 Accumulate `out += transpose(A[:, cols]) * rhs` by spawning one register-tiled
-task per block of SNP columns and rhs tile.
+task per block of SNP columns and rhs tile. Arithmetic runs in the element
+type `T` of `values`; `out` and `rhs` may have other element types.
 """
 function _snparray_AtX_schedule!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     packed::AbstractMatrix{UInt8},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     values::AbstractMatrix{T},
     rows_filled::Int,
     cols::UnitRange{Int},
@@ -230,9 +232,9 @@ Spawn one `_snparray_AtX_task!` per block of SNP columns in `cols` and rhs
 tile, each with its own `panel_length` slice of `workspace`.
 """
 function _snparray_AtX_spawn_tasks!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     packed::AbstractMatrix{UInt8},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     values::AbstractMatrix{T},
     rows_filled::Int,
     cols::UnitRange{Int},

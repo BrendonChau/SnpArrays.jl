@@ -90,21 +90,21 @@ function print_header(io::IO, m::Int, n::Int)
 end
 
 """
-    print_row(io, ::Type{T}, product, variant, seconds, fmas)
+    print_row(io, label, product, variant, seconds, fmas)
 
-Print one row of the timing table.
+Print one row of the timing table with `label` in the Type column.
 """
 function print_row(
     io::IO,
-    ::Type{T},
+    label::AbstractString,
     product::AbstractString,
     variant::AbstractString,
     seconds::Float64,
     fmas::Float64,
-) where T
+)
     emit(io, @sprintf(
         "| %s | %s | %d | %s | %.3f | %.2f |",
-        T, product, K, variant, seconds, fmas / seconds / 1e9,
+        label, product, K, variant, seconds, fmas / seconds / 1e9,
     ))
     return nothing
 end
@@ -116,16 +116,16 @@ function matrix_variant(::Type{T}, m::Int, k::Int) where T
 end
 
 """
-    checksum_row(::Type{T}, product, out) -> String
+    checksum_row(label, product, out) -> String
 
 Return the checksum table row holding `sum(abs2, out)`.
 """
 function checksum_row(
-    ::Type{T},
+    label::AbstractString,
     product::AbstractString,
-    out::Matrix{T},
-) where T
-    return @sprintf("| %s | `%s` | %.17g |", T, product, sum(abs2, out))
+    out::Matrix{<:AbstractFloat},
+)
+    return @sprintf("| %s | `%s` | %.17g |", label, product, sum(abs2, out))
 end
 
 """
@@ -142,12 +142,38 @@ function run_type(io::IO, ::Type{T}, G::SnpArray) where T <: AbstractFloat
     AX = Matrix{T}(undef, m, K)
     AtX = Matrix{T}(undef, n, K)
     fmas = Float64(m) * n * K
-    print_row(io, T, "A*X", matrix_variant(T, m, K),
+    label = string(T)
+    print_row(io, label, "A*X", matrix_variant(T, m, K),
               @elapsed(mul!(AX, operator, X)), fmas)
-    print_row(io, T, "Aᵀ*X",
+    print_row(io, label, "Aᵀ*X",
               has_fork_internals() ? "mul! (register-tiled)" : "mul!",
               @elapsed(mul!(AtX, transpose(operator), Y)), fmas)
-    return [checksum_row(T, "A*X", AX), checksum_row(T, "Aᵀ*X", AtX)]
+    return [checksum_row(label, "A*X", AX),
+            checksum_row(label, "Aᵀ*X", AtX)]
+end
+
+"""
+    run_mixed(io, G) -> Vector{String}
+
+Print the timing rows of both products for a `SnpLinAlg{Float32}` with
+`Float64` right-hand sides and outputs, and return their checksum rows.
+"""
+function run_mixed(io::IO, G::SnpArray)
+    m, n = size(G)
+    operator = SnpLinAlg{Float32}(G; center = true, scale = true,
+                                  impute = true)
+    X = randn(Xoshiro(1), Float64, n, K)
+    Y = randn(Xoshiro(2), Float64, m, K)
+    AX = Matrix{Float64}(undef, m, K)
+    AtX = Matrix{Float64}(undef, n, K)
+    fmas = Float64(m) * n * K
+    label = "Float32→Float64"
+    print_row(io, label, "A*X", matrix_variant(Float32, m, K),
+              @elapsed(mul!(AX, operator, X)), fmas)
+    print_row(io, label, "Aᵀ*X", "mul! (register-tiled)",
+              @elapsed(mul!(AtX, transpose(operator), Y)), fmas)
+    return [checksum_row(label, "A*X", AX),
+            checksum_row(label, "Aᵀ*X", AtX)]
 end
 
 function main()
@@ -168,6 +194,8 @@ function main()
     for T in (Float32, Float64)
         append!(checksums, run_type(io, T, G))
     end
+    # Upstream SnpArrays has no mixed-precision matrix products.
+    has_fork_internals() && append!(checksums, run_mixed(io, G))
     emit(io, "")
     emit(io, "## Checksums")
     emit(io, "")

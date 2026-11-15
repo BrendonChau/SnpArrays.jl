@@ -75,21 +75,70 @@ function mul!(
     return _finish_scaled_product!(out, α)
 end
 
+"""
+    _supports_eltypes(::Type{TO}, ::Type{T}, ::Type{TR}) -> Bool
+
+Return whether a matrix product with output element type `TO`, operator
+element type `T`, and rhs element type `TR` is supported: all equal, or a
+`Float32` operator with each of `TO` and `TR` either `Float32` or `Float64`.
+"""
+_supports_eltypes(::Type{T}, ::Type{T}, ::Type{T}) where T = true
+_supports_eltypes(::Type{Float32}, ::Type{Float32}, ::Type{Float32}) = true
+function _supports_eltypes(
+    ::Type{<:SIMD_FLOAT},
+    ::Type{Float32},
+    ::Type{<:SIMD_FLOAT},
+)
+    return true
+end
+_supports_eltypes(::Type, ::Type, ::Type) = false
+
+"""
+    _check_eltypes(out, T, rhs)
+
+Throw an `ArgumentError` unless `_supports_eltypes` accepts the element types
+of `out`, the operator element type `T`, and the element type of `rhs`.
+"""
+function _check_eltypes(
+    out::AbstractMatrix{TO},
+    ::Type{T},
+    rhs::AbstractMatrix{TR},
+) where {TO, T, TR}
+    _supports_eltypes(TO, T, TR) || throw(ArgumentError(
+        "output has element type $TO, the operator $T, and the " *
+        "right-hand side $TR; expected equal types, or a Float32 operator " *
+        "with Float32 or Float64 output and right-hand side",
+    ))
+    return nothing
+end
+
+"""
+    LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs::AbstractMatrix)
+    LinearAlgebra.mul!(out, sla::SnpLinAlg, rhs::AbstractMatrix, α, β)
+
+Matrix right-hand-side form of the method above. `out`, `sla`, and `rhs`
+share one element type, or `sla` is a `SnpLinAlg{Float32}` and each of `out`
+and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs` is rounded to
+`Float32`; with a `Float64` `out`, partial sums over at most 1024 SNPs are
+formed in `Float32` and summed in `Float64`. Other element types throw an
+`ArgumentError`.
+"""
 function mul!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     sla::SnpLinAlg{T},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
 ) where T <: AbstractFloat
     return mul!(out, sla, rhs, 1, 0)
 end
 
 function mul!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     sla::SnpLinAlg{T},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     α::Number,
     β::Number,
 ) where T <: AbstractFloat
+    _check_eltypes(out, T, rhs)
     size(out) == (size(sla, 1), size(rhs, 2)) || throw(DimensionMismatch(
         "output has size $(size(out)); expected $((size(sla, 1), size(rhs, 2)))",
     ))
@@ -170,23 +219,36 @@ function mul!(
     return _finish_scaled_product!(out, α)
 end
 
+"""
+    LinearAlgebra.mul!(out, adjoint_sla, rhs::AbstractMatrix)
+    LinearAlgebra.mul!(out, adjoint_sla, rhs::AbstractMatrix, cols)
+    LinearAlgebra.mul!(out, adjoint_sla, rhs::AbstractMatrix, α, β)
+
+Matrix right-hand-side forms of the methods above. `out`, the operator, and
+`rhs` share one element type, or the operator is a `SnpLinAlg{Float32}` and
+each of `out` and `rhs` is a `Float32` or `Float64` matrix. A `Float64` `rhs`
+is rounded to `Float32`; with a `Float64` `out`, partial sums over at most
+4096 samples are formed in `Float32` and summed in `Float64`. Other element
+types throw an `ArgumentError`.
+"""
 function mul!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     transposed::Union{Transpose{T, SnpLinAlg{T}},
                       Adjoint{T, SnpLinAlg{T}}},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
 ) where T <: AbstractFloat
     sla = transposed.parent
     return mul!(out, transposed, rhs, 1:size(sla, 2))
 end
 
 function mul!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{TO},
     transposed::Union{Transpose{T, SnpLinAlg{T}},
                       Adjoint{T, SnpLinAlg{T}}},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     cols::UnitRange{Int},
-) where T <: AbstractFloat
+) where {TO <: AbstractFloat, T <: AbstractFloat}
+    _check_eltypes(out, T, rhs)
     sla = transposed.parent
     cols ⊆ 1:size(sla, 2) || throw(ArgumentError(
         "cols $cols is not a subset of 1:$(size(sla, 2))",
@@ -197,7 +259,7 @@ function mul!(
     size(rhs, 1) == size(sla, 1) || throw(DimensionMismatch(
         "right-hand side has $(size(rhs, 1)) rows; expected $(size(sla, 1))",
     ))
-    fill!(out, zero(T))
+    fill!(out, zero(TO))
     # The dense genotype arrays with `cols` as an index offset, never a
     # view: indexing a `SubArray` per element costs about 2x in the
     # register-tiled kernel.
@@ -207,13 +269,14 @@ function mul!(
 end
 
 function mul!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{<:AbstractFloat},
     transposed::Union{Transpose{T, SnpLinAlg{T}},
                       Adjoint{T, SnpLinAlg{T}}},
-    rhs::AbstractMatrix{T},
+    rhs::AbstractMatrix{<:AbstractFloat},
     α::Number,
     β::Number,
 ) where T <: AbstractFloat
+    _check_eltypes(out, T, rhs)
     sla = transposed.parent
     size(out) == (size(sla, 2), size(rhs, 2)) || throw(DimensionMismatch(
         "output has size $(size(out)); expected $((size(sla, 2), size(rhs, 2)))",

@@ -94,7 +94,7 @@ Pack `rhs[columns, tile_columns]` into the task's panel, then sweep samples
 """
 @inline function _snparray_AX_rhs_tile!(
     task::RegisterTileTask{T},
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     rows::UnitRange{Int},
     columns::UnitRange{Int},
     tile_columns::UnitRange{Int},
@@ -118,8 +118,10 @@ each `MR x 2W` tile in registers. On a Xeon 6736P the hot loop compiles to
 16 FMAs on zmm accumulators with no spills, 19 of 32 registers live.
 """
 function _snparray_AX_task!(
-    task::RegisterTileTask{T, <:StridedMatrix{T}, Matrix{UInt8}, Matrix{T}},
-    rhs::StridedMatrix{T},
+    task::RegisterTileTask{
+        T, <:StridedMatrix{<:SIMD_FLOAT}, Matrix{UInt8}, Matrix{T},
+    },
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     rows::UnitRange{Int},
     column_step::Int,
     rhs_columns::UnitRange{Int},

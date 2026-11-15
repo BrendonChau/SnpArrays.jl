@@ -4,10 +4,11 @@
 The arrays one register-tiled `A*X` or `transpose(A)*X` task works on. The
 task packs rhs values into the slice of `panel` after `panel_offset`, and
 adds the tile for SNP column `j` into `out` row `j - out_offset`
-(`out_offset = 0` for `A*X`).
+(`out_offset = 0` for `A*X`). The element type of `out` may be wider than
+the compute type `T`.
 """
-struct RegisterTileTask{T, O <: AbstractMatrix{T}, P <: AbstractMatrix{UInt8},
-                        V <: AbstractMatrix{T}}
+struct RegisterTileTask{T, O <: AbstractMatrix{<:AbstractFloat},
+                        P <: AbstractMatrix{UInt8}, V <: AbstractMatrix{T}}
     out::O
     packed::P
     values::V
@@ -59,14 +60,14 @@ end
     _add_register_tile!(out, accumulators, out_row, tile_columns)
 
 Add the leading `length(tile_columns)` lanes of accumulator row `i` into
-`out[out_row + i - 1, tile_columns]`.
+`out[out_row + i - 1, tile_columns]`, converting each lane to `TO`.
 """
 @inline function _add_register_tile!(
-    out::AbstractMatrix{T},
+    out::AbstractMatrix{TO},
     accumulators::NTuple{MR, NTuple{U, Vec{W, T}}},
     out_row::Int,
     tile_columns::UnitRange{Int},
-) where {T <: SIMD_FLOAT, MR, U, W}
+) where {TO <: SIMD_FLOAT, T <: SIMD_FLOAT, MR, U, W}
     valid = length(tile_columns)
     rhs_column = first(tile_columns)
     @inbounds for i in 1:MR
@@ -77,7 +78,7 @@ Add the leading `length(tile_columns)` lanes of accumulator row `i` into
                 position = (block - 1) * W + lane
                 position <= valid || break
                 out[out_row + i - 1, rhs_column + position - 1] +=
-                    vector[lane]
+                    TO(vector[lane])
             end
         end
     end
@@ -88,12 +89,12 @@ end
     _pack_rhs_panel!(task, rhs, rhs_rows, tile_columns, ::Val{U}, ::Val{W})
 
 Copy `rhs[rhs_rows, tile_columns]` into `task.panel` after
-`task.panel_offset` so that the `U * W` lanes of one rhs row are contiguous,
-zero-filling the lanes beyond `length(tile_columns)`.
+`task.panel_offset`, converted to `T`, so that the `U * W` lanes of one rhs
+row are contiguous, zero-filling the lanes beyond `length(tile_columns)`.
 """
 @inline function _pack_rhs_panel!(
     task::RegisterTileTask{T},
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     rhs_rows::UnitRange{Int},
     tile_columns::UnitRange{Int},
     ::Val{U},
@@ -108,7 +109,7 @@ zero-filling the lanes beyond `length(tile_columns)`.
     @inbounds for j in 1:length(rhs_rows)
         base = panel_offset + (j - 1) * lanes
         for t in 1:valid
-            panel[base + t] = rhs[row_first + j - 1, rhs_column + t - 1]
+            panel[base + t] = T(rhs[row_first + j - 1, rhs_column + t - 1])
         end
         for t in (valid + 1):lanes
             panel[base + t] = zero(T)

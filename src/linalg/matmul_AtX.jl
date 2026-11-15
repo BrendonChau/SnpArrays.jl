@@ -157,7 +157,7 @@ Pack `rhs[rows, tile_columns]` into the task's panel, then sweep SNP
 """
 @inline function _snparray_AtX_rhs_tile!(
     task::RegisterTileTask{T},
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     rows::UnitRange{Int},
     columns::UnitRange{Int},
     tile_columns::UnitRange{Int},
@@ -183,9 +183,10 @@ on zmm accumulators with no spills.
 """
 function _snparray_AtX_task!(
     task::RegisterTileTask{
-        T, <:StridedMatrix{T}, <:StridedMatrix{UInt8}, <:StridedMatrix{T},
+        T, <:StridedMatrix{<:SIMD_FLOAT}, <:StridedMatrix{UInt8},
+        <:StridedMatrix{T},
     },
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     row_step::Int,
     rows_filled::Int,
     columns::UnitRange{Int},

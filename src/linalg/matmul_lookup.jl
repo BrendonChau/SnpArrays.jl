@@ -75,13 +75,13 @@ slice `s` of width `S = NV * W`, the 256 table rows `workspace[s *
 slice_stride + ((b - 1) * 256 + code) * S + t] = Σ_l values[code_l + 1, j_l]
 * rhs[j_l, s * S + t]` over the four SNPs `j_l` of block `b`, zero past
 `size(rhs, 2)` or SNP `n`. The four rhs rows are staged in `workspace` from
-`stage_offset`.
+`stage_offset`, converted to `T`.
 """
 function _lookup_build_tables!(
     workspace::Vector{T},
     stage_offset::Int,
     n::Int,
-    rhs::StridedMatrix{T},
+    rhs::StridedMatrix{<:SIMD_FLOAT},
     values::Matrix{T},
     column_first::Int,
     blocks::UnitRange{Int},
@@ -101,7 +101,7 @@ function _lookup_build_tables!(
             j = j0 + l
             offset = stage_offset + l * k_padded
             for t in 1:k
-                stage[offset + t] = j <= n ? rhs[j, t] : zero(T)
+                stage[offset + t] = j <= n ? T(rhs[j, t]) : zero(T)
             end
             for t in (k + 1):k_padded
                 stage[offset + t] = zero(T)
@@ -221,16 +221,16 @@ end
 
 Add the leading `length(tile_columns)` lanes of each row of the
 `length(tile_rows) x lanes` tile at `tile_offset` into
-`out[tile_rows, tile_columns]`.
+`out[tile_rows, tile_columns]`, converting each entry to `TO`.
 """
 function _lookup_flush_tile!(
-    out::StridedMatrix{T},
+    out::StridedMatrix{TO},
     workspace::Vector{T},
     tile_offset::Int,
     tile_rows::UnitRange{Int},
     tile_columns::UnitRange{Int},
     lanes::Int,
-) where T <: SIMD_FLOAT
+) where {TO <: SIMD_FLOAT, T <: SIMD_FLOAT}
     tile = workspace
     tile_first = first(tile_rows)
     nrows = length(tile_rows)
@@ -239,7 +239,7 @@ function _lookup_flush_tile!(
         column = rhs_column + t - 1
         for i in 1:nrows
             out[tile_first + i - 1, column] +=
-                tile[tile_offset + (i - 1) * lanes + t]
+                TO(tile[tile_offset + (i - 1) * lanes + t])
         end
     end
     return out
@@ -255,7 +255,7 @@ of samples `rows` for the chunk of `nblk` blocks starting at SNP
 `LOOKUP_ROW_TILE`-row tile, gather the table rows and add them into `out`.
 """
 function _snparray_AX_lookup_gather_task!(
-    out::StridedMatrix{T},
+    out::StridedMatrix{<:SIMD_FLOAT},
     packed::Matrix{UInt8},
     workspace::Vector{T},
     tile_offset::Int,
