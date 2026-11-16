@@ -243,11 +243,11 @@ end
 
 """`A*X` tiles `(BM, BN, BK, TM, TK)` for `k <= 8`, `k <= 32`, `k > 32`."""
 const AX_TILES = ((256, 16, 8, 4, 4), (256, 16, 32, 8, 8),
-    (128, 16, 64, 8, 8))
+    (256, 16, 64, 8, 8))
 
 """`transpose(A)*X` tiles `(BM, BN, BK, TN, TK)` by the same `k` bands."""
 const ATX_TILES = ((64, 64, 8, 2, 2), (32, 128, 32, 4, 8),
-    (32, 128, 64, 8, 8))
+    (32, 256, 64, 8, 8))
 
 _tile_band(k::Integer) = k <= 8 ? 1 : k <= 32 ? 2 : 3
 
