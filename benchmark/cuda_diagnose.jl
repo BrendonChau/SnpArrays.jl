@@ -45,12 +45,13 @@ SnpArrays.cuda_tensor_cores!(true)
 """
     emit(io, line)
 
-Print `line` to `stdout` and to `io`, then flush `io`.
+Print `line` to `stdout` and to `io`, then flush both.
 """
 function emit(io::IO, line::AbstractString)
     println(line)
     println(io, line)
     flush(io)
+    flush(stdout)
     return nothing
 end
 
