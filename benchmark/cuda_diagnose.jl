@@ -8,11 +8,12 @@
 #       [m_cap] [n_cap]
 #
 # `sections` is a comma list from `stream,scale,tiles,accuracy` (the
-# default, and the run order). `m_cap` (a multiple of 16) and `n_cap` keep
-# the first samples and SNPs; a capped copy of the files is then written to
-# a temporary directory for the stream. Centered, scaled, mean-imputed. The
-# report is also written, one flushed row at a time, to a timestamped
-# markdown file in `results_dir` (default `results/` next to this script).
+# default, and the run order) and the opt-in `shapes`, run last. `m_cap`
+# (a multiple of 16) and `n_cap` keep the first samples and SNPs; a capped
+# copy of the files is then written to a temporary directory for the
+# stream. Centered, scaled, mean-imputed. The report is also written, one
+# flushed row at a time, to a timestamped markdown file in `results_dir`
+# (default `results/` next to this script).
 using CUDA
 using Dates
 using LinearAlgebra
@@ -992,10 +993,176 @@ function run_accuracy(io::IO, path::AbstractString, G::SnpArray)
     return nothing
 end
 
+# ---------------------------------------------------------------- shapes
+
+"""`A*X` shapes and `k` for `run_shapes`, the `k > 32` band."""
+const AX_SWEEP_SHAPES = ((128, 16, 64, 8, 8), (256, 16, 64, 8, 8))
+const AX_SWEEP_KS = (48, 64, 96, 128)
+"""`Aᵀ*X` shapes `(BM, BN, BK, TN, TK)` and `k` for `run_shapes`."""
+const ATX_SWEEP_SHAPES = ((32, 128, 32, 4, 8), (32, 128, 64, 8, 8),
+    (64, 64, 64, 4, 8), (32, 256, 64, 8, 8), (64, 128, 32, 4, 8))
+const ATX_SWEEP_KS = (32, 128)
+
+"""
+    atx_shape_problem(::Type{T}, shape) -> Union{Nothing, String}
+
+Why `_atX_tiled_kernel!` cannot run `shape = (BM, BN, BK, TN, TK)` for
+element type `T` without halving `BM`, or `nothing` when it can.
+"""
+function atx_shape_problem(::Type{T}, shape::NTuple{5, Int}) where T
+    (BM, BN, BK, TN, TK) = shape
+    BM % 16 == 0 || return "BM not a multiple of 16"
+    BN % TN == 0 || return "BN not a multiple of TN"
+    BK % TK == 0 || return "BK not a multiple of TK"
+    threads = (BN ÷ TN) * (BK ÷ TK)
+    threads <= 1024 || return "$(threads) threads per block"
+    shared = ((BN + 1) * BM + BM * BK) * sizeof(T)
+    shared <= 48 * 1024 || return "$(shared) bytes of static shared memory"
+    return nothing
+end
+
+"""
+    tiled_atx_shape!(out, A, Y, shape) -> out
+
+Set `out = Aᵀ * Y` with `mul!`'s tiled `Aᵀ*X` launch at tile shape
+`(BM, BN, BK, TN, TK)`.
+"""
+function tiled_atx_shape!(out::CuMatrix{T}, A::CuSnpArray{T}, Y::CuMatrix{T},
+                          shape::NTuple{5, Int}) where T <: AbstractFloat
+    m, n = size(A)
+    k = size(Y, 2)
+    (BM, BN, BK, TN, TK) = shape
+    column_blocks = cld(n, BN)
+    rhs_blocks = cld(k, BK)
+    word_rows = cld(m, 16)
+    splits = EXT._splits(column_blocks * rhs_blocks, word_rows, BM ÷ 16)
+    split_word_rows = (BM ÷ 16) * cld(cld(word_rows, splits), BM ÷ 16)
+    splits = cld(word_rows, split_word_rows)
+    partials = splits == 1 ? reshape(out, n, k, 1) :
+        CuArray{T, 3}(undef, n, k, splits)
+    threads = (BN ÷ TN) * (BK ÷ TK)
+    @cuda threads=threads blocks=(column_blocks, rhs_blocks, splits) (
+        EXT._atX_tiled_kernel!(partials, A.data, Y, A.values, Int32(m),
+            Int32(n), Int32(k), Int32(split_word_rows),
+            Val(BM), Val(BN), Val(BK), Val(TN), Val(TK))
+    )
+    splits == 1 || EXT._reduce_splits!(out, partials, splits)
+    return out
+end
+
+"""
+    shape_rows(io, f!, problem, A, rhs, ref, k, rows, shapes, default)
+
+Emit one row per shape in `shapes` for `f!(out, A, rhs, shape)` into a
+`rows x k` output: times, GFMA/s, relative difference from `default`'s
+output, and worst column error against `ref`. A shape for which
+`problem(Float32, shape)` returns a reason gets a skip row.
+"""
+function shape_rows(io::IO, f!::F, problem::P, A::CuSnpArray{Float32},
+                    rhs::CuMatrix{Float32}, ref::Matrix{Float64}, k::Int,
+                    rows::Int, shapes, default::NTuple{5, Int}) where {F, P}
+    m, n = size(A)
+    out = CuMatrix{Float32}(undef, rows, k)
+    expected = Float64.(Array(f!(out, A, rhs, default)))
+    note_memory!()
+    for shape in shapes
+        mark = shape == default ? "yes" : ""
+        reason = problem(Float32, shape)
+        if reason !== nothing
+            emit(io, "| $(k) | `$(shape)` | $(mark) | skipped: $(reason) " *
+                     "| | | | |")
+            continue
+        end
+        times = time_call(f!, out, A, rhs, shape)
+        result = Float64.(Array(out))
+        difference = norm(result .- expected) / norm(expected)
+        gfma = Float64(m) * n * k / times[1] / 1e9
+        worst = worst_column_error(result, ref)
+        emit(io, @sprintf("| %d | `%s` | %s | %.3f | %.3f | %.2f | %.1e | %.2e |",
+                          k, shape, mark, 1000 * times[1], 1000 * times[2],
+                          gfma, difference, worst))
+    end
+    CUDA.unsafe_free!(out)
+    return nothing
+end
+
+"""
+    run_shapes(io, G)
+
+Print tiled `Float32` `A*X` and `Aᵀ*X` at each sweep shape and `k`, with
+the relative difference from the default shape and the worst column error
+against the `Float64` tiled product on shared packed words.
+"""
+function run_shapes(io::IO, G::SnpArray)
+    prior = SnpArrays.CUDA_TENSOR_CORES[]
+    SnpArrays.cuda_tensor_cores!(false)
+    A = operator(Float32, G)
+    A64 = shared_float64(A, G)
+    m, n = size(A)
+    rng = Xoshiro(51)
+    header = "| k | shape | default | min ms | median ms | GFMA/s " *
+             "| rel. diff | rel. error |"
+    rule = "|---:|---|---|---:|---:|---:|---:|---:|"
+    emit(io, "")
+    emit(io, "## shapes: tile shapes of the tiled Float32 kernels")
+    emit(io, "")
+    emit(io, "Min and median of $(REPEATS). rel. diff: from the default " *
+             "shape's output. rel. error: worst column against the " *
+             "Float64 tiled product on the same packed words, `randn` " *
+             "right-hand sides rounded to Float32.")
+    emit(io, "")
+    emit(io, "`A*X`, shape (BM,BN,BK,TM,TK); default " *
+             "`AX_TILES[_tile_band(k)]`.")
+    emit(io, "")
+    emit(io, header)
+    emit(io, rule)
+    for k in AX_SWEEP_KS
+        X = make_rhs(rng, n, k, :randn)
+        X64 = CuArray(X)
+        out64 = CuMatrix{Float64}(undef, m, k)
+        ref = Array(EXT._tiled_mul!(out64, A64, X64))
+        note_memory!()
+        CUDA.unsafe_free!(X64)
+        CUDA.unsafe_free!(out64)
+        X32 = CuArray(Float32.(X))
+        shape_rows(io, tiled_mul_shape!, shape_problem, A, X32, ref, k, m,
+                   AX_SWEEP_SHAPES, EXT.AX_TILES[EXT._tile_band(k)])
+        CUDA.unsafe_free!(X32)
+        X = ref = nothing
+        release!()
+    end
+    emit(io, "")
+    emit(io, "`Aᵀ*X`, shape (BM,BN,BK,TN,TK); default " *
+             "`ATX_TILES[_tile_band(k)]`.")
+    emit(io, "")
+    emit(io, header)
+    emit(io, rule)
+    for k in ATX_SWEEP_KS
+        Y = make_rhs(rng, m, k, :randn)
+        Y64 = CuArray(Y)
+        out64 = CuMatrix{Float64}(undef, n, k)
+        ref = Array(mul!(out64, transpose(A64), Y64))
+        note_memory!()
+        CUDA.unsafe_free!(Y64)
+        CUDA.unsafe_free!(out64)
+        Y32 = CuArray(Float32.(Y))
+        shape_rows(io, tiled_atx_shape!, atx_shape_problem, A, Y32, ref, k, n,
+                   ATX_SWEEP_SHAPES, EXT.ATX_TILES[EXT._tile_band(k)])
+        CUDA.unsafe_free!(Y32)
+        Y = ref = nothing
+        release!()
+    end
+    free_tables!(A64)
+    free_operator!(A)
+    SnpArrays.cuda_tensor_cores!(prior)
+    release!()
+    return nothing
+end
+
 function main()
     for section in SECTIONS
-        section in ALL_SECTIONS || throw(ArgumentError(
-            "unknown section $(section); expected some of $(ALL_SECTIONS)"))
+        section in (ALL_SECTIONS..., "shapes") || throw(ArgumentError(
+            "unknown section $(section); expected some of $((ALL_SECTIONS..., "shapes"))"))
     end
     M_CAP % 16 == 0 || M_CAP == typemax(Int) || throw(ArgumentError(
         "m_cap must be a multiple of 16; got $(M_CAP)"))
@@ -1013,6 +1180,7 @@ function main()
     "scale" in SECTIONS && run_scale(io, G)
     "tiles" in SECTIONS && run_tiles(io, G)
     "accuracy" in SECTIONS && run_accuracy(io, bed, G)
+    "shapes" in SECTIONS && run_shapes(io, G)
     emit(io, "")
     emit(io, "## Peak memory")
     emit(io, "")
