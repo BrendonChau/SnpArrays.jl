@@ -1028,7 +1028,7 @@ const AX_SWEEP_KS = (48, 64, 96, 128)
 """`Aᵀ*X` shapes `(BM, BN, BK, TN, TK)` and `k` for `run_shapes`."""
 const ATX_SWEEP_SHAPES = ((32, 128, 32, 4, 8), (32, 128, 64, 8, 8),
     (64, 64, 64, 4, 8), (32, 256, 64, 8, 8), (64, 128, 32, 4, 8))
-const ATX_SWEEP_KS = (32, 128)
+const ATX_SWEEP_KS = (32, 48, 64, 96, 128)
 
 """
     atx_shape_problem(::Type{T}, shape) -> Union{Nothing, String}
