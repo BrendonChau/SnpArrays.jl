@@ -78,7 +78,7 @@ end
     sla = SnpLinAlg{Float64}(eur_full; center = true, scale = true)
     expected = transpose(sla) * Q
 
-    mktempdir(ENV["TMPDIR"]) do dir
+    mktempdir() do dir
         s1 = SnpArray(undef, m, n1)
         s1.data .= view(eur_full.data, :, 1:n1)
         s2 = SnpArray(undef, m, n2)
@@ -136,7 +136,7 @@ end
     reps = cld(2048, m)
     M = reps * m
 
-    mktempdir(ENV["TMPDIR"]) do dir
+    mktempdir() do dir
         stacked = SnpArray(undef, M, n)
         for r in 1:reps
             stacked[((r - 1) * m + 1):(r * m), :] .= view(eur_full, :, :)
@@ -413,7 +413,7 @@ end
 end
 
 @testset "impute=false NaN propagation" begin
-    mktempdir(ENV["TMPDIR"]) do dir
+    mktempdir() do dir
         packed = SnpArray(undef, 2048, 5)
         fill!(packed.data, 0x00)
         packed.data[1, 2] = 0x04
@@ -488,7 +488,7 @@ end
     reps = 4
     M = reps * m
 
-    mktempdir(ENV["TMPDIR"]) do dir
+    mktempdir() do dir
         stacked = SnpArray(undef, M, n)
         for r in 1:reps
             stacked[((r - 1) * m + 1):(r * m), :] .= view(eur_full, :, :)
