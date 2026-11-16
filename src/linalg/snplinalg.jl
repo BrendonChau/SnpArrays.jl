@@ -28,7 +28,7 @@ AbstractSnpLinAlg = Union{SnpLinAlg, SubArray{T, 1, SnpLinAlg{T}},
 Wrap a `SnpArray` for linear algebra without materializing its genotypes.
 
 # Arguments
-- `s::AbstractSnpArray`: the genotypes to wrap
+- `s::SnpArray`: the genotypes to wrap
 
 # Keywords
 - `model = ADDITIVE_MODEL`: `ADDITIVE_MODEL`, `DOMINANT_MODEL`, or
