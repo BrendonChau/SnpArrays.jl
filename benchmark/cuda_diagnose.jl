@@ -4,15 +4,15 @@
 # accuracy of the Float32 paths against Float64.
 #
 #     julia -t N --project=<env with CUDA and SnpArrays> \
-#       benchmark/cuda_diagnose.jl <bed> [results_dir] [sections] \
-#       [m_cap] [n_cap]
+#       benchmark/cuda_diagnose.jl --bed <path> [--results-dir <dir>] \
+#       [--sections <list>] [--m-cap <samples>] [--n-cap <snps>]
 #
-# `sections` is a comma list from `stream,scale,tiles,accuracy` (the
-# default, and the run order) and the opt-in `shapes`, run last. `m_cap`
-# (a multiple of 16) and `n_cap` keep the first samples and SNPs; a capped
+# `--sections` is a comma list from `stream,scale,tiles,accuracy` (the
+# default, and the run order) and the opt-in `shapes`, run last. `--m-cap`
+# (a multiple of 16) and `--n-cap` keep the first samples and SNPs; a capped
 # copy of the files is then written to a temporary directory for the
 # stream. Centered, scaled, mean-imputed. The report is also written, one
-# flushed row at a time, to a timestamped markdown file in `results_dir`
+# flushed row at a time, to a timestamped markdown file in `--results-dir`
 # (default `results/` next to this script).
 using CUDA
 using Dates
@@ -21,15 +21,41 @@ using Printf
 using Random
 using SnpArrays
 
-length(ARGS) >= 1 || throw(ArgumentError(
-    "usage: cuda_diagnose.jl <bed> [results_dir] [sections] [m_cap] [n_cap]"))
-const BED = ARGS[1]
-const RESULTS_DIR = length(ARGS) >= 2 ? ARGS[2] : joinpath(@__DIR__, "results")
+const USAGE = "usage: cuda_diagnose.jl --bed <path> [--results-dir <dir>] " *
+    "[--sections <list>] [--m-cap <samples>] [--n-cap <snps>]"
+
+"""
+    parse_flags(args) -> Dict{String, String}
+
+Read `--name value` pairs from `args`. A name outside the usage line, a
+repeated name, a name without a value, or a missing `--bed` is an
+`ArgumentError`.
+"""
+function parse_flags(args::Vector{String})
+    known = ("--bed", "--results-dir", "--sections", "--m-cap", "--n-cap")
+    flags = Dict{String, String}()
+    iseven(length(args)) || throw(ArgumentError(USAGE))
+    for i in 1:2:length(args)
+        name = args[i]
+        name in known || throw(ArgumentError("unknown flag $(name); $(USAGE)"))
+        haskey(flags, name) && throw(ArgumentError(
+            "flag $(name) given twice; $(USAGE)"))
+        flags[name] = args[i + 1]
+    end
+    haskey(flags, "--bed") || throw(ArgumentError(USAGE))
+    return flags
+end
+
+const FLAGS = parse_flags(ARGS)
+const BED = FLAGS["--bed"]
+const RESULTS_DIR = get(FLAGS, "--results-dir", joinpath(@__DIR__, "results"))
 const ALL_SECTIONS = ("stream", "scale", "tiles", "accuracy")
-const SECTIONS = length(ARGS) >= 3 ? String.(split(ARGS[3], ",")) :
-    collect(String, ALL_SECTIONS)
-const M_CAP = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : typemax(Int)
-const N_CAP = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : typemax(Int)
+const SECTIONS = haskey(FLAGS, "--sections") ?
+    String.(split(FLAGS["--sections"], ",")) : collect(String, ALL_SECTIONS)
+const M_CAP = haskey(FLAGS, "--m-cap") ? parse(Int, FLAGS["--m-cap"]) :
+    typemax(Int)
+const N_CAP = haskey(FLAGS, "--n-cap") ? parse(Int, FLAGS["--n-cap"]) :
+    typemax(Int)
 const K = 32
 const WIDTH = 4096
 const REPEATS = 3
@@ -1166,7 +1192,7 @@ function main()
             "unknown section $(section); expected some of $((ALL_SECTIONS..., "shapes"))"))
     end
     M_CAP % 16 == 0 || M_CAP == typemax(Int) || throw(ArgumentError(
-        "m_cap must be a multiple of 16; got $(M_CAP)"))
+        "--m-cap must be a multiple of 16; got $(M_CAP)"))
     path = report_path(RESULTS_DIR)
     io = open(path, "w")
     emit(io, "# `cuda_diagnose.jl` on $(CUDA.name(CUDA.device()))")
